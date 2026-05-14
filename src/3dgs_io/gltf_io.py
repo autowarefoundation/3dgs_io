@@ -1,0 +1,529 @@
+from __future__ import annotations
+
+import gzip
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import spz
+
+from ._gltf_common import (
+    FLOAT as _FLOAT,
+)
+from ._gltf_common import (
+    UNSIGNED_BYTE as _UNSIGNED_BYTE,
+)
+from ._gltf_common import (
+    pack_buffer as _pack_buffer,
+)
+from ._gltf_common import (
+    read_accessor as _read_accessor,
+)
+from ._gltf_common import (
+    read_file as _read_file,
+)
+from ._gltf_common import (
+    write_file as _write_file,
+)
+from .metadata import DatasetType as DatasetType  # noqa: F401 – re-export for backward compat
+from .metadata import GlbMetadata, parse_metadata, serialize_metadata
+
+_EXTENSION_NAME = "KHR_gaussian_splatting"
+_SPZ_EXTENSION_NAME = "KHR_gaussian_splatting_compression_spz_2"
+
+# Spherical Harmonics degree-0 constant: 1 / (2 * sqrt(pi))
+_SH_C0 = 0.2820947917738781
+
+
+@dataclass
+class GltfSaveOptions:
+    """Options for saving to glTF/GLB format."""
+
+    spz_compression: bool = False
+    """Use SPZ compression (KHR_gaussian_splatting_compression_spz_2)."""
+
+    metadata: GlbMetadata | dict[str, Any] | None = None
+    """Metadata written to ``asset.extras`` in the glTF JSON.
+
+    Accepts a :class:`GlbMetadata` instance (recommended) or a plain dict."""
+
+
+# ---------------------------------------------------------------------------
+# Activation helpers (GaussianCloud uses pre-activation values)
+# ---------------------------------------------------------------------------
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x.astype(np.float64))).astype(np.float32)
+
+
+def _inverse_sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x.astype(np.float64), 1e-7, 1 - 1e-7)
+    return np.log(x / (1 - x)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def save_gltf(
+    gc: spz.GaussianCloud,
+    path: str | Path,
+    options: GltfSaveOptions | None = None,
+) -> None:
+    """Save a GaussianCloud to a KHR_gaussian_splatting compliant glTF/GLB file."""
+    path = Path(path)
+    if options is None:
+        options = GltfSaveOptions()
+
+    if options.spz_compression:
+        _save_gltf_spz(gc, path, options)
+    else:
+        _save_gltf_standard(gc, path, options)
+
+
+def load_gltf(path: str | Path) -> spz.GaussianCloud:
+    """Load a GaussianCloud from a KHR_gaussian_splatting compliant glTF/GLB file."""
+    gc, _ = load_gltf_with_metadata(path)
+    return gc
+
+
+def load_gltf_with_metadata(
+    path: str | Path,
+) -> tuple[spz.GaussianCloud, GlbMetadata | dict[str, Any] | None]:
+    """Load a GaussianCloud and its ``asset.extras`` metadata from a glTF/GLB file.
+
+    Returns:
+        A tuple of ``(GaussianCloud, metadata)``.  *metadata* is a
+        :class:`GlbMetadata` when the extras match the schema, the raw dict
+        for legacy files, or ``None`` if no extras were present.
+    """
+    path = Path(path)
+
+    gltf_dict, buffer_data = _read_file(path)
+
+    gc = _parse_gaussian_cloud(gltf_dict, buffer_data)
+    raw_metadata = gltf_dict.get("asset", {}).get("extras")
+    return gc, parse_metadata(raw_metadata)
+
+
+# ---------------------------------------------------------------------------
+# Standard (per-attribute) save
+# ---------------------------------------------------------------------------
+
+
+def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) -> None:
+    n = gc.num_points
+
+    positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
+    rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
+    scales = np.array(gc.scales, dtype=np.float32).reshape(n, 3)
+    # gc.colors = SH DC coefficients, gc.alphas = logit values
+    sh_dc = np.array(gc.colors, dtype=np.float32).reshape(n, 3)
+    alphas_logit = np.array(gc.alphas, dtype=np.float32)
+    sh_raw = np.array(gc.sh, dtype=np.float32)
+
+    # Post-activation values for glTF storage
+    opacity_01 = _sigmoid(alphas_logit)
+    opacity_u8 = np.clip(opacity_01 * 255 + 0.5, 0, 255).astype(np.uint8)
+
+    rgb_01 = np.clip(sh_dc * _SH_C0 + 0.5, 0, 1)
+    rgb_u8 = np.clip(rgb_01 * 255 + 0.5, 0, 255).astype(np.uint8)
+
+    # COLOR_0 fallback (VEC4 uint8 normalized)
+    color_0 = np.empty((n, 4), dtype=np.uint8)
+    color_0[:, :3] = rgb_u8
+    color_0[:, 3] = opacity_u8
+
+    pos_min = positions.min(axis=0).tolist()
+    pos_max = positions.max(axis=0).tolist()
+
+    _ROT = f"{_EXTENSION_NAME}:ROTATION"
+    _SCL = f"{_EXTENSION_NAME}:SCALE"
+    _OPA = f"{_EXTENSION_NAME}:OPACITY"
+    _SH0 = f"{_EXTENSION_NAME}:SH_DEGREE_0_COEF_0"
+
+    # (name, bytes, componentType, accessorType, extra_fields)
+    attr_list: list[tuple[str, bytes, int, str, dict]] = [
+        ("POSITION", positions.tobytes(), _FLOAT, "VEC3", {"min": pos_min, "max": pos_max}),
+        ("COLOR_0", color_0.tobytes(), _UNSIGNED_BYTE, "VEC4", {"normalized": True}),
+        (_ROT, rotations.tobytes(), _FLOAT, "VEC4", {}),
+        (_SCL, scales.tobytes(), _FLOAT, "VEC3", {}),
+        (_OPA, opacity_u8.tobytes(), _UNSIGNED_BYTE, "SCALAR", {"normalized": True}),
+        (_SH0, sh_dc.tobytes(), _FLOAT, "VEC3", {}),
+    ]
+
+    # Higher SH degrees
+    sh_degree = _sh_degree_from_array(n, sh_raw)
+    if sh_degree >= 1:
+        sh_reshaped = sh_raw.reshape(n, -1, 3)
+        coef_idx = 0
+        for degree in range(1, sh_degree + 1):
+            num_coefs = 2 * degree + 1
+            for j in range(num_coefs):
+                name = f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"
+                data = (
+                    np.ascontiguousarray(sh_reshaped[:, coef_idx, :]).astype(np.float32).tobytes()
+                )
+                attr_list.append((name, data, _FLOAT, "VEC3", {}))
+                coef_idx += 1
+
+    # Pack buffer
+    buffer_data, offsets, lengths = _pack_buffer([d for _, d, _, _, _ in attr_list])
+
+    # Build JSON
+    attrs_dict = {name: i for i, (name, _, _, _, _) in enumerate(attr_list)}
+    num_attrs = len(attr_list)
+
+    accessors = []
+    for i, (_, _, comp_type, acc_type, extras) in enumerate(attr_list):
+        acc: dict = {
+            "bufferView": i,
+            "componentType": comp_type,
+            "count": n,
+            "type": acc_type,
+        }
+        acc.update(extras)
+        accessors.append(acc)
+
+    asset: dict[str, Any] = {"version": "2.0", "generator": "3dgs-io"}
+    extras = serialize_metadata(options.metadata)
+    if extras is not None:
+        asset["extras"] = extras
+
+    gltf_dict: dict = {
+        "asset": asset,
+        "extensionsUsed": [_EXTENSION_NAME],
+        "extensionsRequired": [_EXTENSION_NAME],
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [
+            {
+                "primitives": [
+                    {
+                        "mode": 0,
+                        "attributes": attrs_dict,
+                        "extensions": {
+                            _EXTENSION_NAME: {
+                                "kernel": "ellipse",
+                                "colorSpace": "srgb_rec709_display",
+                            }
+                        },
+                    }
+                ]
+            }
+        ],
+        "accessors": accessors,
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": offsets[i], "byteLength": lengths[i]}
+            for i in range(num_attrs)
+        ],
+        "buffers": [{"byteLength": len(buffer_data)}],
+    }
+
+    _write_file(path, gltf_dict, buffer_data)
+
+
+# ---------------------------------------------------------------------------
+# SPZ-compressed save
+# ---------------------------------------------------------------------------
+
+
+def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) -> None:
+    n = gc.num_points
+
+    positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
+    pos_min = positions.min(axis=0).tolist()
+    pos_max = positions.max(axis=0).tolist()
+
+    sh_raw = np.array(gc.sh, dtype=np.float32)
+    sh_degree = _sh_degree_from_array(n, sh_raw)
+
+    spz_bytes = _compress_to_spz_bytes(gc)
+
+    # Buffer contains only the SPZ blob.  CesiumJS requires that accessors do
+    # NOT carry a ``bufferView`` when SPZ compression is active – the decoded
+    # SPZ data supplies every attribute.  Accessors are "virtual": they declare
+    # types / counts so that loaders know what to expect from the decoded blob.
+    buffer_data = spz_bytes
+
+    # Virtual accessors (no bufferView – data comes from SPZ decompression)
+    accessors: list[dict] = [
+        {  # 0: POSITION
+            "componentType": _FLOAT,
+            "count": n,
+            "type": "VEC3",
+            "min": pos_min,
+            "max": pos_max,
+        },
+        {  # 1: COLOR_0
+            "componentType": _UNSIGNED_BYTE,
+            "normalized": True,
+            "count": n,
+            "type": "VEC4",
+        },
+        {  # 2: SCALE
+            "componentType": _FLOAT,
+            "count": n,
+            "type": "VEC3",
+        },
+        {  # 3: ROTATION
+            "componentType": _FLOAT,
+            "count": n,
+            "type": "VEC4",
+        },
+    ]
+
+    attributes: dict[str, int] = {
+        "POSITION": 0,
+        "COLOR_0": 1,
+        f"{_EXTENSION_NAME}:SCALE": 2,
+        f"{_EXTENSION_NAME}:ROTATION": 3,
+    }
+
+    # SH coefficient virtual accessors
+    acc_idx = 4
+    for degree in range(1, sh_degree + 1):
+        num_coefs = 2 * degree + 1
+        for j in range(num_coefs):
+            accessors.append(
+                {
+                    "componentType": _FLOAT,
+                    "count": n,
+                    "type": "VEC3",
+                }
+            )
+            attributes[f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"] = acc_idx
+            acc_idx += 1
+
+    asset: dict[str, Any] = {"version": "2.0", "generator": "3dgs-io"}
+    extras = serialize_metadata(options.metadata)
+    if extras is not None:
+        asset["extras"] = extras
+
+    gltf_dict: dict = {
+        "asset": asset,
+        "extensionsUsed": [_EXTENSION_NAME, _SPZ_EXTENSION_NAME],
+        "extensionsRequired": [_EXTENSION_NAME, _SPZ_EXTENSION_NAME],
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [
+            {
+                "primitives": [
+                    {
+                        "mode": 0,
+                        "attributes": attributes,
+                        "extensions": {
+                            _EXTENSION_NAME: {
+                                "extensions": {
+                                    _SPZ_EXTENSION_NAME: {
+                                        "bufferView": 0,
+                                    }
+                                },
+                            }
+                        },
+                    }
+                ]
+            }
+        ],
+        "accessors": accessors,
+        "bufferViews": [
+            {"buffer": 0, "byteLength": len(spz_bytes)},
+        ],
+        "buffers": [{"byteLength": len(spz_bytes)}],
+    }
+
+    _write_file(path, gltf_dict, buffer_data)
+
+
+# ---------------------------------------------------------------------------
+# SPZ compression helpers
+# ---------------------------------------------------------------------------
+
+
+def _compress_to_spz_bytes(gc: spz.GaussianCloud) -> bytes:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "temp.spz"
+        opts = spz.PackOptions()
+        opts.from_coord = spz.RUB
+        spz.save_spz(gc, opts, str(path))
+        # Keep gzip wrapper — CesiumJS's @spz-loader/core expects
+        # gzip-compressed SPZ data, not raw NGSP bytes.
+        return path.read_bytes()
+
+
+def _decompress_from_spz_bytes(data: bytes) -> spz.GaussianCloud:
+    # spz.load_spz() expects gzip-wrapped data (.spz file format).
+    # The KHR_gaussian_splatting_compression_spz_2 spec stores raw SPZ bytes,
+    # but legacy files may contain gzip-wrapped SPZ bytes.  Detect and handle both.
+    _GZIP_MAGIC = b"\x1f\x8b"
+    if not data[:2] == _GZIP_MAGIC:
+        data = gzip.compress(data)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "temp.spz"
+        path.write_bytes(data)
+        opts = spz.UnpackOptions()
+        opts.to_coord = spz.RUB
+        return spz.load_spz(str(path), opts)
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
+def _attr_key(attrs: dict, *candidates: str) -> str | None:
+    for key in candidates:
+        if key in attrs:
+            return key
+    return None
+
+
+def _sh_degree_from_array(num_points: int, sh: np.ndarray) -> int:
+    if len(sh) == 0:
+        return 0
+    coefficients = len(sh) // (num_points * 3)
+    if coefficients >= 15:
+        return 3
+    if coefficients >= 8:
+        return 2
+    if coefficients >= 3:
+        return 1
+    return 0
+
+
+def _parse_gaussian_cloud(gltf_dict: dict, buffer_data: bytes) -> spz.GaussianCloud:
+    primitive = _find_gaussian_primitive(gltf_dict)
+    if primitive is None:
+        raise ValueError("No KHR_gaussian_splatting primitive found in glTF")
+
+    # Check for SPZ compression sub-extension
+    ext = primitive.get("extensions", {}).get(_EXTENSION_NAME, {})
+    spz_ext = ext.get("extensions", {}).get(_SPZ_EXTENSION_NAME)
+
+    if spz_ext is not None:
+        bv_idx = spz_ext["bufferView"]
+        bv = gltf_dict["bufferViews"][bv_idx]
+        offset = bv.get("byteOffset", 0)
+        length = bv["byteLength"]
+        spz_data = buffer_data[offset : offset + length]
+        return _decompress_from_spz_bytes(spz_data)
+
+    return _parse_standard(primitive, gltf_dict, buffer_data)
+
+
+def _parse_standard(
+    primitive: dict,
+    gltf_dict: dict,
+    buffer_data: bytes,
+) -> spz.GaussianCloud:
+    attrs = primitive["attributes"]
+    accessors = gltf_dict["accessors"]
+    buffer_views = gltf_dict["bufferViews"]
+
+    # POSITION
+    positions = _read_accessor(accessors[attrs["POSITION"]], buffer_views, buffer_data)
+
+    # ROTATION
+    rot_key = _attr_key(attrs, f"{_EXTENSION_NAME}:ROTATION", "_ROTATION")
+    if rot_key is None:
+        raise ValueError("No rotation attribute found")
+    rotations = _read_accessor(accessors[attrs[rot_key]], buffer_views, buffer_data)
+
+    # SCALE
+    scale_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SCALE", "_SCALE")
+    if scale_key is None:
+        raise ValueError("No scale attribute found")
+    scales = _read_accessor(accessors[attrs[scale_key]], buffer_views, buffer_data)
+
+    # OPACITY → logit
+    opacity_key = _attr_key(attrs, f"{_EXTENSION_NAME}:OPACITY")
+    if opacity_key is not None:
+        raw = _read_accessor(accessors[attrs[opacity_key]], buffer_views, buffer_data)
+        if raw.dtype == np.float32:
+            alphas = _inverse_sigmoid(raw)
+        else:
+            # uint8 normalized: value/255 gives [0, 1]
+            alphas = _inverse_sigmoid(raw.astype(np.float32) / 255.0)
+    elif "COLOR_0" in attrs:
+        color_0 = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
+        if color_0.dtype == np.float32:
+            alphas = _inverse_sigmoid(color_0[:, 3])
+        else:
+            alphas = _inverse_sigmoid(color_0[:, 3].astype(np.float32) / 255.0)
+    else:
+        raise ValueError("No opacity data found")
+
+    # COLORS (SH DC) from SH_DEGREE_0_COEF_0 or COLOR_0
+    sh_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SH_DEGREE_0_COEF_0")
+    if sh_key is not None:
+        # SH DC coefficients → gc.colors directly
+        colors_sh = _read_accessor(accessors[attrs[sh_key]], buffer_views, buffer_data).astype(
+            np.float32
+        )
+    elif "COLOR_0" in attrs:
+        raw = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
+        if raw.dtype == np.float32:
+            rgb_01 = raw[:, :3]
+        else:
+            rgb_01 = raw[:, :3].astype(np.float32) / 255.0
+        # RGB [0,1] → SH DC: sh = (rgb - 0.5) / C0
+        colors_sh = (rgb_01 - 0.5) / _SH_C0
+    else:
+        raise ValueError("No color data found")
+
+    # Higher SH degrees (1-3)
+    sh_coefficients: list[np.ndarray] = []
+    for degree in range(1, 4):
+        num_coefs = 2 * degree + 1
+        degree_data: list[np.ndarray] = []
+        for j in range(num_coefs):
+            key = f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"
+            if key not in attrs:
+                break
+            coef = _read_accessor(accessors[attrs[key]], buffer_views, buffer_data)
+            degree_data.append(coef.astype(np.float32))
+        if len(degree_data) != num_coefs:
+            break
+        sh_coefficients.extend(degree_data)
+
+    # Build GaussianCloud
+    gc = spz.GaussianCloud()
+    gc.positions = positions.astype(np.float32).reshape(-1)
+    gc.colors = colors_sh.reshape(-1).astype(np.float32)
+    gc.alphas = alphas.astype(np.float32)
+    gc.rotations = rotations.astype(np.float32).reshape(-1)
+    gc.scales = scales.astype(np.float32).reshape(-1)
+
+    if sh_coefficients:
+        sh_stacked = np.stack(sh_coefficients, axis=1)  # (N, num_coef, 3)
+        gc.sh = sh_stacked.reshape(-1).astype(np.float32)
+    else:
+        gc.sh = np.zeros(0, dtype=np.float32)
+
+    return gc
+
+
+def _find_gaussian_primitive(gltf_dict: dict) -> dict | None:
+    for mesh in gltf_dict.get("meshes", []):
+        for prim in mesh.get("primitives", []):
+            exts = prim.get("extensions", {})
+            if _EXTENSION_NAME in exts:
+                return prim
+            a = prim.get("attributes", {})
+            if any(
+                key in a
+                for key in (
+                    f"{_EXTENSION_NAME}:ROTATION",
+                    f"{_EXTENSION_NAME}:SCALE",
+                    "_ROTATION",
+                    "_SCALE",
+                )
+            ):
+                return prim
+    return None

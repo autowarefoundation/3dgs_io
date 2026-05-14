@@ -1,0 +1,37 @@
+[project]
+name = "3dgs-io"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Masaya Kataoka", email = "ms.kataoka@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.1,<2.3",
+    "spz",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.7,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+spz = { git = "https://github.com/nianticlabs/spz.git", rev="v2.1.0"}
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.0.0",
+    "pytest>=9.0.3",
+    "ruff>=0.14.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
