@@ -1,0 +1,92 @@
+name: release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: >-
+      github.event.pull_request.merged == true &&
+      (contains(github.event.pull_request.labels.*.name, 'release:patch') ||
+       contains(github.event.pull_request.labels.*.name, 'release:minor') ||
+       contains(github.event.pull_request.labels.*.name, 'release:major'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Resolve bump level from PR label
+        id: level
+        env:
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          has() { echo "$LABELS" | jq -e --arg l "$1" 'any(. == $l)' >/dev/null; }
+          matches=()
+          for lvl in major minor patch; do
+            if has "release:${lvl}"; then matches+=("${lvl}"); fi
+          done
+          if [ "${#matches[@]}" -ne 1 ]; then
+            echo "Expected exactly one of release:{major,minor,patch} labels, got: ${matches[*]:-<none>}" >&2
+            exit 1
+          fi
+          echo "bump=${matches[0]}" >> "$GITHUB_OUTPUT"
+          echo "Selected bump level: ${matches[0]}"
+
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          uv version --bump "${{ steps.level.outputs.bump }}"
+          next=$(uv version --short)
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
+          echo "Bumped to ${next} (${{ steps.level.outputs.bump }})"
+
+      - name: Fail if tag already exists
+        run: |
+          if git rev-parse "refs/tags/${{ steps.bump.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.bump.outputs.tag }} already exists" >&2
+            exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit, tag, and push
+        id: commit
+        run: |
+          set -euo pipefail
+          git add pyproject.toml uv.lock
+          git commit -m "chore(release): ${{ steps.bump.outputs.tag }}"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
+          git push origin "HEAD:main"
+          git push origin "${{ steps.bump.outputs.tag }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.bump.outputs.tag }}" \
+            --title "${{ steps.bump.outputs.tag }}" \
+            --target "${{ steps.commit.outputs.sha }}" \
+            --generate-notes
