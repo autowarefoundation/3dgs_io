@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3dgs_io Viewer</title>
+    <script>
+        const _useDebug = new URLSearchParams(window.location.search).has('debug');
+        const _cesiumBase = _useDebug
+            ? 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/CesiumUnminified'
+            : 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium';
+        document.write(`<script src="${_cesiumBase}/Cesium.js"><\/script>`);
+        document.write(`<link href="${_cesiumBase}/Widgets/widgets.css" rel="stylesheet">`);
+    </script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; }
+        #cesiumContainer { width: 100%; height: 100%; }
+
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(38, 38, 38, 0.9);
+            color: #eee;
+            padding: 16px;
+            border-radius: 8px;
+            min-width: 320px;
+            max-height: calc(100vh - 20px);
+            overflow-y: auto;
+            font-size: 13px;
+            backdrop-filter: blur(4px);
+        }
+        #controls h2 { margin-bottom: 12px; font-size: 16px; }
+        #controls label { display: block; margin: 8px 0 4px; color: #aaa; }
+        #controls input[type="text"],
+        #controls input[type="number"] {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background: #333;
+            color: #eee;
+            font-size: 13px;
+        }
+        #controls button {
+            margin-top: 12px;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            background: #4a9eff;
+            color: #fff;
+        }
+        #controls button:hover { background: #3a8eef; }
+        #controls button.secondary {
+            background: #555;
+            margin-left: 4px;
+        }
+        #controls button.secondary:hover { background: #666; }
+        #status {
+            margin-top: 12px;
+            padding: 8px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        .control-group {
+            border-top: 1px solid #444;
+            padding-top: 8px;
+            margin-top: 8px;
+        }
+        #toggle-controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            z-index: 1001;
+            background: rgba(38,38,38,0.9);
+            color: #eee;
+            border: none;
+            border-radius: 4px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 14px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="cesiumContainer"></div>
+
+    <button id="toggle-controls" onclick="toggleControls()">&#9776; Controls</button>
+
+    <div id="controls">
+        <h2>3dgs_io Viewer</h2>
+
+        <label for="tilesetUrl">Tileset URL:</label>
+        <input type="text" id="tilesetUrl" value="tiles/tileset.json" placeholder="path/to/tileset.json">
+
+        <div style="margin-top:8px;">
+            <button onclick="loadTileset()">Load Tileset</button>
+            <button class="secondary" onclick="flyToTileset()">Fly To</button>
+            <button class="secondary" onclick="flyTopDown()">Top View</button>
+            <button class="secondary" onclick="hideControls()">Hide</button>
+        </div>
+
+        <div class="control-group">
+            <label for="globeOpacity">Globe Opacity: <span id="globeOpacityValue">100%</span></label>
+            <input type="range" id="globeOpacity" min="0" max="100" value="100"
+                   style="width:100%;" oninput="setGlobeOpacity(this.value)">
+        </div>
+
+        <div class="control-group">
+            <label for="cesiumToken">Cesium Ion Token (optional):</label>
+            <input type="text" id="cesiumToken" placeholder="your-cesium-ion-token">
+            <div style="margin-top:4px; font-size:11px; color:#888;">
+                Base imagery requires a <a href="https://ion.cesium.com/tokens" target="_blank" style="color:#4a9eff;">Cesium Ion token</a>.
+                Without a token, the globe is blank but tiles still load.
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Quick Placement Override:</label>
+            <div style="display:flex; gap:8px;">
+                <div style="flex:1">
+                    <label for="overrideLat" style="font-size:11px;">Lat</label>
+                    <input type="number" id="overrideLat" step="0.0001" placeholder="35.6812">
+                </div>
+                <div style="flex:1">
+                    <label for="overrideLon" style="font-size:11px;">Lon</label>
+                    <input type="number" id="overrideLon" step="0.0001" placeholder="139.7671">
+                </div>
+                <div style="flex:1">
+                    <label for="overrideHeight" style="font-size:11px;">Height</label>
+                    <input type="number" id="overrideHeight" step="1" placeholder="0">
+                </div>
+            </div>
+        </div>
+
+        <div id="status">Ready. Enter a tileset URL and click Load.</div>
+    </div>
+
+    <script>
+        let viewer = null;
+        let currentTileset = null;
+
+        function getUrlParams() {
+            const params = new URLSearchParams(window.location.search);
+            return {
+                tilesetUrl: params.get('tileset') || params.get('url'),
+                token: params.get('token'),
+                lat: params.get('lat') ? parseFloat(params.get('lat')) : null,
+                lon: params.get('lon') ? parseFloat(params.get('lon')) : null,
+                height: params.get('height') ? parseFloat(params.get('height')) : null,
+            };
+        }
+
+        async function initViewer() {
+            const params = getUrlParams();
+
+            const token = params.token || document.getElementById('cesiumToken').value;
+            if (token) {
+                Cesium.Ion.defaultAccessToken = token;
+            }
+
+            try {
+                viewer = new Cesium.Viewer('cesiumContainer', {
+                    timeline: false,
+                    animation: false,
+                    homeButton: true,
+                    sceneModePicker: true,
+                    baseLayerPicker: true,
+                    navigationHelpButton: false,
+                    infoBox: false,
+                    selectionIndicator: false,
+                });
+                viewer.scene.globe.depthTestAgainstTerrain = false;
+
+                viewer.scene.atmosphere.show = false;
+                viewer.scene.globe.showGroundAtmosphere = false;
+                viewer.scene.skyAtmosphere.show = false;
+            } catch (e) {
+                setStatus('Error initializing Cesium viewer: ' + (e.message || e));
+                console.error('Viewer init failed:', e);
+                return;
+            }
+
+            if (params.tilesetUrl) {
+                document.getElementById('tilesetUrl').value = params.tilesetUrl;
+            }
+            if (params.token) {
+                document.getElementById('cesiumToken').value = params.token;
+            }
+            if (params.lat !== null) document.getElementById('overrideLat').value = params.lat;
+            if (params.lon !== null) document.getElementById('overrideLon').value = params.lon;
+            if (params.height !== null) document.getElementById('overrideHeight').value = params.height;
+
+            if (params.tilesetUrl) {
+                loadTileset();
+            }
+        }
+
+        async function loadTileset() {
+            const url = document.getElementById('tilesetUrl').value.trim();
+            if (!url) {
+                setStatus('Error: No tileset URL specified.');
+                return;
+            }
+
+            const token = document.getElementById('cesiumToken').value.trim();
+            if (token) {
+                Cesium.Ion.defaultAccessToken = token;
+            }
+
+            if (currentTileset) {
+                viewer.scene.primitives.remove(currentTileset);
+                currentTileset = null;
+            }
+
+            setStatus('Loading: ' + url + ' ...');
+
+            try {
+                const tileset = await Cesium.Cesium3DTileset.fromUrl(url, {
+                    maximumScreenSpaceError: 8,
+                    maximumMemoryUsage: 2048,
+                });
+
+                tileset.tileFailed.addEventListener(function(event) {
+                    console.error('Tile failed:', event.url, event.message);
+                    setStatus('Tile load error: ' + event.message + '\n' + event.url);
+                });
+
+                tileset.tileLoad.addEventListener(function(tile) {
+                    console.log('Tile loaded:', tile.contentReady, tile.content);
+                });
+
+                if (tileset.imageBasedLighting) {
+                    tileset.imageBasedLighting.imageBasedLightingFactor = new Cesium.Cartesian2(0.0, 0.0);
+                }
+
+                viewer.scene.primitives.add(tileset);
+                currentTileset = tileset;
+
+                setStatus('Tileset loaded: ' + url + '\nLoading content...');
+
+                flyToTileset();
+
+                setTimeout(function() {
+                    const root = tileset.root;
+                    const info = [];
+                    info.push('Tileset: ' + url);
+                    info.push('Root ready: ' + (root ? root.contentReady : 'no root'));
+                    if (root && root.content) {
+                        const cls = root.content.constructor.name;
+                        const isGS = cls === 'GaussianSplat3DTileContent'
+                            || (root.content._splats !== undefined)
+                            || (root.content._pointCount !== undefined && root.content._sortWorker !== undefined);
+                        info.push('Content class: ' + cls + (isGS ? ' (3D Gaussian Splatting)' : ''));
+                    }
+                    const stats = tileset.statistics;
+                    if (stats) {
+                        info.push('Tiles: ' + stats.numberOfTilesTotal + ', loaded: ' + stats.numberOfLoadedTilesTotal);
+                        if (stats.numberOfPointsLoaded > 0) {
+                            info.push('Points/splats loaded: ' + stats.numberOfPointsLoaded.toLocaleString());
+                        }
+                    }
+                    info.push('\nTip: add ?debug=1 to URL for verbose class names');
+                    setStatus(info.join('\n'));
+                }, 3000);
+            } catch (e) {
+                setStatus('Error loading tileset:\n' + (e.message || e));
+                console.error(e);
+            }
+        }
+
+        function flyToTileset() {
+            if (!currentTileset) {
+                const lat = parseFloat(document.getElementById('overrideLat').value);
+                const lon = parseFloat(document.getElementById('overrideLon').value);
+                const height = parseFloat(document.getElementById('overrideHeight').value) || 100;
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    viewer.camera.flyTo({
+                        destination: Cesium.Cartesian3.fromDegrees(lon, lat, height + 200),
+                        orientation: {
+                            heading: 0,
+                            pitch: Cesium.Math.toRadians(-45),
+                            roll: 0,
+                        },
+                    });
+                }
+                return;
+            }
+
+            viewer.flyTo(currentTileset, {
+                offset: new Cesium.HeadingPitchRange(
+                    0,
+                    Cesium.Math.toRadians(-45),
+                    0
+                ),
+            });
+        }
+
+        function flyTopDown() {
+            if (!currentTileset) {
+                setStatus('No tileset loaded.');
+                return;
+            }
+            setGlobeOpacity(30);
+            document.getElementById('globeOpacity').value = 30;
+
+            const boundingSphere = currentTileset.boundingSphere;
+            const center = boundingSphere.center;
+            const radius = boundingSphere.radius;
+
+            const cartographic = Cesium.Cartographic.fromCartesian(center);
+            const height = cartographic.height + radius * 3;
+            viewer.camera.flyTo({
+                destination: Cesium.Cartesian3.fromRadians(
+                    cartographic.longitude,
+                    cartographic.latitude,
+                    height
+                ),
+                orientation: {
+                    heading: 0,
+                    pitch: Cesium.Math.toRadians(-90),
+                    roll: 0,
+                },
+            });
+        }
+
+        function setGlobeOpacity(pct) {
+            pct = Number(pct);
+            document.getElementById('globeOpacityValue').textContent = pct + '%';
+            if (!viewer) return;
+            const globe = viewer.scene.globe;
+            if (pct >= 100) {
+                globe.show = true;
+                globe.translucency.enabled = false;
+            } else if (pct <= 0) {
+                globe.show = false;
+            } else {
+                globe.show = true;
+                globe.translucency.enabled = true;
+                globe.translucency.frontFaceAlpha = pct / 100;
+            }
+        }
+
+        function setStatus(msg) {
+            document.getElementById('status').textContent = msg;
+        }
+
+        function hideControls() {
+            document.getElementById('controls').style.display = 'none';
+            document.getElementById('toggle-controls').style.display = 'block';
+        }
+
+        function toggleControls() {
+            document.getElementById('controls').style.display = 'block';
+            document.getElementById('toggle-controls').style.display = 'none';
+        }
+
+        initViewer();
+    </script>
+</body>
+</html>
