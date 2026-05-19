@@ -26,6 +26,7 @@ from .tiles_io import (
     load_tileset,
     merge_tileset,
 )
+from .viewer import launch_viewer
 
 __all__ = [
     "Checkpoint",
@@ -55,4 +56,5 @@ __all__ = [
     "Tile3DContent",
     "load_tileset",
     "merge_tileset",
+    "launch_viewer",
 ]
