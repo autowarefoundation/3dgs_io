@@ -31,12 +31,16 @@ for _ext, _mime in _EXTRA_TYPES.items():
     mimetypes.add_type(_mime, _ext)
 
 
+_INDEX_HTML = (_VIEWER_DIR / "index.html").read_bytes()
+
+_CHUNK_SIZE = 64 * 1024
+
+
 class _ViewerHandler(SimpleHTTPRequestHandler):
     """Serves viewer assets from the package and tile files from a user directory."""
 
     tiles_directory: ClassVar[Path]  # set by ``create_server``
 
-    # Silence per-request log lines (still logged on errors).
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
 
@@ -54,17 +58,18 @@ class _ViewerHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         clean = posixpath.normpath(urllib.parse.unquote(parsed.path))
 
-        # Serve viewer HTML at root.
         if clean in ("/", "/index.html"):
-            self._serve_file(_VIEWER_DIR / "index.html")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(_INDEX_HTML)))
+            self.end_headers()
+            self.wfile.write(_INDEX_HTML)
             return
 
-        # Serve tile files from the user-supplied directory.
         if clean.startswith("/tiles/"):
             relative = clean[len("/tiles/") :]
             target = (self.tiles_directory / relative).resolve()
-            # Prevent path traversal.
-            if not str(target).startswith(str(self.tiles_directory.resolve())):
+            if not target.is_relative_to(self.tiles_directory):
                 self.send_error(403, "Forbidden")
                 return
             self._serve_file(target)
@@ -73,18 +78,22 @@ class _ViewerHandler(SimpleHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def _serve_file(self, path: Path) -> None:
-        if not path.is_file():
+        try:
+            fp = path.open("rb")
+        except (FileNotFoundError, IsADirectoryError, PermissionError):
             self.send_error(404, "Not Found")
             return
-        content_type, _ = mimetypes.guess_type(str(path))
-        if content_type is None:
-            content_type = "application/octet-stream"
-        data = path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        with fp:
+            content_type, _ = mimetypes.guess_type(str(path))
+            if content_type is None:
+                content_type = "application/octet-stream"
+            file_size = path.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(file_size))
+            self.end_headers()
+            while chunk := fp.read(_CHUNK_SIZE):
+                self.wfile.write(chunk)
 
 
 def create_server(
@@ -106,8 +115,8 @@ def create_server(
     """
     tiles_directory = Path(tiles_directory).resolve()
 
-    # Create a handler subclass that captures the tiles directory so each
-    # request instance can access it via ``self.tiles_directory``.
+    # HTTPServer instantiates the handler class per-request, so we inject
+    # config via a dynamic subclass rather than constructor args.
     handler = type(
         "_BoundHandler",
         (_ViewerHandler,),

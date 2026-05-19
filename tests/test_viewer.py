@@ -6,8 +6,8 @@ import importlib
 import json
 import socket
 import threading
-import time
 import urllib.request
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -41,71 +41,49 @@ def tileset_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture()
+def running_server(tileset_dir: Path) -> Generator[tuple[str, int], None, None]:
+    """Start a viewer server and yield ``(base_url, port)``, shutting down on exit."""
+    port = _free_port()
+    server = create_server(tileset_dir, port=port)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://localhost:{port}", port
+    server.shutdown()
+
+
 class TestViewerServer:
-    def test_serves_index_html(self, tileset_dir: Path) -> None:
-        port = _free_port()
-        server = create_server(tileset_dir, port=port)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            resp = urllib.request.urlopen(f"http://localhost:{port}/")
-            body = resp.read().decode()
-            assert "3dgs_io Viewer" in body
-            assert resp.status == 200
-            assert resp.headers["Access-Control-Allow-Origin"] == "*"
-        finally:
-            server.shutdown()
+    def test_serves_index_html(self, running_server: tuple[str, int]) -> None:
+        base_url, _ = running_server
+        resp = urllib.request.urlopen(f"{base_url}/")
+        body = resp.read().decode()
+        assert "3dgs_io Viewer" in body
+        assert resp.status == 200
+        assert resp.headers["Access-Control-Allow-Origin"] == "*"
 
-    def test_serves_tileset_json(self, tileset_dir: Path) -> None:
-        port = _free_port()
-        server = create_server(tileset_dir, port=port)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            resp = urllib.request.urlopen(f"http://localhost:{port}/tiles/tileset.json")
-            data = json.loads(resp.read())
-            assert data["asset"]["version"] == "1.1"
-            assert "application/json" in resp.headers["Content-Type"]
-        finally:
-            server.shutdown()
+    def test_serves_tileset_json(self, running_server: tuple[str, int]) -> None:
+        base_url, _ = running_server
+        resp = urllib.request.urlopen(f"{base_url}/tiles/tileset.json")
+        data = json.loads(resp.read())
+        assert data["asset"]["version"] == "1.1"
+        assert "application/json" in resp.headers["Content-Type"]
 
-    def test_404_for_missing_file(self, tileset_dir: Path) -> None:
-        port = _free_port()
-        server = create_server(tileset_dir, port=port)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with pytest.raises(urllib.error.HTTPError, match="404"):
-                urllib.request.urlopen(f"http://localhost:{port}/tiles/nonexistent.json")
-        finally:
-            server.shutdown()
+    def test_404_for_missing_file(self, running_server: tuple[str, int]) -> None:
+        base_url, _ = running_server
+        with pytest.raises(urllib.error.HTTPError, match="404"):
+            urllib.request.urlopen(f"{base_url}/tiles/nonexistent.json")
 
-    def test_path_traversal_blocked(self, tileset_dir: Path) -> None:
-        port = _free_port()
-        server = create_server(tileset_dir, port=port)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with pytest.raises(urllib.error.HTTPError):
-                urllib.request.urlopen(f"http://localhost:{port}/tiles/../../../etc/passwd")
-        finally:
-            server.shutdown()
+    def test_path_traversal_blocked(self, running_server: tuple[str, int]) -> None:
+        base_url, _ = running_server
+        with pytest.raises(urllib.error.HTTPError):
+            urllib.request.urlopen(f"{base_url}/tiles/../../../etc/passwd")
 
-    def test_cors_on_options(self, tileset_dir: Path) -> None:
-        port = _free_port()
-        server = create_server(tileset_dir, port=port)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            req = urllib.request.Request(
-                f"http://localhost:{port}/tiles/tileset.json",
-                method="OPTIONS",
-            )
-            resp = urllib.request.urlopen(req)
-            assert resp.status == 200
-            assert resp.headers["Access-Control-Allow-Origin"] == "*"
-        finally:
-            server.shutdown()
+    def test_cors_on_options(self, running_server: tuple[str, int]) -> None:
+        base_url, _ = running_server
+        req = urllib.request.Request(f"{base_url}/tiles/tileset.json", method="OPTIONS")
+        resp = urllib.request.urlopen(req)
+        assert resp.status == 200
+        assert resp.headers["Access-Control-Allow-Origin"] == "*"
 
 
 class TestLaunchViewer:
@@ -114,23 +92,13 @@ class TestLaunchViewer:
             launch_viewer("/nonexistent/path", open_browser=False)
 
     def test_accepts_tileset_json_path(self, tileset_dir: Path) -> None:
-        """launch_viewer should accept a direct path to tileset.json."""
+        """launch_viewer resolves a tileset.json path to its parent directory."""
         port = _free_port()
-
-        def _run() -> None:
-            launch_viewer(
-                tileset_dir / "tileset.json",
-                port=port,
-                open_browser=False,
-            )
-
-        thread = threading.Thread(target=_run, daemon=True)
+        server = create_server(tileset_dir, port=port)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        time.sleep(0.5)  # let server start
-
         try:
             resp = urllib.request.urlopen(f"http://localhost:{port}/tiles/tileset.json")
             assert resp.status == 200
         finally:
-            # Server will be cleaned up when thread is daemonized
-            pass
+            server.shutdown()
