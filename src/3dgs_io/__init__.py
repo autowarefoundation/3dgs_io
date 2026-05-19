@@ -19,6 +19,7 @@ from .metadata import (
     serialize_metadata,
 )
 from .spz_io import load_ply, load_spz, save_ply, save_spz
+from .tiles_export import TilesetSaveOptions, save_tileset
 from .tiles_io import (
     LayerType,
     LidarTile3DContent,
@@ -54,7 +55,9 @@ __all__ = [
     "load_ply",
     "save_ply",
     "Tile3DContent",
+    "TilesetSaveOptions",
     "load_tileset",
     "merge_tileset",
+    "save_tileset",
     "launch_viewer",
 ]
