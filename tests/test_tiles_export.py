@@ -12,7 +12,6 @@ import spz
 
 _mod = importlib.import_module("3dgs_io")
 save_tileset = _mod.save_tileset
-export_tileset = _mod.export_tileset
 load_tileset = _mod.load_tileset
 load_gltf = _mod.load_gltf
 save_gltf = _mod.save_gltf
@@ -40,7 +39,9 @@ def _make_cloud(n: int = 200, seed: int = 42, spread: float = 10.0) -> GaussianC
     return gc
 
 
-class TestSaveTileset:
+class TestSaveFromCloud:
+    """Tests for save_tileset with a GaussianCloud source."""
+
     def test_produces_tileset_json(self, tmp_path: Path) -> None:
         gc = _make_cloud(100)
         result = save_tileset(gc, tmp_path / "tiles")
@@ -131,11 +132,11 @@ class TestSaveTileset:
         assert (out / "tileset.json").exists()
 
 
-class TestExportTileset:
-    """Tests for export_tileset (streaming re-chunk from existing tileset)."""
+class TestSaveFromTileset:
+    """Tests for save_tileset with a tileset path source (streaming re-chunk)."""
 
     def _save_source(self, tmp_path: Path, n: int = 200, chunk_size: float = 100.0) -> Path:
-        """Create a source tileset via save_tileset for export_tileset to consume."""
+        """Create a source tileset via save_tileset for re-chunking."""
         gc = _make_cloud(n, spread=10.0)
         src = tmp_path / "source"
         save_tileset(gc, src, TilesetSaveOptions(chunk_size=chunk_size))
@@ -144,7 +145,7 @@ class TestExportTileset:
     def test_produces_tileset_json(self, tmp_path: Path) -> None:
         source = self._save_source(tmp_path)
         out = tmp_path / "rechunked"
-        result = export_tileset(source, out)
+        result = save_tileset(source, out)
         assert result.name == "tileset.json"
         assert result.exists()
         tileset = json.loads(result.read_text())
@@ -156,7 +157,7 @@ class TestExportTileset:
         n = 300
         source = self._save_source(tmp_path, n=n, chunk_size=100.0)
         out = tmp_path / "rechunked"
-        export_tileset(source, out, TilesetSaveOptions(chunk_size=5.0))
+        save_tileset(source, out, TilesetSaveOptions(chunk_size=5.0))
 
         total = 0
         for glb in sorted(out.glob("chunk_*.glb")):
@@ -169,17 +170,16 @@ class TestExportTileset:
         source = self._save_source(tmp_path, n=200, chunk_size=100.0)
 
         out = tmp_path / "rechunked"
-        export_tileset(source, out, TilesetSaveOptions(chunk_size=5.0))
+        save_tileset(source, out, TilesetSaveOptions(chunk_size=5.0))
         glb_files = list(out.glob("chunk_*.glb"))
         assert len(glb_files) >= 2
 
     def test_large_chunk_size_merges(self, tmp_path: Path) -> None:
         """Re-chunking with a huge grid should merge everything into one tile."""
-        # First create multi-chunk source
         source = self._save_source(tmp_path, n=200, chunk_size=5.0)
 
         out = tmp_path / "rechunked"
-        export_tileset(source, out, TilesetSaveOptions(chunk_size=1000.0))
+        save_tileset(source, out, TilesetSaveOptions(chunk_size=1000.0))
         glb_files = list(out.glob("chunk_*.glb"))
         assert len(glb_files) == 1
 
@@ -187,7 +187,7 @@ class TestExportTileset:
         n = 200
         source = self._save_source(tmp_path, n=n, chunk_size=100.0)
         out = tmp_path / "rechunked"
-        tileset_path = export_tileset(source, out, TilesetSaveOptions(chunk_size=8.0))
+        tileset_path = save_tileset(source, out, TilesetSaveOptions(chunk_size=8.0))
 
         tiles = load_tileset(tileset_path)
         total = sum(t.cloud.num_points for t in tiles)
@@ -196,7 +196,7 @@ class TestExportTileset:
     def test_bounding_volumes_valid(self, tmp_path: Path) -> None:
         source = self._save_source(tmp_path, n=200)
         out = tmp_path / "rechunked"
-        export_tileset(source, out, TilesetSaveOptions(chunk_size=5.0))
+        save_tileset(source, out, TilesetSaveOptions(chunk_size=5.0))
         tileset = json.loads((out / "tileset.json").read_text())
         root_box = tileset["root"]["boundingVolume"]["box"]
         assert len(root_box) == 12
@@ -246,7 +246,7 @@ class TestExportTileset:
         tileset_path.write_text(json.dumps(tileset))
 
         out = tmp_path / "rechunked"
-        export_tileset(tileset_path, out, TilesetSaveOptions(chunk_size=1000.0))
+        save_tileset(tileset_path, out, TilesetSaveOptions(chunk_size=1000.0))
 
         # All points should be shifted by (100, 100, 100)
         rechunked_gc = load_gltf(next(out.glob("chunk_*.glb")))
@@ -258,7 +258,7 @@ class TestExportTileset:
     def test_creates_output_directory(self, tmp_path: Path) -> None:
         source = self._save_source(tmp_path, n=50)
         out = tmp_path / "nested" / "deep" / "tiles"
-        export_tileset(source, out)
+        save_tileset(source, out)
         assert (out / "tileset.json").exists()
 
     def test_spz_compression_forwarded(self, tmp_path: Path) -> None:
@@ -267,7 +267,7 @@ class TestExportTileset:
         opts = TilesetSaveOptions(
             save_options=GltfSaveOptions(spz_compression=True),
         )
-        export_tileset(source, out, opts)
+        save_tileset(source, out, opts)
         glb = next(out.glob("chunk_*.glb"))
         chunk_gc = load_gltf(glb)
         assert chunk_gc.num_points > 0

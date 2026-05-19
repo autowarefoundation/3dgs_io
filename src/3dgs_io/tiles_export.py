@@ -1,11 +1,9 @@
 """3D Tiles (OGC) writer with spatial chunk splitting.
 
-Provides two public functions:
-
-* :func:`save_tileset` — split a single :class:`~spz.GaussianCloud` that is
-  already in memory.
-* :func:`export_tileset` — read an existing ``tileset.json`` tile-by-tile and
-  re-chunk it, keeping only one input tile in memory at a time.
+:func:`save_tileset` accepts either an in-memory :class:`~spz.GaussianCloud`
+or a path / URL to an existing ``tileset.json``.  When given a path the
+tiles are read one-by-one and re-chunked, keeping only one input tile in
+memory at a time.
 """
 
 from __future__ import annotations
@@ -61,21 +59,23 @@ class _CellAccumulator:
 
 
 # ---------------------------------------------------------------------------
-# In-memory export (GaussianCloud already loaded)
+# Public API
 # ---------------------------------------------------------------------------
 
 
 def save_tileset(
-    gc: spz.GaussianCloud,
+    source: spz.GaussianCloud | str | Path,
     output_dir: str | Path,
     options: TilesetSaveOptions | None = None,
 ) -> Path:
-    """Split a GaussianCloud into spatial chunks and write a 3D Tiles tileset.
+    """Split a point source into spatial chunks and write a 3D Tiles tileset.
 
     Parameters
     ----------
-    gc:
-        The Gaussian cloud to export.
+    source:
+        Either a :class:`~spz.GaussianCloud` already in memory, or a path /
+        URL to an existing ``tileset.json``.  When a tileset is given, tiles
+        are loaded one-by-one and re-chunked (memory-efficient streaming).
     output_dir:
         Directory where ``tileset.json`` and chunk GLB files are written.
         Created if it does not exist.
@@ -89,16 +89,32 @@ def save_tileset(
     if options is None:
         options = TilesetSaveOptions()
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    n = gc.num_points
-    if n == 0:
-        raise ValueError("Cannot export an empty GaussianCloud")
-
     cs = float(options.chunk_size)
     if cs <= 0:
         raise ValueError(f"chunk_size must be positive, got {cs}")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(source, spz.GaussianCloud):
+        return _save_from_cloud(source, output_dir, cs, options)
+    return _save_from_tileset(source, output_dir, cs, options)
+
+
+# ---------------------------------------------------------------------------
+# GaussianCloud path (all data already in memory)
+# ---------------------------------------------------------------------------
+
+
+def _save_from_cloud(
+    gc: spz.GaussianCloud,
+    output_dir: Path,
+    cs: float,
+    options: TilesetSaveOptions,
+) -> Path:
+    n = gc.num_points
+    if n == 0:
+        raise ValueError("Cannot export an empty GaussianCloud")
 
     positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
     rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
@@ -153,46 +169,16 @@ def save_tileset(
 
 
 # ---------------------------------------------------------------------------
-# Streaming export (reads tiles one-by-one from an existing tileset)
+# Tileset path (streaming re-chunk)
 # ---------------------------------------------------------------------------
 
 
-def export_tileset(
+def _save_from_tileset(
     source: str | Path,
-    output_dir: str | Path,
-    options: TilesetSaveOptions | None = None,
+    output_dir: Path,
+    cs: float,
+    options: TilesetSaveOptions,
 ) -> Path:
-    """Re-chunk an existing 3D Tiles tileset, loading one tile at a time.
-
-    This is the memory-efficient counterpart to loading the entire tileset
-    with :func:`~3dgs_io.load_tileset`, merging it, and calling
-    :func:`save_tileset`.  Only one input tile is in memory at any point;
-    the output cell accumulators grow incrementally.
-
-    Parameters
-    ----------
-    source:
-        Path or URL to the source ``tileset.json``.
-    output_dir:
-        Directory where the re-chunked ``tileset.json`` and GLB files are
-        written.  Created if it does not exist.
-    options:
-        Export options.  See :class:`TilesetSaveOptions`.
-
-    Returns
-    -------
-    Path to the generated ``tileset.json``.
-    """
-    if options is None:
-        options = TilesetSaveOptions()
-
-    cs = float(options.chunk_size)
-    if cs <= 0:
-        raise ValueError(f"chunk_size must be positive, got {cs}")
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     base_url, tileset = _fetch_json(source)
     root = tileset.get("root")
     if root is None:

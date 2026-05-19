@@ -19,7 +19,7 @@ from .metadata import (
     serialize_metadata,
 )
 from .spz_io import load_ply, load_spz, save_ply, save_spz
-from .tiles_export import TilesetSaveOptions, export_tileset, save_tileset
+from .tiles_export import TilesetSaveOptions, save_tileset
 from .tiles_io import (
     LayerType,
     LidarTile3DContent,
@@ -33,7 +33,6 @@ __all__ = [
     "Checkpoint",
     "DatasetType",
     "Export",
-    "export_tileset",
     "GaussianCloud",
     "GlbMetadata",
     "GltfSaveOptions",
