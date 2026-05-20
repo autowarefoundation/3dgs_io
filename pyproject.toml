@@ -22,9 +22,12 @@ spz = { git = "https://github.com/nianticlabs/spz.git", rev="v2.1.0"}
 
 [dependency-groups]
 dev = [
+    "furo>=2024.8.6",
     "pre-commit>=4.0.0",
     "pytest>=9.0.3",
     "ruff>=0.14.0",
+    "sphinx>=8.0",
+    "sphinx-autodoc-typehints>=2.0",
 ]
 
 [tool.ruff]
