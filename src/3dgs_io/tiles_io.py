@@ -4,8 +4,9 @@ Traverses a ``tileset.json`` (local file or HTTP/HTTPS URL), fetches each tile's
 glTF/GLB content, and returns one or more cloud objects.
 
 Supports:
-* **Single content** — ``content.uri`` (legacy / simple tilesets).
-* **Multiple contents** — ``contents`` array with ``group`` indices
+
+* **Single content** -- ``content.uri`` (legacy / simple tilesets).
+* **Multiple contents** -- ``contents`` array with ``group`` indices
   (3D Tiles 1.1) for mixed Camera 3DGS + LiDAR 2DGS tilesets.
 
 Only explicit (non-implicit) tiling and cumulative ``transform`` matrices are
