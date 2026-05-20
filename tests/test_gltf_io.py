@@ -140,25 +140,31 @@ def test_glb_json_structure(tmp_path: Path) -> None:
     gltf = json.loads(json_bytes)
 
     assert _EXT in gltf["extensionsUsed"]
-    assert _EXT in gltf["extensionsRequired"]
+    # extensionsRequired should NOT be present (graceful fallback)
+    assert "extensionsRequired" not in gltf
 
     prim = gltf["meshes"][0]["primitives"][0]
     assert prim["mode"] == 0
     attrs = prim["attributes"]
 
+    # Only standard attributes in the attributes dict
     assert "POSITION" in attrs
     assert "COLOR_0" in attrs
-    assert f"{_EXT}:ROTATION" in attrs
-    assert f"{_EXT}:SCALE" in attrs
-    assert f"{_EXT}:OPACITY" in attrs
-    assert f"{_EXT}:SH_DEGREE_0_COEF_0" in attrs
+    assert len(attrs) == 2
 
-    assert "_ROTATION" not in attrs
-    assert "_SCALE" not in attrs
+    # No colon-prefixed keys in attributes (would break CesiumJS shaders)
+    assert not any(":" in k for k in attrs)
 
     ext_props = prim["extensions"][_EXT]
     assert ext_props["kernel"] == "ellipse"
     assert ext_props["colorSpace"] == "srgb_rec709_display"
+
+    # Gaussian data referenced from extension block as accessor indices
+    assert isinstance(ext_props["rotation"], int)
+    assert isinstance(ext_props["scale"], int)
+    assert isinstance(ext_props["opacity"], int)
+    assert isinstance(ext_props["sh"], list)
+    assert len(ext_props["sh"]) >= 1  # at least DC
 
     assert len(gltf["accessors"]) == 6
     assert len(gltf["bufferViews"]) == 6
@@ -167,12 +173,12 @@ def test_glb_json_structure(tmp_path: Path) -> None:
     assert "min" in pos_acc
     assert "max" in pos_acc
 
-    opa_acc = gltf["accessors"][attrs[f"{_EXT}:OPACITY"]]
+    opa_acc = gltf["accessors"][ext_props["opacity"]]
     assert opa_acc["type"] == "SCALAR"
     assert opa_acc["componentType"] == 5121
     assert opa_acc["normalized"] is True
 
-    sh_acc = gltf["accessors"][attrs[f"{_EXT}:SH_DEGREE_0_COEF_0"]]
+    sh_acc = gltf["accessors"][ext_props["sh"][0]]
     assert sh_acc["type"] == "VEC3"
     assert sh_acc["componentType"] == 5126
 
@@ -196,12 +202,19 @@ def test_glb_spz_json_structure(tmp_path: Path) -> None:
 
     prim = gltf["meshes"][0]["primitives"][0]
     attrs = prim["attributes"]
+
+    # Only standard attributes in the attributes dict
     assert "POSITION" in attrs
     assert "COLOR_0" in attrs
-    assert f"{_EXT}:SCALE" in attrs
-    assert f"{_EXT}:ROTATION" in attrs
+    assert len(attrs) == 2
 
+    # No colon-prefixed keys in attributes
+    assert not any(":" in k for k in attrs)
+
+    # Gaussian data referenced from extension block
     ext_gs = prim["extensions"][_EXT]
+    assert isinstance(ext_gs["scale"], int)
+    assert isinstance(ext_gs["rotation"], int)
     spz_sub = ext_gs["extensions"][_SPZ_EXT]
     assert "bufferView" in spz_sub
 
@@ -262,6 +275,142 @@ def test_buffer_alignment(n: int, tmp_path: Path) -> None:
 
 
 # ── backward compatibility with legacy format ─────────────────────────────
+
+
+def test_load_legacy_colon_attributes(tmp_path: Path) -> None:
+    """Can load files with colon-prefixed attribute names (pre-fix format)."""
+    n = 5
+    rng = np.random.default_rng(77)
+    positions = rng.standard_normal((n, 3)).astype(np.float32)
+    rotations = rng.standard_normal((n, 4)).astype(np.float32)
+    rotations /= np.linalg.norm(rotations, axis=1, keepdims=True)
+    scales = rng.standard_normal((n, 3)).astype(np.float32)
+    sh_dc = rng.standard_normal((n, 3)).astype(np.float32)
+    opacity_u8 = rng.integers(1, 255, (n,), dtype=np.uint8)
+
+    rgb_01 = np.clip(sh_dc * _SH_C0 + 0.5, 0, 1)
+    rgb_u8 = np.clip(rgb_01 * 255 + 0.5, 0, 255).astype(np.uint8)
+    color_0 = np.empty((n, 4), dtype=np.uint8)
+    color_0[:, :3] = rgb_u8
+    color_0[:, 3] = opacity_u8
+
+    # Build a GLB with colon-prefixed attributes in the attributes dict
+    all_data = [
+        positions.tobytes(),
+        color_0.tobytes(),
+        rotations.tobytes(),
+        scales.tobytes(),
+        opacity_u8.tobytes(),
+        sh_dc.tobytes(),
+    ]
+    offset = 0
+    offsets, lengths = [], []
+    for d in all_data:
+        pad = (4 - offset % 4) % 4
+        offset += pad
+        offsets.append(offset)
+        lengths.append(len(d))
+        offset += len(d)
+    buffer_parts = []
+    cur = 0
+    for d in all_data:
+        pad = (4 - cur % 4) % 4
+        if pad:
+            buffer_parts.append(b"\x00" * pad)
+            cur += pad
+        buffer_parts.append(d)
+        cur += len(d)
+    buffer_data = b"".join(buffer_parts)
+
+    gltf_dict = {
+        "asset": {"version": "2.0"},
+        "extensionsUsed": [_EXT],
+        "extensionsRequired": [_EXT],
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [
+            {
+                "primitives": [
+                    {
+                        "mode": 0,
+                        "attributes": {
+                            "POSITION": 0,
+                            "COLOR_0": 1,
+                            f"{_EXT}:ROTATION": 2,
+                            f"{_EXT}:SCALE": 3,
+                            f"{_EXT}:OPACITY": 4,
+                            f"{_EXT}:SH_DEGREE_0_COEF_0": 5,
+                        },
+                        "extensions": {
+                            _EXT: {
+                                "kernel": "ellipse",
+                                "colorSpace": "srgb_rec709_display",
+                            }
+                        },
+                    }
+                ]
+            }
+        ],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": n,
+                "type": "VEC3",
+                "min": positions.min(axis=0).tolist(),
+                "max": positions.max(axis=0).tolist(),
+            },
+            {
+                "bufferView": 1,
+                "componentType": 5121,
+                "count": n,
+                "type": "VEC4",
+                "normalized": True,
+            },
+            {"bufferView": 2, "componentType": 5126, "count": n, "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5126, "count": n, "type": "VEC3"},
+            {
+                "bufferView": 4,
+                "componentType": 5121,
+                "count": n,
+                "type": "SCALAR",
+                "normalized": True,
+            },
+            {"bufferView": 5, "componentType": 5126, "count": n, "type": "VEC3"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": offsets[i], "byteLength": lengths[i]} for i in range(6)
+        ],
+        "buffers": [{"byteLength": len(buffer_data)}],
+    }
+
+    json_bytes = json.dumps(gltf_dict, separators=(",", ":")).encode("utf-8")
+    json_pad = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b"\x20" * json_pad
+    bin_pad = (4 - len(buffer_data) % 4) % 4
+    bin_data = buffer_data + b"\x00" * bin_pad
+
+    path = tmp_path / "legacy_colon.glb"
+    with open(path, "wb") as f:
+        total = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
+        f.write(b"glTF")
+        f.write(struct.pack("<II", 2, total))
+        f.write(struct.pack("<II", len(json_bytes), 0x4E4F534A))
+        f.write(json_bytes)
+        f.write(struct.pack("<II", len(bin_data), 0x004E4942))
+        f.write(bin_data)
+
+    loaded = load_gltf(path)
+    assert loaded.num_points == n
+    np.testing.assert_array_equal(
+        np.array(loaded.positions, dtype=np.float32).reshape(n, 3), positions
+    )
+    np.testing.assert_array_equal(
+        np.array(loaded.rotations, dtype=np.float32).reshape(n, 4), rotations
+    )
+    np.testing.assert_array_equal(np.array(loaded.scales, dtype=np.float32).reshape(n, 3), scales)
+    np.testing.assert_array_equal(np.array(loaded.colors, dtype=np.float32).reshape(n, 3), sh_dc)
 
 
 def test_load_legacy_format(tmp_path: Path) -> None:

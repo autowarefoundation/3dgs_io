@@ -141,19 +141,18 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
     pos_min = positions.min(axis=0).tolist()
     pos_max = positions.max(axis=0).tolist()
 
-    _ROT = f"{_EXTENSION_NAME}:ROTATION"
-    _SCL = f"{_EXTENSION_NAME}:SCALE"
-    _OPA = f"{_EXTENSION_NAME}:OPACITY"
-    _SH0 = f"{_EXTENSION_NAME}:SH_DEGREE_0_COEF_0"
-
-    # (name, bytes, componentType, accessorType, extra_fields)
-    attr_list: list[tuple[str, bytes, int, str, dict]] = [
-        ("POSITION", positions.tobytes(), _FLOAT, "VEC3", {"min": pos_min, "max": pos_max}),
-        ("COLOR_0", color_0.tobytes(), _UNSIGNED_BYTE, "VEC4", {"normalized": True}),
-        (_ROT, rotations.tobytes(), _FLOAT, "VEC4", {}),
-        (_SCL, scales.tobytes(), _FLOAT, "VEC3", {}),
-        (_OPA, opacity_u8.tobytes(), _UNSIGNED_BYTE, "SCALAR", {"normalized": True}),
-        (_SH0, sh_dc.tobytes(), _FLOAT, "VEC3", {}),
+    # All data arrays for the binary buffer, in accessor order.
+    # Indices 0-1: standard glTF attributes (safe for any viewer).
+    # Indices 2+: Gaussian data referenced only from the extension block,
+    # keeping them out of the attributes dict to avoid GLSL variable name
+    # issues in viewers that generate shader code from attribute names.
+    data_list: list[tuple[bytes, int, str, dict]] = [
+        (positions.tobytes(), _FLOAT, "VEC3", {"min": pos_min, "max": pos_max}),
+        (color_0.tobytes(), _UNSIGNED_BYTE, "VEC4", {"normalized": True}),
+        (rotations.tobytes(), _FLOAT, "VEC4", {}),
+        (scales.tobytes(), _FLOAT, "VEC3", {}),
+        (opacity_u8.tobytes(), _UNSIGNED_BYTE, "SCALAR", {"normalized": True}),
+        (sh_dc.tobytes(), _FLOAT, "VEC3", {}),
     ]
 
     # Higher SH degrees
@@ -163,23 +162,20 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
         coef_idx = 0
         for degree in range(1, sh_degree + 1):
             num_coefs = 2 * degree + 1
-            for j in range(num_coefs):
-                name = f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"
+            for _j in range(num_coefs):
                 data = (
                     np.ascontiguousarray(sh_reshaped[:, coef_idx, :]).astype(np.float32).tobytes()
                 )
-                attr_list.append((name, data, _FLOAT, "VEC3", {}))
+                data_list.append((data, _FLOAT, "VEC3", {}))
                 coef_idx += 1
 
     # Pack buffer
-    buffer_data, offsets, lengths = _pack_buffer([d for _, d, _, _, _ in attr_list])
+    buffer_data, offsets, lengths = _pack_buffer([d for d, _, _, _ in data_list])
+    num_data = len(data_list)
 
-    # Build JSON
-    attrs_dict = {name: i for i, (name, _, _, _, _) in enumerate(attr_list)}
-    num_attrs = len(attr_list)
-
+    # Build accessors
     accessors = []
-    for i, (_, _, comp_type, acc_type, extras) in enumerate(attr_list):
+    for i, (_, comp_type, acc_type, extras) in enumerate(data_list):
         acc: dict = {
             "bufferView": i,
             "componentType": comp_type,
@@ -197,7 +193,6 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
     gltf_dict: dict = {
         "asset": asset,
         "extensionsUsed": [_EXTENSION_NAME],
-        "extensionsRequired": [_EXTENSION_NAME],
         "scene": 0,
         "scenes": [{"nodes": [0]}],
         "nodes": [{"mesh": 0}],
@@ -206,11 +201,18 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
                 "primitives": [
                     {
                         "mode": 0,
-                        "attributes": attrs_dict,
+                        "attributes": {
+                            "POSITION": 0,
+                            "COLOR_0": 1,
+                        },
                         "extensions": {
                             _EXTENSION_NAME: {
                                 "kernel": "ellipse",
                                 "colorSpace": "srgb_rec709_display",
+                                "rotation": 2,
+                                "scale": 3,
+                                "opacity": 4,
+                                "sh": list(range(5, num_data)),
                             }
                         },
                     }
@@ -220,7 +222,7 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
         "accessors": accessors,
         "bufferViews": [
             {"buffer": 0, "byteOffset": offsets[i], "byteLength": lengths[i]}
-            for i in range(num_attrs)
+            for i in range(num_data)
         ],
         "buffers": [{"byteLength": len(buffer_data)}],
     }
@@ -278,18 +280,12 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
         },
     ]
 
-    attributes: dict[str, int] = {
-        "POSITION": 0,
-        "COLOR_0": 1,
-        f"{_EXTENSION_NAME}:SCALE": 2,
-        f"{_EXTENSION_NAME}:ROTATION": 3,
-    }
-
     # SH coefficient virtual accessors
+    sh_accessor_indices: list[int] = []
     acc_idx = 4
     for degree in range(1, sh_degree + 1):
         num_coefs = 2 * degree + 1
-        for j in range(num_coefs):
+        for _j in range(num_coefs):
             accessors.append(
                 {
                     "componentType": _FLOAT,
@@ -297,8 +293,24 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
                     "type": "VEC3",
                 }
             )
-            attributes[f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"] = acc_idx
+            sh_accessor_indices.append(acc_idx)
             acc_idx += 1
+
+    # Gaussian data is referenced from the extension block, not from the
+    # attributes dict.  Colon-prefixed attribute names
+    # ("KHR_gaussian_splatting:ROTATION" etc.) cause GLSL syntax errors in
+    # viewers that derive shader variable names from the attributes dict.
+    gs_ext: dict[str, Any] = {
+        "scale": 2,
+        "rotation": 3,
+        "extensions": {
+            _SPZ_EXTENSION_NAME: {
+                "bufferView": 0,
+            }
+        },
+    }
+    if sh_accessor_indices:
+        gs_ext["sh"] = sh_accessor_indices
 
     asset: dict[str, Any] = {"version": "2.0", "generator": "3dgs-io"}
     extras = serialize_metadata(options.metadata)
@@ -317,15 +329,12 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
                 "primitives": [
                     {
                         "mode": 0,
-                        "attributes": attributes,
+                        "attributes": {
+                            "POSITION": 0,
+                            "COLOR_0": 1,
+                        },
                         "extensions": {
-                            _EXTENSION_NAME: {
-                                "extensions": {
-                                    _SPZ_EXTENSION_NAME: {
-                                        "bufferView": 0,
-                                    }
-                                },
-                            }
+                            _EXTENSION_NAME: gs_ext,
                         },
                     }
                 ]
@@ -426,71 +435,96 @@ def _parse_standard(
     accessors = gltf_dict["accessors"]
     buffer_views = gltf_dict["bufferViews"]
 
+    # Extension block (new format stores accessor indices here)
+    gs_ext = primitive.get("extensions", {}).get(_EXTENSION_NAME, {})
+
     # POSITION
     positions = _read_accessor(accessors[attrs["POSITION"]], buffer_views, buffer_data)
 
-    # ROTATION
-    rot_key = _attr_key(attrs, f"{_EXTENSION_NAME}:ROTATION", "_ROTATION")
-    if rot_key is None:
-        raise ValueError("No rotation attribute found")
-    rotations = _read_accessor(accessors[attrs[rot_key]], buffer_views, buffer_data)
+    # ROTATION — try extension block first, then legacy attribute names
+    rot_idx = gs_ext.get("rotation")
+    if rot_idx is None:
+        rot_key = _attr_key(attrs, f"{_EXTENSION_NAME}:ROTATION", "_ROTATION")
+        if rot_key is None:
+            raise ValueError("No rotation attribute found")
+        rot_idx = attrs[rot_key]
+    rotations = _read_accessor(accessors[rot_idx], buffer_views, buffer_data)
 
     # SCALE
-    scale_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SCALE", "_SCALE")
-    if scale_key is None:
-        raise ValueError("No scale attribute found")
-    scales = _read_accessor(accessors[attrs[scale_key]], buffer_views, buffer_data)
+    scl_idx = gs_ext.get("scale")
+    if scl_idx is None:
+        scale_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SCALE", "_SCALE")
+        if scale_key is None:
+            raise ValueError("No scale attribute found")
+        scl_idx = attrs[scale_key]
+    scales = _read_accessor(accessors[scl_idx], buffer_views, buffer_data)
 
     # OPACITY → logit
-    opacity_key = _attr_key(attrs, f"{_EXTENSION_NAME}:OPACITY")
-    if opacity_key is not None:
-        raw = _read_accessor(accessors[attrs[opacity_key]], buffer_views, buffer_data)
+    opa_idx = gs_ext.get("opacity")
+    if opa_idx is not None:
+        raw = _read_accessor(accessors[opa_idx], buffer_views, buffer_data)
         if raw.dtype == np.float32:
             alphas = _inverse_sigmoid(raw)
         else:
-            # uint8 normalized: value/255 gives [0, 1]
             alphas = _inverse_sigmoid(raw.astype(np.float32) / 255.0)
-    elif "COLOR_0" in attrs:
-        color_0 = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
-        if color_0.dtype == np.float32:
-            alphas = _inverse_sigmoid(color_0[:, 3])
-        else:
-            alphas = _inverse_sigmoid(color_0[:, 3].astype(np.float32) / 255.0)
     else:
-        raise ValueError("No opacity data found")
+        opacity_key = _attr_key(attrs, f"{_EXTENSION_NAME}:OPACITY")
+        if opacity_key is not None:
+            raw = _read_accessor(accessors[attrs[opacity_key]], buffer_views, buffer_data)
+            if raw.dtype == np.float32:
+                alphas = _inverse_sigmoid(raw)
+            else:
+                alphas = _inverse_sigmoid(raw.astype(np.float32) / 255.0)
+        elif "COLOR_0" in attrs:
+            color_0 = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
+            if color_0.dtype == np.float32:
+                alphas = _inverse_sigmoid(color_0[:, 3])
+            else:
+                alphas = _inverse_sigmoid(color_0[:, 3].astype(np.float32) / 255.0)
+        else:
+            raise ValueError("No opacity data found")
 
-    # COLORS (SH DC) from SH_DEGREE_0_COEF_0 or COLOR_0
-    sh_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SH_DEGREE_0_COEF_0")
-    if sh_key is not None:
-        # SH DC coefficients → gc.colors directly
-        colors_sh = _read_accessor(accessors[attrs[sh_key]], buffer_views, buffer_data).astype(
+    # COLORS (SH DC) and higher SH coefficients
+    sh_indices = gs_ext.get("sh")
+    if sh_indices is not None and len(sh_indices) > 0:
+        # New format: sh[0] is DC, sh[1:] are higher degree coefficients
+        colors_sh = _read_accessor(accessors[sh_indices[0]], buffer_views, buffer_data).astype(
             np.float32
         )
-    elif "COLOR_0" in attrs:
-        raw = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
-        if raw.dtype == np.float32:
-            rgb_01 = raw[:, :3]
-        else:
-            rgb_01 = raw[:, :3].astype(np.float32) / 255.0
-        # RGB [0,1] → SH DC: sh = (rgb - 0.5) / C0
-        colors_sh = (rgb_01 - 0.5) / _SH_C0
+        sh_coefficients: list[np.ndarray] = []
+        for idx in sh_indices[1:]:
+            coef = _read_accessor(accessors[idx], buffer_views, buffer_data)
+            sh_coefficients.append(coef.astype(np.float32))
     else:
-        raise ValueError("No color data found")
+        # Legacy format: colon-prefixed attribute names
+        sh_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SH_DEGREE_0_COEF_0")
+        if sh_key is not None:
+            colors_sh = _read_accessor(accessors[attrs[sh_key]], buffer_views, buffer_data).astype(
+                np.float32
+            )
+        elif "COLOR_0" in attrs:
+            raw = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
+            if raw.dtype == np.float32:
+                rgb_01 = raw[:, :3]
+            else:
+                rgb_01 = raw[:, :3].astype(np.float32) / 255.0
+            colors_sh = (rgb_01 - 0.5) / _SH_C0
+        else:
+            raise ValueError("No color data found")
 
-    # Higher SH degrees (1-3)
-    sh_coefficients: list[np.ndarray] = []
-    for degree in range(1, 4):
-        num_coefs = 2 * degree + 1
-        degree_data: list[np.ndarray] = []
-        for j in range(num_coefs):
-            key = f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"
-            if key not in attrs:
+        sh_coefficients = []
+        for degree in range(1, 4):
+            num_coefs = 2 * degree + 1
+            degree_data: list[np.ndarray] = []
+            for j in range(num_coefs):
+                key = f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"
+                if key not in attrs:
+                    break
+                coef = _read_accessor(accessors[attrs[key]], buffer_views, buffer_data)
+                degree_data.append(coef.astype(np.float32))
+            if len(degree_data) != num_coefs:
                 break
-            coef = _read_accessor(accessors[attrs[key]], buffer_views, buffer_data)
-            degree_data.append(coef.astype(np.float32))
-        if len(degree_data) != num_coefs:
-            break
-        sh_coefficients.extend(degree_data)
+            sh_coefficients.extend(degree_data)
 
     # Build GaussianCloud
     gc = spz.GaussianCloud()
@@ -501,6 +535,14 @@ def _parse_standard(
     gc.scales = scales.astype(np.float32).reshape(-1)
 
     if sh_coefficients:
+        # Infer SH degree from coefficient count and set BEFORE assigning sh
+        n_coefs = len(sh_coefficients)
+        if n_coefs >= 15:
+            gc.sh_degree = 3
+        elif n_coefs >= 8:
+            gc.sh_degree = 2
+        elif n_coefs >= 3:
+            gc.sh_degree = 1
         sh_stacked = np.stack(sh_coefficients, axis=1)  # (N, num_coef, 3)
         gc.sh = sh_stacked.reshape(-1).astype(np.float32)
     else:
