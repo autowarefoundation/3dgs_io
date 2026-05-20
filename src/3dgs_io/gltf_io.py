@@ -296,10 +296,29 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
             sh_accessor_indices.append(acc_idx)
             acc_idx += 1
 
-    # Gaussian data is referenced from the extension block, not from the
-    # attributes dict.  Colon-prefixed attribute names
-    # ("KHR_gaussian_splatting:ROTATION" etc.) cause GLSL syntax errors in
-    # viewers that derive shader variable names from the attributes dict.
+    # CesiumJS's loadPrimitive() only iterates gltfPrimitive.attributes to
+    # create vertex buffer loaders.  For SPZ GLBs every Gaussian attribute
+    # must appear in the attributes dict with underscore-prefixed semantics
+    # so that CesiumJS's processSpz() can map decoded SPZ data to each one.
+    # (Non-SPZ GLBs keep these out of the attributes dict to avoid GLSL
+    # variable-name issues in viewers that derive shader code from attribute
+    # names; SPZ GLBs don't hit that path because the data comes from the
+    # SPZ decoder, not from per-attribute buffer views.)
+    attributes: dict[str, int] = {
+        "POSITION": 0,
+        "COLOR_0": 1,
+        "_SCALE": 2,
+        "_ROTATION": 3,
+    }
+    # Add SH coefficient attributes with the naming pattern CesiumJS expects:
+    #   _SH_DEGREE_{l}_COEF_{n}
+    coef_acc_idx = 4
+    for degree in range(1, sh_degree + 1):
+        num_coefs = 2 * degree + 1
+        for j in range(num_coefs):
+            attributes[f"_SH_DEGREE_{degree}_COEF_{j}"] = coef_acc_idx
+            coef_acc_idx += 1
+
     gs_ext: dict[str, Any] = {
         "scale": 2,
         "rotation": 3,
@@ -329,10 +348,7 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
                 "primitives": [
                     {
                         "mode": 0,
-                        "attributes": {
-                            "POSITION": 0,
-                            "COLOR_0": 1,
-                        },
+                        "attributes": attributes,
                         "extensions": {
                             _EXTENSION_NAME: gs_ext,
                         },
