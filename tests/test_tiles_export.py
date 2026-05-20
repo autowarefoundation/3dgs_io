@@ -104,6 +104,27 @@ class TestSaveFromCloud:
         with pytest.raises(ValueError, match="chunk_size must be positive"):
             save_tileset(gc, tmp_path / "tiles", TilesetSaveOptions(chunk_size=0.0))
 
+    def test_sh_degree_1_roundtrip(self, tmp_path: Path) -> None:
+        """SH degree 1 data must survive chunked tileset save/load."""
+        n = 200
+        gc = _make_cloud(n, spread=10.0)
+        rng = np.random.default_rng(99)
+        gc.sh_degree = 1
+        # SH degree 1: 3 coefficient groups × 3 channels = 9 values per point
+        gc.sh = rng.standard_normal(n * 9).astype(np.float32)
+
+        out = tmp_path / "tiles"
+        save_tileset(gc, out, TilesetSaveOptions(chunk_size=5.0))
+
+        total = 0
+        for glb in sorted(out.glob("chunk_*.glb")):
+            chunk_gc = load_gltf(glb)
+            total += chunk_gc.num_points
+            assert chunk_gc.sh_degree == 1
+            sh = np.array(chunk_gc.sh, dtype=np.float32)
+            assert sh.size == chunk_gc.num_points * 9
+        assert total == n
+
     def test_spz_compression_forwarded(self, tmp_path: Path) -> None:
         gc = _make_cloud(100)
         out = tmp_path / "tiles"

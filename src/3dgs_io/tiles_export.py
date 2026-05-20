@@ -145,9 +145,9 @@ def _save_from_cloud(
         chunk_gc.colors = colors[mask].reshape(-1).astype(np.float32)
         chunk_gc.alphas = alphas[mask].astype(np.float32)
         if has_sh:
+            chunk_gc.sh_degree = gc.sh_degree
             sh_reshaped = sh.reshape(n, sh_per_point, 3)
             chunk_gc.sh = sh_reshaped[mask].reshape(-1).astype(np.float32)
-            chunk_gc.sh_degree = gc.sh_degree
 
         filename = f"chunk_{chunk_idx}.glb"
         save_gltf(chunk_gc, output_dir / filename, options.save_options)
