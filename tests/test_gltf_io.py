@@ -203,15 +203,18 @@ def test_glb_spz_json_structure(tmp_path: Path) -> None:
     prim = gltf["meshes"][0]["primitives"][0]
     attrs = prim["attributes"]
 
-    # Only standard attributes in the attributes dict
+    # SPZ attributes: standard + underscore-prefixed Gaussian semantics
     assert "POSITION" in attrs
     assert "COLOR_0" in attrs
-    assert len(attrs) == 2
+    assert "_SCALE" in attrs
+    assert "_ROTATION" in attrs
+    # degree-0 SH has no extra SH attributes
+    assert len(attrs) == 4
 
-    # No colon-prefixed keys in attributes
+    # No colon-prefixed keys in attributes (use underscore prefix instead)
     assert not any(":" in k for k in attrs)
 
-    # Gaussian data referenced from extension block
+    # Gaussian data also referenced from extension block
     ext_gs = prim["extensions"][_EXT]
     assert isinstance(ext_gs["scale"], int)
     assert isinstance(ext_gs["rotation"], int)
