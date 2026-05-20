@@ -309,9 +309,27 @@ def _write_tileset_json(
     options: TilesetSaveOptions,
 ) -> Path:
     root_box = _aabb_to_3dtiles_box(bbox_min, bbox_max)
+
+    # Declare glTF extensions used by tile content so CesiumJS routes
+    # GLBs through the Gaussian Splatting pipeline instead of the
+    # standard Model pipeline (which fails on SPZ virtual accessors).
+    gltf_exts_used = ["KHR_gaussian_splatting"]
+    gltf_exts_required = ["KHR_gaussian_splatting"]
+    if options.save_options.spz_compression:
+        spz_ext = "KHR_gaussian_splatting_compression_spz_2"
+        gltf_exts_used.append(spz_ext)
+        gltf_exts_required.append(spz_ext)
+
     tileset: dict[str, Any] = {
         "asset": {"version": "1.1", "generator": "3dgs-io"},
         "geometricError": options.geometric_error,
+        "extensionsUsed": ["3DTILES_content_gltf"],
+        "extensions": {
+            "3DTILES_content_gltf": {
+                "extensionsUsed": gltf_exts_used,
+                "extensionsRequired": gltf_exts_required,
+            }
+        },
         "root": {
             "boundingVolume": {"box": root_box},
             "geometricError": options.geometric_error,
