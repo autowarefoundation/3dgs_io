@@ -441,10 +441,10 @@ def _parse_standard(
     # POSITION
     positions = _read_accessor(accessors[attrs["POSITION"]], buffer_views, buffer_data)
 
-    # ROTATION — try extension block first, then legacy attribute names
+    # ROTATION
     rot_idx = gs_ext.get("rotation")
     if rot_idx is None:
-        rot_key = _attr_key(attrs, f"{_EXTENSION_NAME}:ROTATION", "_ROTATION")
+        rot_key = _attr_key(attrs, "_ROTATION")
         if rot_key is None:
             raise ValueError("No rotation attribute found")
         rot_idx = attrs[rot_key]
@@ -453,7 +453,7 @@ def _parse_standard(
     # SCALE
     scl_idx = gs_ext.get("scale")
     if scl_idx is None:
-        scale_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SCALE", "_SCALE")
+        scale_key = _attr_key(attrs, "_SCALE")
         if scale_key is None:
             raise ValueError("No scale attribute found")
         scl_idx = attrs[scale_key]
@@ -467,27 +467,19 @@ def _parse_standard(
             alphas = _inverse_sigmoid(raw)
         else:
             alphas = _inverse_sigmoid(raw.astype(np.float32) / 255.0)
-    else:
-        opacity_key = _attr_key(attrs, f"{_EXTENSION_NAME}:OPACITY")
-        if opacity_key is not None:
-            raw = _read_accessor(accessors[attrs[opacity_key]], buffer_views, buffer_data)
-            if raw.dtype == np.float32:
-                alphas = _inverse_sigmoid(raw)
-            else:
-                alphas = _inverse_sigmoid(raw.astype(np.float32) / 255.0)
-        elif "COLOR_0" in attrs:
-            color_0 = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
-            if color_0.dtype == np.float32:
-                alphas = _inverse_sigmoid(color_0[:, 3])
-            else:
-                alphas = _inverse_sigmoid(color_0[:, 3].astype(np.float32) / 255.0)
+    elif "COLOR_0" in attrs:
+        color_0 = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
+        if color_0.dtype == np.float32:
+            alphas = _inverse_sigmoid(color_0[:, 3])
         else:
-            raise ValueError("No opacity data found")
+            alphas = _inverse_sigmoid(color_0[:, 3].astype(np.float32) / 255.0)
+    else:
+        raise ValueError("No opacity data found")
 
     # COLORS (SH DC) and higher SH coefficients
     sh_indices = gs_ext.get("sh")
     if sh_indices is not None and len(sh_indices) > 0:
-        # New format: sh[0] is DC, sh[1:] are higher degree coefficients
+        # sh[0] is DC, sh[1:] are higher degree coefficients
         colors_sh = _read_accessor(accessors[sh_indices[0]], buffer_views, buffer_data).astype(
             np.float32
         )
@@ -495,36 +487,16 @@ def _parse_standard(
         for idx in sh_indices[1:]:
             coef = _read_accessor(accessors[idx], buffer_views, buffer_data)
             sh_coefficients.append(coef.astype(np.float32))
-    else:
-        # Legacy format: colon-prefixed attribute names
-        sh_key = _attr_key(attrs, f"{_EXTENSION_NAME}:SH_DEGREE_0_COEF_0")
-        if sh_key is not None:
-            colors_sh = _read_accessor(accessors[attrs[sh_key]], buffer_views, buffer_data).astype(
-                np.float32
-            )
-        elif "COLOR_0" in attrs:
-            raw = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
-            if raw.dtype == np.float32:
-                rgb_01 = raw[:, :3]
-            else:
-                rgb_01 = raw[:, :3].astype(np.float32) / 255.0
-            colors_sh = (rgb_01 - 0.5) / _SH_C0
+    elif "COLOR_0" in attrs:
+        raw = _read_accessor(accessors[attrs["COLOR_0"]], buffer_views, buffer_data)
+        if raw.dtype == np.float32:
+            rgb_01 = raw[:, :3]
         else:
-            raise ValueError("No color data found")
-
+            rgb_01 = raw[:, :3].astype(np.float32) / 255.0
+        colors_sh = (rgb_01 - 0.5) / _SH_C0
         sh_coefficients = []
-        for degree in range(1, 4):
-            num_coefs = 2 * degree + 1
-            degree_data: list[np.ndarray] = []
-            for j in range(num_coefs):
-                key = f"{_EXTENSION_NAME}:SH_DEGREE_{degree}_COEF_{j}"
-                if key not in attrs:
-                    break
-                coef = _read_accessor(accessors[attrs[key]], buffer_views, buffer_data)
-                degree_data.append(coef.astype(np.float32))
-            if len(degree_data) != num_coefs:
-                break
-            sh_coefficients.extend(degree_data)
+    else:
+        raise ValueError("No color data found")
 
     # Build GaussianCloud
     gc = spz.GaussianCloud()
@@ -561,8 +533,6 @@ def _find_gaussian_primitive(gltf_dict: dict) -> dict | None:
             if any(
                 key in a
                 for key in (
-                    f"{_EXTENSION_NAME}:ROTATION",
-                    f"{_EXTENSION_NAME}:SCALE",
                     "_ROTATION",
                     "_SCALE",
                 )
