@@ -386,13 +386,6 @@ def _decompress_from_spz_bytes(data: bytes) -> spz.GaussianCloud:
 # ---------------------------------------------------------------------------
 
 
-def _attr_key(attrs: dict, *candidates: str) -> str | None:
-    for key in candidates:
-        if key in attrs:
-            return key
-    return None
-
-
 def _sh_degree_from_array(num_points: int, sh: np.ndarray) -> int:
     if len(sh) == 0:
         return 0
@@ -444,19 +437,13 @@ def _parse_standard(
     # ROTATION
     rot_idx = gs_ext.get("rotation")
     if rot_idx is None:
-        rot_key = _attr_key(attrs, "_ROTATION")
-        if rot_key is None:
-            raise ValueError("No rotation attribute found")
-        rot_idx = attrs[rot_key]
+        raise ValueError("No rotation attribute found in extension block")
     rotations = _read_accessor(accessors[rot_idx], buffer_views, buffer_data)
 
     # SCALE
     scl_idx = gs_ext.get("scale")
     if scl_idx is None:
-        scale_key = _attr_key(attrs, "_SCALE")
-        if scale_key is None:
-            raise ValueError("No scale attribute found")
-        scl_idx = attrs[scale_key]
+        raise ValueError("No scale attribute found in extension block")
     scales = _read_accessor(accessors[scl_idx], buffer_views, buffer_data)
 
     # OPACITY → logit
@@ -528,14 +515,5 @@ def _find_gaussian_primitive(gltf_dict: dict) -> dict | None:
         for prim in mesh.get("primitives", []):
             exts = prim.get("extensions", {})
             if _EXTENSION_NAME in exts:
-                return prim
-            a = prim.get("attributes", {})
-            if any(
-                key in a
-                for key in (
-                    "_ROTATION",
-                    "_SCALE",
-                )
-            ):
                 return prim
     return None
