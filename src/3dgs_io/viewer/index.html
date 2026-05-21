@@ -7,8 +7,8 @@
     <script>
         const _useDebug = new URLSearchParams(window.location.search).has('debug');
         const _cesiumBase = _useDebug
-            ? 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/CesiumUnminified'
-            : 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium';
+            ? 'https://cesium.com/downloads/cesiumjs/releases/1.141/Build/CesiumUnminified'
+            : 'https://cesium.com/downloads/cesiumjs/releases/1.141/Build/Cesium';
         document.write(`<script src="${_cesiumBase}/Cesium.js"><\/script>`);
         document.write(`<link href="${_cesiumBase}/Widgets/widgets.css" rel="stylesheet">`);
     </script>
@@ -123,6 +123,13 @@
         </div>
 
         <div class="control-group">
+            <label for="splatBudget">Splat Budget: <span id="splatBudgetValue">2,000,000</span></label>
+            <input type="range" id="splatBudget" min="100000" max="5000000" step="100000" value="2000000"
+                   style="width:100%;" oninput="updateSplatBudget(this.value)">
+            <div style="font-size:11px; color:#888;">Max splats before SSE increases to prevent OOM.</div>
+        </div>
+
+        <div class="control-group">
             <label>Quick Placement Override:</label>
             <div style="display:flex; gap:8px;">
                 <div style="flex:1">
@@ -146,6 +153,9 @@
     <script>
         let viewer = null;
         let currentTileset = null;
+        let splatBudget = 2000000;
+        let targetSSE = 16;
+        let budgetActive = false;
 
         function getUrlParams() {
             const params = new URLSearchParams(window.location.search);
@@ -155,7 +165,37 @@
                 lat: params.get('lat') ? parseFloat(params.get('lat')) : null,
                 lon: params.get('lon') ? parseFloat(params.get('lon')) : null,
                 height: params.get('height') ? parseFloat(params.get('height')) : null,
+                budget: params.get('budget') ? parseInt(params.get('budget'), 10) : null,
             };
+        }
+
+        function updateSplatBudget(val) {
+            splatBudget = parseInt(val, 10);
+            document.getElementById('splatBudgetValue').textContent = splatBudget.toLocaleString();
+        }
+
+        function enforceSplatBudget() {
+            if (!currentTileset) return;
+            const stats = currentTileset.statistics;
+            if (!stats) return;
+            const loaded = stats.numberOfPointsLoaded || 0;
+
+            if (loaded > splatBudget) {
+                // Over budget: increase SSE to reduce loaded tiles
+                if (!budgetActive) budgetActive = true;
+                currentTileset.maximumScreenSpaceError = Math.min(
+                    currentTileset.maximumScreenSpaceError * 1.2,
+                    512
+                );
+            } else if (budgetActive && loaded < splatBudget * 0.6) {
+                // Well under budget: gradually restore SSE
+                const newSSE = Math.max(
+                    currentTileset.maximumScreenSpaceError * 0.95,
+                    targetSSE
+                );
+                currentTileset.maximumScreenSpaceError = newSSE;
+                if (newSSE <= targetSSE + 0.1) budgetActive = false;
+            }
         }
 
         async function initViewer() {
@@ -197,6 +237,14 @@
             if (params.lat !== null) document.getElementById('overrideLat').value = params.lat;
             if (params.lon !== null) document.getElementById('overrideLon').value = params.lon;
             if (params.height !== null) document.getElementById('overrideHeight').value = params.height;
+            if (params.budget !== null) {
+                splatBudget = params.budget;
+                document.getElementById('splatBudget').value = params.budget;
+                document.getElementById('splatBudgetValue').textContent = params.budget.toLocaleString();
+            }
+
+            // Enforce splat budget every frame
+            viewer.scene.postRender.addEventListener(enforceSplatBudget);
 
             if (params.tilesetUrl) {
                 loadTileset();
@@ -223,9 +271,19 @@
             setStatus('Loading: ' + url + ' ...');
 
             try {
+                const sse = parseFloat(new URLSearchParams(window.location.search).get('sse') || '16');
+                targetSSE = sse;
+                const mem = parseInt(new URLSearchParams(window.location.search).get('mem') || '512', 10);
+                budgetActive = false;
                 const tileset = await Cesium.Cesium3DTileset.fromUrl(url, {
-                    maximumScreenSpaceError: 8,
-                    maximumMemoryUsage: 2048,
+                    maximumScreenSpaceError: sse,
+                    maximumMemoryUsage: mem,
+                    foveatedScreenSpaceError: true,
+                    foveatedConeSize: 0.1,
+                    foveatedMinimumScreenSpaceErrorRelaxation: 0.0,
+                    dynamicScreenSpaceError: true,
+                    dynamicScreenSpaceErrorDensity: 0.00278,
+                    dynamicScreenSpaceErrorFactor: 4.0,
                 });
 
                 tileset.tileFailed.addEventListener(function(event) {
@@ -248,28 +306,22 @@
 
                 flyToTileset();
 
-                setTimeout(function() {
-                    const root = tileset.root;
-                    const info = [];
-                    info.push('Tileset: ' + url);
-                    info.push('Root ready: ' + (root ? root.contentReady : 'no root'));
-                    if (root && root.content) {
-                        const cls = root.content.constructor.name;
-                        const isGS = cls === 'GaussianSplat3DTileContent'
-                            || (root.content._splats !== undefined)
-                            || (root.content._pointCount !== undefined && root.content._sortWorker !== undefined);
-                        info.push('Content class: ' + cls + (isGS ? ' (3D Gaussian Splatting)' : ''));
-                    }
-                    const stats = tileset.statistics;
-                    if (stats) {
-                        info.push('Tiles: ' + stats.numberOfTilesTotal + ', loaded: ' + stats.numberOfLoadedTilesTotal);
-                        if (stats.numberOfPointsLoaded > 0) {
-                            info.push('Points/splats loaded: ' + stats.numberOfPointsLoaded.toLocaleString());
-                        }
-                    }
-                    info.push('\nTip: add ?debug=1 to URL for verbose class names');
+                // Live stats update every 500ms
+                setInterval(function() {
+                    if (!currentTileset) return;
+                    const stats = currentTileset.statistics;
+                    if (!stats) return;
+                    const loaded = stats.numberOfPointsLoaded || 0;
+                    const tiles = stats.numberOfLoadedTilesTotal || 0;
+                    const curSSE = currentTileset.maximumScreenSpaceError;
+                    const pct = Math.round(loaded / splatBudget * 100);
+                    const info = [
+                        'Splats: ' + loaded.toLocaleString() + ' / ' + splatBudget.toLocaleString() + ' (' + pct + '%)',
+                        'Tiles loaded: ' + tiles,
+                        'SSE: ' + curSSE.toFixed(1) + (budgetActive ? ' (budget throttled)' : ' (target: ' + targetSSE + ')'),
+                    ];
                     setStatus(info.join('\n'));
-                }, 3000);
+                }, 500);
             } catch (e) {
                 setStatus('Error loading tileset:\n' + (e.message || e));
                 console.error(e);
