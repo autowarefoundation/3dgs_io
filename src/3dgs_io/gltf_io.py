@@ -304,32 +304,35 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
     # variable-name issues in viewers that derive shader code from attribute
     # names; SPZ GLBs don't hit that path because the data comes from the
     # SPZ decoder, not from per-attribute buffer views.)
+    # Use colon-prefixed attribute names matching the KHR_gaussian_splatting
+    # spec.  CesiumJS's processSpz() accepts both "_SCALE" and
+    # "KHR_gaussian_splatting:SCALE"; the colon form is canonical.
+    _EXT_PFX = f"{_EXTENSION_NAME}:"
     attributes: dict[str, int] = {
         "POSITION": 0,
         "COLOR_0": 1,
-        "_SCALE": 2,
-        "_ROTATION": 3,
+        f"{_EXT_PFX}SCALE": 2,
+        f"{_EXT_PFX}ROTATION": 3,
     }
-    # Add SH coefficient attributes with the naming pattern CesiumJS expects:
-    #   _SH_DEGREE_{l}_COEF_{n}
     coef_acc_idx = 4
     for degree in range(1, sh_degree + 1):
         num_coefs = 2 * degree + 1
         for j in range(num_coefs):
-            attributes[f"_SH_DEGREE_{degree}_COEF_{j}"] = coef_acc_idx
+            attributes[f"{_EXT_PFX}SH_DEGREE_{degree}_COEF_{j}"] = coef_acc_idx
             coef_acc_idx += 1
 
+    # SPZ extension block: only the SPZ sub-extension reference.
+    # Do NOT include "scale", "rotation", or "sh" accessor indices here —
+    # CesiumJS ignores them for SPZ and extra keys may confuse the parser.
     gs_ext: dict[str, Any] = {
-        "scale": 2,
-        "rotation": 3,
+        "kernel": "ellipse",
+        "projection": "perspective",
         "extensions": {
             _SPZ_EXTENSION_NAME: {
                 "bufferView": 0,
             }
         },
     }
-    if sh_accessor_indices:
-        gs_ext["sh"] = sh_accessor_indices
 
     asset: dict[str, Any] = {"version": "2.0", "generator": "3dgs-io"}
     extras = serialize_metadata(options.metadata)
@@ -375,7 +378,9 @@ def _compress_to_spz_bytes(gc: spz.GaussianCloud) -> bytes:
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "temp.spz"
         opts = spz.PackOptions()
-        opts.from_coord = spz.RUB
+        # Do NOT set from_coord — CesiumJS's @spz-loader/core WASM
+        # decoder outputs raw positions without any coordinate conversion,
+        # so positions must be stored as-is in the input coordinate space.
         spz.save_spz(gc, opts, str(path))
         # Keep gzip wrapper — CesiumJS's @spz-loader/core expects
         # gzip-compressed SPZ data, not raw NGSP bytes.
@@ -393,7 +398,8 @@ def _decompress_from_spz_bytes(data: bytes) -> spz.GaussianCloud:
         path = Path(tmpdir) / "temp.spz"
         path.write_bytes(data)
         opts = spz.UnpackOptions()
-        opts.to_coord = spz.RUB
+        # Do NOT set to_coord — must match _compress_to_spz_bytes() which
+        # stores positions without coordinate conversion.
         return spz.load_spz(str(path), opts)
 
 

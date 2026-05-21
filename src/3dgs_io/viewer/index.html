@@ -7,8 +7,8 @@
     <script>
         const _useDebug = new URLSearchParams(window.location.search).has('debug');
         const _cesiumBase = _useDebug
-            ? 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/CesiumUnminified'
-            : 'https://cesium.com/downloads/cesiumjs/releases/1.140/Build/Cesium';
+            ? 'https://cesium.com/downloads/cesiumjs/releases/1.141/Build/CesiumUnminified'
+            : 'https://cesium.com/downloads/cesiumjs/releases/1.141/Build/Cesium';
         document.write(`<script src="${_cesiumBase}/Cesium.js"><\/script>`);
         document.write(`<link href="${_cesiumBase}/Widgets/widgets.css" rel="stylesheet">`);
     </script>
@@ -223,9 +223,11 @@
             setStatus('Loading: ' + url + ' ...');
 
             try {
+                const sse = parseFloat(new URLSearchParams(window.location.search).get('sse') || '16');
+                const mem = parseInt(new URLSearchParams(window.location.search).get('mem') || '512', 10);
                 const tileset = await Cesium.Cesium3DTileset.fromUrl(url, {
-                    maximumScreenSpaceError: 8,
-                    maximumMemoryUsage: 2048,
+                    maximumScreenSpaceError: sse,
+                    maximumMemoryUsage: mem,
                 });
 
                 tileset.tileFailed.addEventListener(function(event) {
