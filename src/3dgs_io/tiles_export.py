@@ -19,6 +19,7 @@ import spz
 
 from .gltf_io import GltfSaveOptions, save_gltf
 from .tiles_io import (
+    BoundingVolumeBox,
     _apply_rotation_to_quats,
     _degree_from_coef_count,
     _fetch_json,
@@ -371,22 +372,16 @@ def _aabb_to_3dtiles_box(
 def _root_aabb(root: dict) -> tuple[np.ndarray, np.ndarray]:
     """Extract an AABB from the root tile's bounding volume.
 
-    Supports the ``box`` bounding volume type.  The box format is
-    ``[cx, cy, cz, ax0, ax1, ax2, ay0, ay1, ay2, az0, az1, az2]``
-    where the last 9 values are 3 half-axis vectors.
+    Supports the ``box`` bounding volume type.
     """
     bv = root.get("boundingVolume", {})
     box = bv.get("box")
     if box is not None and len(box) == 12:
-        center = np.array(box[0:3], dtype=np.float64)
-        axes = np.array(
-            [[box[3], box[4], box[5]], [box[6], box[7], box[8]], [box[9], box[10], box[11]]],
-            dtype=np.float64,
-        )
+        parsed = BoundingVolumeBox.from_list(box)
         # For each world axis, the half-extent is the sum of absolute
         # projections of all half-axis vectors onto that axis.
-        half_extent = np.abs(axes).sum(axis=0)
-        return center - half_extent, center + half_extent
+        half_extent = np.abs(parsed.half_axes).sum(axis=0)
+        return parsed.center - half_extent, parsed.center + half_extent
 
     raise ValueError("Root bounding volume must be a 'box'; found keys: " + ", ".join(bv.keys()))
 

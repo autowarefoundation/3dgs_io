@@ -21,6 +21,10 @@ from .metadata import (
 from .spz_io import load_ply, load_spz, save_ply, save_spz
 from .tiles_export import TilesetSaveOptions, save_tileset
 from .tiles_io import (
+    BoundingVolume,
+    BoundingVolumeBox,
+    BoundingVolumeRegion,
+    BoundingVolumeSphere,
     LayerType,
     LidarTile3DContent,
     Tile3DContent,
@@ -30,6 +34,10 @@ from .tiles_io import (
 from .viewer import launch_viewer
 
 __all__ = [
+    "BoundingVolume",
+    "BoundingVolumeBox",
+    "BoundingVolumeRegion",
+    "BoundingVolumeSphere",
     "Checkpoint",
     "DatasetType",
     "Export",
