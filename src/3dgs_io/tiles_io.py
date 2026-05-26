@@ -41,12 +41,7 @@ class LayerType(str, Enum):
 
 @dataclass
 class BoundingVolumeBox:
-    """A bounding volume defined as an oriented box.
-
-    The 12-element array is ``[cx, cy, cz, xx, xy, xz, yx, yy, yz, zx, zy, zz]``
-    where ``(cx, cy, cz)`` is the centre and the remaining 9 values are three
-    half-axis column vectors.
-    """
+    """A bounding volume defined as an oriented box."""
 
     center: np.ndarray
     """Centre of the box as a 3-element float64 array ``(cx, cy, cz)``."""
@@ -377,6 +372,9 @@ def _traverse(
     should_load = has_content and (is_leaf or not leaves_only)
 
     if should_load:
+        geo_error = float(tile.get("geometricError", 0.0))
+        bv = _parse_bounding_volume(tile.get("boundingVolume"))
+
         for entry in contents:
             if entry is None:
                 continue
@@ -397,8 +395,6 @@ def _traverse(
                 continue
 
             resolved = _resolve_uri(base_url, uri)
-            geo_error = float(tile.get("geometricError", 0.0))
-            bv = _parse_bounding_volume(tile.get("boundingVolume"))
 
             if content_type == LayerType.LIDAR_2DGS:
                 cloud = _load_tile_content(resolved, load_lidar_gltf)
