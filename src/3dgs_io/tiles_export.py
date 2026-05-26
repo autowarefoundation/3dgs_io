@@ -142,9 +142,13 @@ def _save_from_tiles(
         save_gltf(tile.cloud, output_dir / filename, options.save_options)
 
         child: dict[str, Any] = {
-            "geometricError": 0.0,
+            "geometricError": tile.geometric_error,
             "content": {"uri": filename},
         }
+
+        transform = tile.transform.reshape(4, 4)
+        if not np.allclose(transform, np.eye(4)):
+            child["transform"] = [float(v) for v in transform.ravel()]
 
         if tile.bounding_volume is not None:
             child["boundingVolume"] = _serialize_bounding_volume(tile.bounding_volume)

@@ -378,6 +378,38 @@ class TestSaveFromTiles:
         assert got[13] == 200.0
         assert got[14] == 300.0
 
+    def test_tile_transform_written(self, tmp_path: Path) -> None:
+        gc = _make_cloud(30, seed=10)
+        # column-major translation (10, 20, 30)
+        transform = np.eye(4, dtype=np.float64)
+        transform[3, 0] = 10.0
+        transform[3, 1] = 20.0
+        transform[3, 2] = 30.0
+        tile = Tile3DContent(
+            cloud=gc,
+            transform=transform.ravel(),
+            content_uri="dummy.glb",
+            geometric_error=5.0,
+            bounding_volume=BoundingVolumeBox(center=np.zeros(3), half_axes=np.eye(3) * 5.0),
+        )
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        child = tileset["root"]["children"][0]
+        assert child["geometricError"] == 5.0
+        got = child["transform"]
+        assert len(got) == 16
+        assert got[12] == 10.0
+        assert got[13] == 20.0
+        assert got[14] == 30.0
+
+    def test_identity_transform_omitted(self, tmp_path: Path) -> None:
+        tile = self._make_tile()
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        assert "transform" not in tileset["root"]["children"][0]
+
     def test_no_root_transform_by_default(self, tmp_path: Path) -> None:
         tile = self._make_tile()
         out = tmp_path / "tiles"
