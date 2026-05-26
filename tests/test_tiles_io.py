@@ -389,6 +389,38 @@ def test_multi_content_lidar_data_integrity(tmp_path: Path) -> None:
     assert len(cloud.opacity) == 20
 
 
+def test_bounding_volume_box_populated(tmp_path: Path) -> None:
+    """bounding_volume is populated when boundingVolume exists in tileset.json."""
+    tileset_path = _build_local_tileset(tmp_path, n=10)
+    tiles = load_tileset(tileset_path)
+    assert len(tiles) == 1
+    t = tiles[0]
+    assert t.bounding_volume is not None
+    assert "box" in t.bounding_volume
+    assert t.bounding_volume["box"] == [0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0, 5]
+
+
+def test_bounding_volume_none_when_absent(tmp_path: Path) -> None:
+    """bounding_volume is None when the tile node has no boundingVolume."""
+    tileset_path = _build_local_tileset(tmp_path, n=10)
+    tileset = json.loads(tileset_path.read_text())
+    del tileset["root"]["boundingVolume"]
+    tileset_path.write_text(json.dumps(tileset))
+
+    tiles = load_tileset(tileset_path)
+    assert len(tiles) == 1
+    assert tiles[0].bounding_volume is None
+
+
+def test_bounding_volume_lidar(tmp_path: Path) -> None:
+    """LidarTile3DContent also exposes bounding_volume."""
+    tileset_path = _build_multi_content_tileset(tmp_path, n_lidar=10)
+    tiles = load_tileset(tileset_path, layer="lidar_2dgs")
+    assert len(tiles) == 1
+    assert tiles[0].bounding_volume is not None
+    assert "box" in tiles[0].bounding_volume
+
+
 def test_legacy_single_content_backward_compat(tmp_path: Path) -> None:
     """Legacy single-content tileset works with default layer."""
     tileset_path = _build_local_tileset(tmp_path, n=20)

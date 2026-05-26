@@ -58,6 +58,9 @@ class Tile3DContent:
     refine: str = "REPLACE"
     """Refinement strategy inherited from the nearest ancestor (``ADD``/``REPLACE``)."""
 
+    bounding_volume: dict | None = None
+    """Raw ``boundingVolume`` dict from the tileset (``box``, ``region``, or ``sphere``)."""
+
 
 @dataclass
 class LidarTile3DContent:
@@ -77,6 +80,9 @@ class LidarTile3DContent:
 
     refine: str = "REPLACE"
     """Refinement strategy inherited from the nearest ancestor (``ADD``/``REPLACE``)."""
+
+    bounding_volume: dict | None = None
+    """Raw ``boundingVolume`` dict from the tileset (``box``, ``region``, or ``sphere``)."""
 
 
 def load_tileset(
@@ -293,6 +299,7 @@ def _traverse(
 
             resolved = _resolve_uri(base_url, uri)
             geo_error = float(tile.get("geometricError", 0.0))
+            bv = tile.get("boundingVolume")
 
             if content_type == LayerType.LIDAR_2DGS:
                 cloud = _load_tile_content(resolved, load_lidar_gltf)
@@ -303,6 +310,7 @@ def _traverse(
                         content_uri=resolved,
                         geometric_error=geo_error,
                         refine=refine,
+                        bounding_volume=bv,
                     )
                 )
             else:
@@ -314,6 +322,7 @@ def _traverse(
                         content_uri=resolved,
                         geometric_error=geo_error,
                         refine=refine,
+                        bounding_volume=bv,
                     )
                 )
 
