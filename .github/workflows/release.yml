@@ -82,6 +82,9 @@ jobs:
           git push origin "${{ steps.bump.outputs.tag }}"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Build package
+        run: uv build
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,4 +92,5 @@ jobs:
           gh release create "${{ steps.bump.outputs.tag }}" \
             --title "${{ steps.bump.outputs.tag }}" \
             --target "${{ steps.commit.outputs.sha }}" \
-            --generate-notes
+            --generate-notes \
+            dist/*
