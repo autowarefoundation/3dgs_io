@@ -58,6 +58,10 @@ class BoundingVolumeBox:
             half_axes=arr[3:].reshape(3, 3),
         )
 
+    def to_dict(self) -> dict[str, list[float]]:
+        """Serialize to the 3D Tiles JSON ``boundingVolume`` dict."""
+        return {"box": self.center.tolist() + self.half_axes.ravel().tolist()}
+
 
 @dataclass
 class BoundingVolumeRegion:
@@ -97,6 +101,19 @@ class BoundingVolumeRegion:
             max_height=values[5],
         )
 
+    def to_dict(self) -> dict[str, list[float]]:
+        """Serialize to the 3D Tiles JSON ``boundingVolume`` dict."""
+        return {
+            "region": [
+                float(self.west),
+                float(self.south),
+                float(self.east),
+                float(self.north),
+                float(self.min_height),
+                float(self.max_height),
+            ]
+        }
+
 
 @dataclass
 class BoundingVolumeSphere:
@@ -115,6 +132,10 @@ class BoundingVolumeSphere:
             center=np.array(values[:3], dtype=np.float64),
             radius=float(values[3]),
         )
+
+    def to_dict(self) -> dict[str, list[float]]:
+        """Serialize to the 3D Tiles JSON ``boundingVolume`` dict."""
+        return {"sphere": self.center.tolist() + [float(self.radius)]}
 
 
 BoundingVolume = BoundingVolumeBox | BoundingVolumeRegion | BoundingVolumeSphere

@@ -151,7 +151,7 @@ def _save_from_tiles(
             child["transform"] = [float(v) for v in transform.ravel()]
 
         if tile.bounding_volume is not None:
-            child["boundingVolume"] = _serialize_bounding_volume(tile.bounding_volume)
+            child["boundingVolume"] = tile.bounding_volume.to_dict()
             bmin, bmax = _bounding_volume_to_aabb(tile.bounding_volume)
         else:
             n = tile.cloud.num_points
@@ -440,26 +440,6 @@ def _aabb_to_3dtiles_box(
         0.0,
         float(half[2]),
     ]
-
-
-def _serialize_bounding_volume(bv: BoundingVolume) -> dict[str, list[float]]:
-    """Convert a typed :class:`BoundingVolume` back to 3D Tiles JSON."""
-    if isinstance(bv, BoundingVolumeBox):
-        return {"box": bv.center.tolist() + bv.half_axes.ravel().tolist()}
-    if isinstance(bv, BoundingVolumeRegion):
-        return {
-            "region": [
-                float(bv.west),
-                float(bv.south),
-                float(bv.east),
-                float(bv.north),
-                float(bv.min_height),
-                float(bv.max_height),
-            ]
-        }
-    if isinstance(bv, BoundingVolumeSphere):
-        return {"sphere": bv.center.tolist() + [float(bv.radius)]}
-    raise TypeError(f"Unknown bounding volume type: {type(bv)}")  # pragma: no cover
 
 
 def _bounding_volume_to_aabb(bv: BoundingVolume) -> tuple[np.ndarray, np.ndarray]:
