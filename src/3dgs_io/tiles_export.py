@@ -134,8 +134,8 @@ def _save_from_tiles(
         raise ValueError("Cannot export an empty list of tiles")
 
     children: list[dict[str, Any]] = []
-    aabb_mins: list[np.ndarray] = []
-    aabb_maxs: list[np.ndarray] = []
+    bbox_min: np.ndarray | None = None
+    bbox_max: np.ndarray | None = None
 
     for i, tile in enumerate(tiles):
         filename = f"tile_{i}.glb"
@@ -156,12 +156,11 @@ def _save_from_tiles(
             bmax = positions.max(axis=0).astype(np.float64)
             child["boundingVolume"] = {"box": _aabb_to_3dtiles_box(bmin, bmax)}
 
-        aabb_mins.append(bmin)
-        aabb_maxs.append(bmax)
+        bbox_min = bmin if bbox_min is None else np.minimum(bbox_min, bmin)
+        bbox_max = bmax if bbox_max is None else np.maximum(bbox_max, bmax)
         children.append(child)
 
-    bbox_min = np.min(aabb_mins, axis=0)
-    bbox_max = np.max(aabb_maxs, axis=0)
+    assert bbox_min is not None and bbox_max is not None  # guaranteed by non-empty check
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options, root_transform)
 
@@ -442,13 +441,20 @@ def _aabb_to_3dtiles_box(
 def _serialize_bounding_volume(bv: BoundingVolume) -> dict[str, list[float]]:
     """Convert a typed :class:`BoundingVolume` back to 3D Tiles JSON."""
     if isinstance(bv, BoundingVolumeBox):
-        values = np.concatenate([bv.center, bv.half_axes.ravel()])
-        return {"box": [float(v) for v in values]}
+        return {"box": bv.center.tolist() + bv.half_axes.ravel().tolist()}
     if isinstance(bv, BoundingVolumeRegion):
-        return {"region": [bv.west, bv.south, bv.east, bv.north, bv.min_height, bv.max_height]}
+        return {
+            "region": [
+                float(bv.west),
+                float(bv.south),
+                float(bv.east),
+                float(bv.north),
+                float(bv.min_height),
+                float(bv.max_height),
+            ]
+        }
     if isinstance(bv, BoundingVolumeSphere):
-        c = bv.center
-        return {"sphere": [float(c[0]), float(c[1]), float(c[2]), bv.radius]}
+        return {"sphere": bv.center.tolist() + [float(bv.radius)]}
     raise TypeError(f"Unknown bounding volume type: {type(bv)}")  # pragma: no cover
 
 
@@ -466,18 +472,11 @@ def _bounding_volume_to_aabb(bv: BoundingVolume) -> tuple[np.ndarray, np.ndarray
 
 
 def _root_aabb(root: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Extract an AABB from the root tile's bounding volume.
-
-    Supports the ``box`` bounding volume type.
-    """
+    """Extract an AABB from the root tile's bounding volume."""
     bv = root.get("boundingVolume", {})
     box = bv.get("box")
     if box is not None and len(box) == 12:
-        parsed = BoundingVolumeBox.from_list(box)
-        # For each world axis, the half-extent is the sum of absolute
-        # projections of all half-axis vectors onto that axis.
-        half_extent = np.abs(parsed.half_axes).sum(axis=0)
-        return parsed.center - half_extent, parsed.center + half_extent
+        return _bounding_volume_to_aabb(BoundingVolumeBox.from_list(box))
 
     raise ValueError("Root bounding volume must be a 'box'; found keys: " + ", ".join(bv.keys()))
 
