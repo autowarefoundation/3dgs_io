@@ -70,6 +70,46 @@ class _CellAccumulator:
 # ---------------------------------------------------------------------------
 
 
+def compute_bounding_volume(
+    cloud: spz.GaussianCloud,
+    camera_positions: np.ndarray | None = None,
+) -> dict[str, list[float]]:
+    """Compute a 3D Tiles ``boundingVolume.box`` from Gaussian positions.
+
+    Parameters
+    ----------
+    cloud:
+        A :class:`~spz.GaussianCloud` whose positions define the initial
+        axis-aligned bounding box.
+    camera_positions:
+        Optional *(N, 3)* array of camera positions used during training.
+        When provided the bounding box is expanded to include them.
+
+    Returns
+    -------
+    A dict ``{"box": [cx, cy, cz, hx, 0, 0, 0, hy, 0, 0, 0, hz]}``
+    in the 3D Tiles 12-element AABB format (center + three axis-aligned
+    half-extent vectors).
+    """
+    n = cloud.num_points
+    if n == 0:
+        raise ValueError("Cannot compute bounding volume from an empty GaussianCloud")
+
+    positions = np.asarray(cloud.positions, dtype=np.float32).reshape(n, 3)
+    bbox_min = positions.min(axis=0).astype(np.float64)
+    bbox_max = positions.max(axis=0).astype(np.float64)
+
+    if camera_positions is not None:
+        cam = np.asarray(camera_positions, dtype=np.float64)
+        if cam.ndim != 2 or cam.shape[1] != 3:
+            raise ValueError(f"camera_positions must be (N, 3), got shape {cam.shape}")
+        if cam.shape[0] > 0:
+            bbox_min = np.minimum(bbox_min, cam.min(axis=0))
+            bbox_max = np.maximum(bbox_max, cam.max(axis=0))
+
+    return {"box": _aabb_to_3dtiles_box(bbox_min, bbox_max)}
+
+
 def save_tileset(
     source: spz.GaussianCloud | str | Path | list[Tile3DContent],
     output_dir: str | Path,
