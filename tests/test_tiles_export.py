@@ -1,4 +1,4 @@
-"""Tests for the 3D Tiles exporter with spatial chunk splitting."""
+"""Tests for the 3D Tiles exporter."""
 
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ load_gltf = _mod.load_gltf
 save_gltf = _mod.save_gltf
 TilesetSaveOptions = _mod.TilesetSaveOptions
 GltfSaveOptions = _mod.GltfSaveOptions
+Tile3DContent = _mod.Tile3DContent
+BoundingVolumeBox = _mod.BoundingVolumeBox
+BoundingVolumeSphere = _mod.BoundingVolumeSphere
 GaussianCloud = spz.GaussianCloud
 
 _SH_C0 = 0.2820947917738781
@@ -292,3 +295,191 @@ class TestSaveFromTileset:
         glb = next(out.glob("chunk_*.glb"))
         chunk_gc = load_gltf(glb)
         assert chunk_gc.num_points > 0
+
+
+class TestSaveFromTiles:
+    """Tests for save_tileset with a list[Tile3DContent] source."""
+
+    @staticmethod
+    def _make_tile(n: int = 50, seed: int = 42, spread: float = 5.0) -> Tile3DContent:
+        gc = _make_cloud(n, seed=seed, spread=spread)
+        positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
+        bmin = positions.min(axis=0).astype(np.float64)
+        bmax = positions.max(axis=0).astype(np.float64)
+        center = (bmin + bmax) / 2
+        half = (bmax - bmin) / 2
+        half_axes = np.diag(half)
+        return Tile3DContent(
+            cloud=gc,
+            transform=np.eye(4, dtype=np.float64).ravel(),
+            content_uri="dummy.glb",
+            bounding_volume=BoundingVolumeBox(center=center, half_axes=half_axes),
+        )
+
+    def test_produces_valid_tileset_json(self, tmp_path: Path) -> None:
+        tiles = [self._make_tile(seed=i) for i in range(3)]
+        out = tmp_path / "tiles"
+        result = save_tileset(tiles, out)
+        assert result.name == "tileset.json"
+        assert result.exists()
+        tileset = json.loads(result.read_text())
+        assert tileset["asset"]["version"] == "1.1"
+        assert len(tileset["root"]["children"]) == 3
+
+    def test_all_points_preserved(self, tmp_path: Path) -> None:
+        n1, n2 = 60, 80
+        tiles = [self._make_tile(n=n1, seed=1), self._make_tile(n=n2, seed=2)]
+        out = tmp_path / "tiles"
+        save_tileset(tiles, out)
+
+        total = 0
+        for glb in sorted(out.glob("tile_*.glb")):
+            total += load_gltf(glb).num_points
+        assert total == n1 + n2
+
+    def test_bounding_volumes_preserved(self, tmp_path: Path) -> None:
+        tile = self._make_tile()
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        child_box = tileset["root"]["children"][0]["boundingVolume"]["box"]
+        assert len(child_box) == 12
+        expected = np.concatenate(
+            [tile.bounding_volume.center, tile.bounding_volume.half_axes.ravel()]
+        )
+        np.testing.assert_allclose(child_box, expected.tolist(), atol=1e-10)
+
+    def test_root_bounding_volume_is_union(self, tmp_path: Path) -> None:
+        t1 = self._make_tile(n=30, seed=1, spread=5.0)
+        t2 = self._make_tile(n=30, seed=2, spread=5.0)
+        out = tmp_path / "tiles"
+        save_tileset([t1, t2], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        root_box = tileset["root"]["boundingVolume"]["box"]
+        assert len(root_box) == 12
+        # Root must enclose both children
+        assert root_box[3] >= 0  # hx
+        assert root_box[7] >= 0  # hy
+        assert root_box[11] >= 0  # hz
+
+    def test_root_transform_written(self, tmp_path: Path) -> None:
+        tile = self._make_tile()
+        # column-major translation (100, 200, 300)
+        transform = np.eye(4, dtype=np.float64)
+        transform[3, 0] = 100.0
+        transform[3, 1] = 200.0
+        transform[3, 2] = 300.0
+        out = tmp_path / "tiles"
+        save_tileset([tile], out, root_transform=transform)
+        tileset = json.loads((out / "tileset.json").read_text())
+        got = tileset["root"]["transform"]
+        assert len(got) == 16
+        assert got[12] == 100.0
+        assert got[13] == 200.0
+        assert got[14] == 300.0
+
+    def test_tile_transform_written(self, tmp_path: Path) -> None:
+        gc = _make_cloud(30, seed=10)
+        # column-major translation (10, 20, 30)
+        transform = np.eye(4, dtype=np.float64)
+        transform[3, 0] = 10.0
+        transform[3, 1] = 20.0
+        transform[3, 2] = 30.0
+        tile = Tile3DContent(
+            cloud=gc,
+            transform=transform.ravel(),
+            content_uri="dummy.glb",
+            geometric_error=5.0,
+            bounding_volume=BoundingVolumeBox(center=np.zeros(3), half_axes=np.eye(3) * 5.0),
+        )
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        child = tileset["root"]["children"][0]
+        assert child["geometricError"] == 5.0
+        got = child["transform"]
+        assert len(got) == 16
+        assert got[12] == 10.0
+        assert got[13] == 20.0
+        assert got[14] == 30.0
+
+    def test_identity_transform_omitted(self, tmp_path: Path) -> None:
+        tile = self._make_tile()
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        assert "transform" not in tileset["root"]["children"][0]
+
+    def test_no_root_transform_by_default(self, tmp_path: Path) -> None:
+        tile = self._make_tile()
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        assert "transform" not in tileset["root"]
+
+    def test_empty_list_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            save_tileset([], tmp_path / "tiles")
+
+    def test_roundtrip_load_save_load(self, tmp_path: Path) -> None:
+        """load_tileset -> save_tileset -> load_tileset produces equivalent data."""
+        # Step 1: create a source tileset from a cloud
+        gc = _make_cloud(200, spread=10.0)
+        src = tmp_path / "source"
+        save_tileset(gc, src, TilesetSaveOptions(chunk_size=8.0))
+
+        # Step 2: load it
+        tiles = load_tileset(src / "tileset.json")
+        n_original = sum(t.cloud.num_points for t in tiles)
+
+        # Step 3: save from loaded tiles
+        out = tmp_path / "roundtrip"
+        save_tileset(tiles, out)
+
+        # Step 4: load again
+        tiles2 = load_tileset(out / "tileset.json")
+        n_roundtrip = sum(t.cloud.num_points for t in tiles2)
+        assert n_roundtrip == n_original
+
+    def test_spz_compression_forwarded(self, tmp_path: Path) -> None:
+        tile = self._make_tile()
+        out = tmp_path / "tiles"
+        opts = TilesetSaveOptions(
+            save_options=GltfSaveOptions(spz_compression=True),
+        )
+        save_tileset([tile], out, opts)
+        tileset = json.loads((out / "tileset.json").read_text())
+        exts = tileset["extensions"]["3DTILES_content_gltf"]["extensionsUsed"]
+        assert "KHR_gaussian_splatting_compression_spz_2" in exts
+        glb = next(out.glob("tile_*.glb"))
+        assert load_gltf(glb).num_points > 0
+
+    def test_sphere_bounding_volume(self, tmp_path: Path) -> None:
+        gc = _make_cloud(30, seed=99)
+        tile = Tile3DContent(
+            cloud=gc,
+            transform=np.eye(4, dtype=np.float64).ravel(),
+            content_uri="dummy.glb",
+            bounding_volume=BoundingVolumeSphere(center=np.array([1.0, 2.0, 3.0]), radius=10.0),
+        )
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        child_bv = tileset["root"]["children"][0]["boundingVolume"]
+        assert "sphere" in child_bv
+        assert child_bv["sphere"] == [1.0, 2.0, 3.0, 10.0]
+
+    def test_no_bounding_volume_fallback(self, tmp_path: Path) -> None:
+        """Tiles without bounding_volume get an AABB computed from positions."""
+        gc = _make_cloud(30, seed=55)
+        tile = Tile3DContent(
+            cloud=gc,
+            transform=np.eye(4, dtype=np.float64).ravel(),
+            content_uri="dummy.glb",
+            bounding_volume=None,
+        )
+        out = tmp_path / "tiles"
+        save_tileset([tile], out)
+        tileset = json.loads((out / "tileset.json").read_text())
+        child_box = tileset["root"]["children"][0]["boundingVolume"]["box"]
+        assert len(child_box) == 12

@@ -1,9 +1,11 @@
-"""3D Tiles (OGC) writer with spatial chunk splitting.
+"""3D Tiles (OGC) writer.
 
-:func:`save_tileset` accepts either an in-memory :class:`~spz.GaussianCloud`
-or a path / URL to an existing ``tileset.json``.  When given a path the
-tiles are read one-by-one and re-chunked, keeping only one input tile in
-memory at a time.
+:func:`save_tileset` accepts:
+
+* an in-memory :class:`~spz.GaussianCloud` — spatially chunked,
+* a path / URL to an existing ``tileset.json`` — streamed and re-chunked,
+* a ``list[Tile3DContent]`` — written as-is (one GLB per tile) with each
+  tile's :attr:`~Tile3DContent.bounding_volume` preserved.
 """
 
 from __future__ import annotations
@@ -19,7 +21,11 @@ import spz
 
 from .gltf_io import GltfSaveOptions, save_gltf
 from .tiles_io import (
+    BoundingVolume,
     BoundingVolumeBox,
+    BoundingVolumeRegion,
+    BoundingVolumeSphere,
+    Tile3DContent,
     _apply_rotation_to_quats,
     _degree_from_coef_count,
     _fetch_json,
@@ -65,23 +71,31 @@ class _CellAccumulator:
 
 
 def save_tileset(
-    source: spz.GaussianCloud | str | Path,
+    source: spz.GaussianCloud | str | Path | list[Tile3DContent],
     output_dir: str | Path,
     options: TilesetSaveOptions | None = None,
+    *,
+    root_transform: np.ndarray | None = None,
 ) -> Path:
-    """Split a point source into spatial chunks and write a 3D Tiles tileset.
+    """Write a 3D Tiles tileset from one of several source types.
 
     Parameters
     ----------
     source:
-        Either a :class:`~spz.GaussianCloud` already in memory, or a path /
-        URL to an existing ``tileset.json``.  When a tileset is given, tiles
-        are loaded one-by-one and re-chunked (memory-efficient streaming).
+        * :class:`~spz.GaussianCloud` — split into spatial chunks.
+        * ``str`` / :class:`~pathlib.Path` — path or URL to an existing
+          ``tileset.json`` to re-chunk (memory-efficient streaming).
+        * ``list[Tile3DContent]`` — each tile is saved as-is (one GLB per
+          entry) with its :attr:`~Tile3DContent.bounding_volume` written
+          into the child node.
     output_dir:
-        Directory where ``tileset.json`` and chunk GLB files are written.
+        Directory where ``tileset.json`` and GLB files are written.
         Created if it does not exist.
     options:
         Export options.  See :class:`TilesetSaveOptions`.
+    root_transform:
+        Optional 4×4 column-major ECEF transform written to the root tile.
+        Defaults to identity (omitted from JSON).
 
     Returns
     -------
@@ -90,16 +104,69 @@ def save_tileset(
     if options is None:
         options = TilesetSaveOptions()
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(source, list):
+        return _save_from_tiles(source, output_dir, options, root_transform)
+
     cs = float(options.chunk_size)
     if cs <= 0:
         raise ValueError(f"chunk_size must be positive, got {cs}")
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     if isinstance(source, spz.GaussianCloud):
         return _save_from_cloud(source, output_dir, cs, options)
     return _save_from_tileset(source, output_dir, cs, options)
+
+
+# ---------------------------------------------------------------------------
+# Tile3DContent list path (pre-built tiles written as-is)
+# ---------------------------------------------------------------------------
+
+
+def _save_from_tiles(
+    tiles: list[Tile3DContent],
+    output_dir: Path,
+    options: TilesetSaveOptions,
+    root_transform: np.ndarray | None,
+) -> Path:
+    if not tiles:
+        raise ValueError("Cannot export an empty list of tiles")
+
+    children: list[dict[str, Any]] = []
+    bbox_min: np.ndarray | None = None
+    bbox_max: np.ndarray | None = None
+
+    for i, tile in enumerate(tiles):
+        filename = f"tile_{i}.glb"
+        save_gltf(tile.cloud, output_dir / filename, options.save_options)
+
+        child: dict[str, Any] = {
+            "geometricError": tile.geometric_error,
+            "content": {"uri": filename},
+        }
+
+        transform = tile.transform.reshape(4, 4)
+        if not np.allclose(transform, np.eye(4)):
+            child["transform"] = [float(v) for v in transform.ravel()]
+
+        if tile.bounding_volume is not None:
+            child["boundingVolume"] = tile.bounding_volume.to_dict()
+            bmin, bmax = _bounding_volume_to_aabb(tile.bounding_volume)
+        else:
+            n = tile.cloud.num_points
+            positions = np.array(tile.cloud.positions, dtype=np.float32).reshape(n, 3)
+            bmin = positions.min(axis=0).astype(np.float64)
+            bmax = positions.max(axis=0).astype(np.float64)
+            child["boundingVolume"] = {"box": _aabb_to_3dtiles_box(bmin, bmax)}
+
+        bbox_min = bmin if bbox_min is None else np.minimum(bbox_min, bmin)
+        bbox_max = bmax if bbox_max is None else np.maximum(bbox_max, bmax)
+        children.append(child)
+
+    assert bbox_min is not None and bbox_max is not None  # guaranteed by non-empty check
+
+    return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options, root_transform)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +375,7 @@ def _write_tileset_json(
     bbox_max: np.ndarray,
     children: list[dict[str, Any]],
     options: TilesetSaveOptions,
+    root_transform: np.ndarray | None = None,
 ) -> Path:
     root_box = _aabb_to_3dtiles_box(bbox_min, bbox_max)
 
@@ -321,6 +389,16 @@ def _write_tileset_json(
         gltf_exts_used.append(spz_ext)
         gltf_exts_required.append(spz_ext)
 
+    root: dict[str, Any] = {
+        "boundingVolume": {"box": root_box},
+        "geometricError": options.geometric_error,
+        "refine": "ADD",
+        "children": children,
+    }
+
+    if root_transform is not None:
+        root["transform"] = [float(v) for v in np.asarray(root_transform, dtype=np.float64).ravel()]
+
     tileset: dict[str, Any] = {
         "asset": {"version": "1.1", "generator": "3dgs-io"},
         "geometricError": options.geometric_error,
@@ -331,12 +409,7 @@ def _write_tileset_json(
                 "extensionsRequired": gltf_exts_required,
             }
         },
-        "root": {
-            "boundingVolume": {"box": root_box},
-            "geometricError": options.geometric_error,
-            "refine": "ADD",
-            "children": children,
-        },
+        "root": root,
     }
     tileset_path = output_dir / "tileset.json"
     tileset_path.write_text(json.dumps(tileset, indent=2))
@@ -369,19 +442,25 @@ def _aabb_to_3dtiles_box(
     ]
 
 
-def _root_aabb(root: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Extract an AABB from the root tile's bounding volume.
+def _bounding_volume_to_aabb(bv: BoundingVolume) -> tuple[np.ndarray, np.ndarray]:
+    """Compute an axis-aligned bounding box ``(min, max)`` from a typed volume."""
+    if isinstance(bv, BoundingVolumeBox):
+        half_extent = np.abs(bv.half_axes).sum(axis=0)
+        return bv.center - half_extent, bv.center + half_extent
+    if isinstance(bv, BoundingVolumeSphere):
+        r = np.full(3, bv.radius, dtype=np.float64)
+        return bv.center - r, bv.center + r
+    if isinstance(bv, BoundingVolumeRegion):
+        raise TypeError("Cannot compute a Cartesian AABB from a geographic BoundingVolumeRegion")
+    raise TypeError(f"Unknown bounding volume type: {type(bv)}")  # pragma: no cover
 
-    Supports the ``box`` bounding volume type.
-    """
+
+def _root_aabb(root: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Extract an AABB from the root tile's bounding volume."""
     bv = root.get("boundingVolume", {})
     box = bv.get("box")
     if box is not None and len(box) == 12:
-        parsed = BoundingVolumeBox.from_list(box)
-        # For each world axis, the half-extent is the sum of absolute
-        # projections of all half-axis vectors onto that axis.
-        half_extent = np.abs(parsed.half_axes).sum(axis=0)
-        return parsed.center - half_extent, parsed.center + half_extent
+        return _bounding_volume_to_aabb(BoundingVolumeBox.from_list(box))
 
     raise ValueError("Root bounding volume must be a 'box'; found keys: " + ", ".join(bv.keys()))
 
