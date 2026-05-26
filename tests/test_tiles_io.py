@@ -22,6 +22,9 @@ merge_tileset = _mod.merge_tileset
 Tile3DContent = _mod.Tile3DContent
 LidarTile3DContent = _mod.LidarTile3DContent
 LidarGaussianCloud = _mod.LidarGaussianCloud
+BoundingVolumeBox = _mod.BoundingVolumeBox
+BoundingVolumeRegion = _mod.BoundingVolumeRegion
+BoundingVolumeSphere = _mod.BoundingVolumeSphere
 save_gltf = _mod.save_gltf
 save_lidar_gltf = _mod.save_lidar_gltf
 GltfSaveOptions = _mod.GltfSaveOptions
@@ -390,14 +393,50 @@ def test_multi_content_lidar_data_integrity(tmp_path: Path) -> None:
 
 
 def test_bounding_volume_box_populated(tmp_path: Path) -> None:
-    """bounding_volume is populated when boundingVolume exists in tileset.json."""
+    """bounding_volume is populated as BoundingVolumeBox when boundingVolume.box exists."""
     tileset_path = _build_local_tileset(tmp_path, n=10)
     tiles = load_tileset(tileset_path)
     assert len(tiles) == 1
     t = tiles[0]
     assert t.bounding_volume is not None
-    assert "box" in t.bounding_volume
-    assert t.bounding_volume["box"] == [0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0, 5]
+    assert isinstance(t.bounding_volume, BoundingVolumeBox)
+    np.testing.assert_array_equal(t.bounding_volume.center, [0, 0, 0])
+    expected_half_axes = np.array([[5, 0, 0], [0, 5, 0], [0, 0, 5]], dtype=np.float64)
+    np.testing.assert_array_equal(t.bounding_volume.half_axes, expected_half_axes)
+
+
+def test_bounding_volume_region(tmp_path: Path) -> None:
+    """bounding_volume is parsed as BoundingVolumeRegion."""
+    tileset_path = _build_local_tileset(tmp_path, n=10)
+    tileset = json.loads(tileset_path.read_text())
+    tileset["root"]["boundingVolume"] = {
+        "region": [-1.3197, 0.6988, -1.3196, 0.6989, 0.0, 100.0],
+    }
+    tileset_path.write_text(json.dumps(tileset))
+
+    tiles = load_tileset(tileset_path)
+    bv = tiles[0].bounding_volume
+    assert isinstance(bv, BoundingVolumeRegion)
+    assert bv.west == pytest.approx(-1.3197)
+    assert bv.north == pytest.approx(0.6989)
+    assert bv.min_height == pytest.approx(0.0)
+    assert bv.max_height == pytest.approx(100.0)
+
+
+def test_bounding_volume_sphere(tmp_path: Path) -> None:
+    """bounding_volume is parsed as BoundingVolumeSphere."""
+    tileset_path = _build_local_tileset(tmp_path, n=10)
+    tileset = json.loads(tileset_path.read_text())
+    tileset["root"]["boundingVolume"] = {
+        "sphere": [1.0, 2.0, 3.0, 10.0],
+    }
+    tileset_path.write_text(json.dumps(tileset))
+
+    tiles = load_tileset(tileset_path)
+    bv = tiles[0].bounding_volume
+    assert isinstance(bv, BoundingVolumeSphere)
+    np.testing.assert_array_equal(bv.center, [1.0, 2.0, 3.0])
+    assert bv.radius == pytest.approx(10.0)
 
 
 def test_bounding_volume_none_when_absent(tmp_path: Path) -> None:
@@ -418,7 +457,7 @@ def test_bounding_volume_lidar(tmp_path: Path) -> None:
     tiles = load_tileset(tileset_path, layer="lidar_2dgs")
     assert len(tiles) == 1
     assert tiles[0].bounding_volume is not None
-    assert "box" in tiles[0].bounding_volume
+    assert isinstance(tiles[0].bounding_volume, BoundingVolumeBox)
 
 
 def test_legacy_single_content_backward_compat(tmp_path: Path) -> None:

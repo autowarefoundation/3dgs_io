@@ -40,6 +40,92 @@ class LayerType(str, Enum):
 
 
 @dataclass
+class BoundingVolumeBox:
+    """A bounding volume defined as an oriented box.
+
+    The 12-element array is ``[cx, cy, cz, xx, xy, xz, yx, yy, yz, zx, zy, zz]``
+    where ``(cx, cy, cz)`` is the centre and the remaining 9 values are three
+    half-axis column vectors.
+    """
+
+    center: np.ndarray
+    """Centre of the box as a 3-element float64 array ``(cx, cy, cz)``."""
+
+    half_axes: np.ndarray
+    """Three half-axis column vectors as a 3x3 float64 array (columns = axes)."""
+
+    @staticmethod
+    def from_list(values: list[float]) -> BoundingVolumeBox:
+        """Construct from the 12-element array used in 3D Tiles JSON."""
+        arr = np.array(values, dtype=np.float64)
+        return BoundingVolumeBox(
+            center=arr[:3],
+            half_axes=arr[3:].reshape(3, 3),
+        )
+
+
+@dataclass
+class BoundingVolumeRegion:
+    """A bounding volume defined as a geographic region.
+
+    Longitude and latitude values are in **radians**; heights are in metres
+    above the WGS 84 ellipsoid.
+    """
+
+    west: float
+    """Western longitude (radians)."""
+
+    south: float
+    """Southern latitude (radians)."""
+
+    east: float
+    """Eastern longitude (radians)."""
+
+    north: float
+    """Northern latitude (radians)."""
+
+    min_height: float
+    """Minimum height above the ellipsoid (metres)."""
+
+    max_height: float
+    """Maximum height above the ellipsoid (metres)."""
+
+    @staticmethod
+    def from_list(values: list[float]) -> BoundingVolumeRegion:
+        """Construct from the 6-element array used in 3D Tiles JSON."""
+        return BoundingVolumeRegion(
+            west=values[0],
+            south=values[1],
+            east=values[2],
+            north=values[3],
+            min_height=values[4],
+            max_height=values[5],
+        )
+
+
+@dataclass
+class BoundingVolumeSphere:
+    """A bounding volume defined as a sphere."""
+
+    center: np.ndarray
+    """Centre of the sphere as a 3-element float64 array ``(cx, cy, cz)``."""
+
+    radius: float
+    """Radius of the sphere (metres)."""
+
+    @staticmethod
+    def from_list(values: list[float]) -> BoundingVolumeSphere:
+        """Construct from the 4-element array used in 3D Tiles JSON."""
+        return BoundingVolumeSphere(
+            center=np.array(values[:3], dtype=np.float64),
+            radius=float(values[3]),
+        )
+
+
+BoundingVolume = BoundingVolumeBox | BoundingVolumeRegion | BoundingVolumeSphere
+
+
+@dataclass
 class Tile3DContent:
     """A single loaded camera 3DGS tile from a 3D Tileset."""
 
@@ -58,8 +144,8 @@ class Tile3DContent:
     refine: str = "REPLACE"
     """Refinement strategy inherited from the nearest ancestor (``ADD``/``REPLACE``)."""
 
-    bounding_volume: dict | None = None
-    """Raw ``boundingVolume`` dict from the tileset (``box``, ``region``, or ``sphere``)."""
+    bounding_volume: BoundingVolume | None = None
+    """Parsed bounding volume from the tileset (box, region, or sphere)."""
 
 
 @dataclass
@@ -81,8 +167,8 @@ class LidarTile3DContent:
     refine: str = "REPLACE"
     """Refinement strategy inherited from the nearest ancestor (``ADD``/``REPLACE``)."""
 
-    bounding_volume: dict | None = None
-    """Raw ``boundingVolume`` dict from the tileset (``box``, ``region``, or ``sphere``)."""
+    bounding_volume: BoundingVolume | None = None
+    """Parsed bounding volume from the tileset (box, region, or sphere)."""
 
 
 def load_tileset(
@@ -226,6 +312,19 @@ def _degree_from_coef_count(n_coefs: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _parse_bounding_volume(raw: dict | None) -> BoundingVolume | None:
+    """Convert a raw ``boundingVolume`` dict to a typed dataclass."""
+    if raw is None:
+        return None
+    if "box" in raw:
+        return BoundingVolumeBox.from_list(raw["box"])
+    if "region" in raw:
+        return BoundingVolumeRegion.from_list(raw["region"])
+    if "sphere" in raw:
+        return BoundingVolumeSphere.from_list(raw["sphere"])
+    return None
+
+
 def _parse_group_types(tileset: dict) -> dict[int, LayerType]:
     """Extract group index -> content type mapping from tileset metadata."""
     groups = tileset.get("groups", [])
@@ -299,7 +398,7 @@ def _traverse(
 
             resolved = _resolve_uri(base_url, uri)
             geo_error = float(tile.get("geometricError", 0.0))
-            bv = tile.get("boundingVolume")
+            bv = _parse_bounding_volume(tile.get("boundingVolume"))
 
             if content_type == LayerType.LIDAR_2DGS:
                 cloud = _load_tile_content(resolved, load_lidar_gltf)
