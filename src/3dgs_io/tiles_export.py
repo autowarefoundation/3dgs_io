@@ -72,8 +72,8 @@ class _CellAccumulator:
 
 def compute_bounding_volume(
     camera_positions: np.ndarray,
-) -> dict[str, list[float]]:
-    """Compute a 3D Tiles ``boundingVolume.box`` from camera positions.
+) -> BoundingVolumeBox:
+    """Compute an axis-aligned :class:`BoundingVolumeBox` from camera positions.
 
     Parameters
     ----------
@@ -82,9 +82,8 @@ def compute_bounding_volume(
 
     Returns
     -------
-    A dict ``{"box": [cx, cy, cz, hx, 0, 0, 0, hy, 0, 0, 0, hz]}``
-    in the 3D Tiles 12-element AABB format (center + three axis-aligned
-    half-extent vectors).
+    A :class:`BoundingVolumeBox` whose ``center`` is the midpoint and
+    ``half_axes`` is a diagonal matrix of per-axis half-extents.
     """
     cam = np.asarray(camera_positions, dtype=np.float64)
     if cam.ndim != 2 or cam.shape[1] != 3:
@@ -94,8 +93,10 @@ def compute_bounding_volume(
 
     bbox_min = cam.min(axis=0)
     bbox_max = cam.max(axis=0)
+    center = (bbox_min + bbox_max) / 2
+    half_axes = np.diag((bbox_max - bbox_min) / 2)
 
-    return {"box": _aabb_to_3dtiles_box(bbox_min, bbox_max)}
+    return BoundingVolumeBox(center=center, half_axes=half_axes)
 
 
 def save_tileset(

@@ -9,43 +9,30 @@ import pytest
 
 _mod = importlib.import_module("3dgs_io")
 compute_bounding_volume = _mod.compute_bounding_volume
+BoundingVolumeBox = _mod.BoundingVolumeBox
 
 
 class TestComputeBoundingVolume:
-    def test_basic_aabb(self) -> None:
+    def test_returns_bounding_volume_box(self) -> None:
         cameras = np.array([[0.0, 0.0, 0.0], [10.0, 20.0, 30.0]])
         result = compute_bounding_volume(cameras)
+        assert isinstance(result, BoundingVolumeBox)
 
-        assert "box" in result
-        box = result["box"]
-        assert len(box) == 12
-        # center = (5, 10, 15), half-extents = (5, 10, 15)
-        assert box[0] == pytest.approx(5.0)
-        assert box[1] == pytest.approx(10.0)
-        assert box[2] == pytest.approx(15.0)
-        assert box[3] == pytest.approx(5.0)
-        assert box[7] == pytest.approx(10.0)
-        assert box[11] == pytest.approx(15.0)
-        # off-diagonal zeros
-        assert box[4] == 0.0
-        assert box[5] == 0.0
-        assert box[6] == 0.0
-        assert box[8] == 0.0
-        assert box[9] == 0.0
-        assert box[10] == 0.0
+    def test_basic_aabb(self) -> None:
+        cameras = np.array([[0.0, 0.0, 0.0], [10.0, 20.0, 30.0]])
+        bv = compute_bounding_volume(cameras)
+
+        # center = (5, 10, 15)
+        np.testing.assert_allclose(bv.center, [5.0, 10.0, 15.0])
+        # half_axes = diag(5, 10, 15)
+        np.testing.assert_allclose(bv.half_axes, np.diag([5.0, 10.0, 15.0]))
 
     def test_single_camera(self) -> None:
         cameras = np.array([[5.0, 10.0, 15.0]])
-        result = compute_bounding_volume(cameras)
+        bv = compute_bounding_volume(cameras)
 
-        box = result["box"]
-        # center = (5, 10, 15), half-extents = (0, 0, 0)
-        assert box[0] == pytest.approx(5.0)
-        assert box[1] == pytest.approx(10.0)
-        assert box[2] == pytest.approx(15.0)
-        assert box[3] == pytest.approx(0.0)
-        assert box[7] == pytest.approx(0.0)
-        assert box[11] == pytest.approx(0.0)
+        np.testing.assert_allclose(bv.center, [5.0, 10.0, 15.0])
+        np.testing.assert_allclose(bv.half_axes, np.diag([0.0, 0.0, 0.0]))
 
     def test_many_cameras(self) -> None:
         cameras = np.array(
@@ -55,16 +42,23 @@ class TestComputeBoundingVolume:
                 [0.5, 0.5, 0.5],
             ]
         )
-        result = compute_bounding_volume(cameras)
+        bv = compute_bounding_volume(cameras)
 
-        box = result["box"]
-        # AABB: [-1,1] x [-2,2] x [-3,3] → center=(0,0,0), half=(1,2,3)
-        assert box[0] == pytest.approx(0.0)
-        assert box[1] == pytest.approx(0.0)
-        assert box[2] == pytest.approx(0.0)
-        assert box[3] == pytest.approx(1.0)
-        assert box[7] == pytest.approx(2.0)
-        assert box[11] == pytest.approx(3.0)
+        # AABB: [-1,1] x [-2,2] x [-3,3]
+        np.testing.assert_allclose(bv.center, [0.0, 0.0, 0.0])
+        np.testing.assert_allclose(bv.half_axes, np.diag([1.0, 2.0, 3.0]))
+
+    def test_to_dict_roundtrip(self) -> None:
+        cameras = np.array([[0.0, 0.0, 0.0], [10.0, 20.0, 30.0]])
+        bv = compute_bounding_volume(cameras)
+        d = bv.to_dict()
+
+        assert "box" in d
+        box = d["box"]
+        assert len(box) == 12
+        assert box[0] == pytest.approx(5.0)
+        assert box[1] == pytest.approx(10.0)
+        assert box[2] == pytest.approx(15.0)
 
     def test_empty_raises(self) -> None:
         cameras = np.zeros((0, 3), dtype=np.float64)
