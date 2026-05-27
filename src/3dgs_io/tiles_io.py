@@ -404,6 +404,31 @@ def _traverse(
             uri = entry.get("uri") or entry.get("url")
             if uri is None:
                 continue
+
+            resolved = _resolve_uri(base_url, uri)
+
+            # External tileset: content URI points to another tileset.json.
+            # Must be checked before the content-type filter because the
+            # external tileset is a container that may hold any layer.
+            parsed_uri = urllib.parse.urlparse(resolved)
+            if Path(parsed_uri.path).suffix.lower() == ".json":
+                ext_base, ext_data = _fetch_json(resolved)
+                ext_root = ext_data.get("root")
+                if ext_root is not None:
+                    ext_groups = _parse_group_types(ext_data)
+                    _traverse(
+                        ext_root,
+                        base_url=ext_base,
+                        parent_transform=transform,
+                        parent_refine=refine,
+                        results=results,
+                        max_tiles=max_tiles,
+                        leaves_only=leaves_only,
+                        group_types=ext_groups,
+                        target_layer=target_layer,
+                    )
+                continue
+
             group_idx = entry.get("group")
             content_type = (
                 group_types.get(group_idx, LayerType.CAMERA_3DGS)
@@ -414,8 +439,6 @@ def _traverse(
             # Skip content that does not match the requested layer.
             if content_type != target_layer:
                 continue
-
-            resolved = _resolve_uri(base_url, uri)
 
             if content_type == LayerType.LIDAR_2DGS:
                 cloud = _load_tile_content(resolved, load_lidar_gltf)
@@ -465,8 +488,12 @@ def _fetch_json(source: str | Path) -> tuple[str, dict]:
     against (the directory containing the tileset.json, with trailing slash).
     """
     src = str(source)
-    if isinstance(source, Path) or urllib.parse.urlparse(src).scheme in ("", "file"):
-        path = Path(source)
+    parsed = urllib.parse.urlparse(src)
+    if isinstance(source, Path) or parsed.scheme in ("", "file"):
+        if isinstance(source, Path) or parsed.scheme == "":
+            path = Path(source)
+        else:
+            path = Path(urllib.parse.unquote(parsed.path))
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         base = path.resolve().parent.as_uri() + "/"

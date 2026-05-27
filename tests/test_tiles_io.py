@@ -460,6 +460,234 @@ def test_bounding_volume_lidar(tmp_path: Path) -> None:
     assert isinstance(tiles[0].bounding_volume, BoundingVolumeBox)
 
 
+# ── external tileset (nested tileset.json references) ─────────────────────
+
+
+def _build_external_tileset(tmp_path: Path, n_per_seg: int = 10, n_segments: int = 2) -> Path:
+    """Write a segmented tileset where root children point to external tileset.json files."""
+    rng = np.random.default_rng(99)
+    sh_c0 = 0.2820947917738781
+    root_children = []
+
+    for seg_idx in range(n_segments):
+        seg_dir = tmp_path / f"seg_{seg_idx:02d}"
+        seg_dir.mkdir()
+
+        # Create GLB chunks in the segment directory
+        n_chunks = 2
+        child_tiles = []
+        for chunk_idx in range(n_chunks):
+            gc = GaussianCloud()
+            positions = rng.uniform(-5.0, 5.0, (n_per_seg, 3)).astype(np.float32)
+            rgb = rng.integers(0, 256, (n_per_seg, 3), dtype=np.uint8)
+            colors_sh = ((rgb.astype(np.float32) / 255.0) - 0.5) / sh_c0
+            alpha_u8 = rng.integers(1, 255, (n_per_seg,), dtype=np.uint8)
+            alpha_01 = alpha_u8.astype(np.float64) / 255.0
+            alphas = np.log(alpha_01 / (1 - alpha_01)).astype(np.float32)
+            rots = rng.standard_normal((n_per_seg, 4)).astype(np.float32)
+            rots /= np.linalg.norm(rots, axis=1, keepdims=True)
+            scales = rng.standard_normal((n_per_seg, 3)).astype(np.float32)
+
+            gc.positions = positions.reshape(-1)
+            gc.colors = colors_sh.reshape(-1)
+            gc.alphas = alphas
+            gc.rotations = rots.reshape(-1)
+            gc.scales = scales.reshape(-1)
+            gc.sh = np.zeros(0, dtype=np.float32)
+
+            glb_path = seg_dir / f"chunk_{chunk_idx}.glb"
+            save_gltf(gc, glb_path, GltfSaveOptions(spz_compression=True))
+
+            child_tiles.append(
+                {
+                    "boundingVolume": {"box": [0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0, 5]},
+                    "geometricError": 0.0,
+                    "content": {"uri": f"chunk_{chunk_idx}.glb"},
+                }
+            )
+
+        # Write the external tileset.json for this segment
+        ext_tileset = {
+            "asset": {"version": "1.1"},
+            "geometricError": 100.0,
+            "root": {
+                "boundingVolume": {"box": [0, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 10]},
+                "geometricError": 50.0,
+                "refine": "REPLACE",
+                "children": child_tiles,
+            },
+        }
+        (seg_dir / "tileset.json").write_text(json.dumps(ext_tileset))
+
+        root_children.append(
+            {
+                "boundingVolume": {"box": [0, 0, 0, 20, 0, 0, 0, 20, 0, 0, 0, 20]},
+                "geometricError": 500.0,
+                "content": {"uri": f"seg_{seg_idx:02d}/tileset.json"},
+            }
+        )
+
+    # Write root tileset.json
+    root_tileset = {
+        "asset": {"version": "1.1"},
+        "geometricError": 1000.0,
+        "root": {
+            "boundingVolume": {"box": [0, 0, 0, 50, 0, 0, 0, 50, 0, 0, 0, 50]},
+            "geometricError": 500.0,
+            "refine": "REPLACE",
+            "children": root_children,
+        },
+    }
+    tileset_path = tmp_path / "tileset.json"
+    tileset_path.write_text(json.dumps(root_tileset))
+    return tileset_path
+
+
+def test_load_external_tileset(tmp_path: Path) -> None:
+    """External tileset references are recursively resolved."""
+    tileset_path = _build_external_tileset(tmp_path, n_per_seg=10, n_segments=2)
+
+    tiles = load_tileset(tileset_path)
+    # 2 segments x 2 chunks = 4 tiles, each with 10 points
+    assert len(tiles) == 4
+    for t in tiles:
+        assert isinstance(t, Tile3DContent)
+        assert t.cloud.num_points == 10
+
+
+def test_external_tileset_merge(tmp_path: Path) -> None:
+    """Tiles from external tilesets can be merged."""
+    tileset_path = _build_external_tileset(tmp_path, n_per_seg=5, n_segments=3)
+
+    tiles = load_tileset(tileset_path)
+    assert len(tiles) == 6  # 3 segments x 2 chunks
+    merged = merge_tileset(tiles)
+    assert merged.num_points == 30  # 6 tiles x 5 points
+
+
+def test_external_tileset_with_transform(tmp_path: Path) -> None:
+    """Transform from root tile is inherited through external tileset traversal."""
+    tileset_path = _build_external_tileset(tmp_path, n_per_seg=5, n_segments=1)
+    tileset = json.loads(tileset_path.read_text())
+
+    # Add a translation transform to the root child that references the external tileset
+    tileset["root"]["children"][0]["transform"] = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        100.0,
+        200.0,
+        300.0,
+        1.0,
+    ]
+    tileset_path.write_text(json.dumps(tileset))
+
+    tiles = load_tileset(tileset_path)
+    assert len(tiles) == 2
+    # The transform should be inherited
+    for t in tiles:
+        mat = t.transform.reshape(4, 4)
+        np.testing.assert_allclose(mat[3, 0], 100.0, atol=1e-6)
+        np.testing.assert_allclose(mat[3, 1], 200.0, atol=1e-6)
+        np.testing.assert_allclose(mat[3, 2], 300.0, atol=1e-6)
+
+
+def test_external_tileset_max_tiles(tmp_path: Path) -> None:
+    """max_tiles is respected across external tileset boundaries."""
+    tileset_path = _build_external_tileset(tmp_path, n_per_seg=10, n_segments=3)
+
+    tiles = load_tileset(tileset_path, max_tiles=3)
+    assert len(tiles) == 3
+
+
+def test_external_tileset_with_groups(tmp_path: Path) -> None:
+    """External tileset with its own groups definition is handled correctly."""
+    rng = np.random.default_rng(77)
+    sh_c0 = 0.2820947917738781
+
+    seg_dir = tmp_path / "seg_00"
+    seg_dir.mkdir()
+
+    # Camera GLB
+    gc = GaussianCloud()
+    n = 8
+    positions = rng.uniform(-5.0, 5.0, (n, 3)).astype(np.float32)
+    rgb = rng.integers(0, 256, (n, 3), dtype=np.uint8)
+    colors_sh = ((rgb.astype(np.float32) / 255.0) - 0.5) / sh_c0
+    alpha_u8 = rng.integers(1, 255, (n,), dtype=np.uint8)
+    alpha_01 = alpha_u8.astype(np.float64) / 255.0
+    alphas = np.log(alpha_01 / (1 - alpha_01)).astype(np.float32)
+    rots = rng.standard_normal((n, 4)).astype(np.float32)
+    rots /= np.linalg.norm(rots, axis=1, keepdims=True)
+    scales = rng.standard_normal((n, 3)).astype(np.float32)
+    gc.positions = positions.reshape(-1)
+    gc.colors = colors_sh.reshape(-1)
+    gc.alphas = alphas
+    gc.rotations = rots.reshape(-1)
+    gc.scales = scales.reshape(-1)
+    gc.sh = np.zeros(0, dtype=np.float32)
+    save_gltf(gc, seg_dir / "camera.glb", GltfSaveOptions(spz_compression=True))
+
+    # LiDAR GLB
+    lidar = _make_lidar_cloud(rng, 12)
+    save_lidar_gltf(lidar, seg_dir / "lidar.glb")
+
+    # External tileset with groups
+    ext_tileset = {
+        "asset": {"version": "1.1"},
+        "groups": [
+            {"class": "ContentType", "properties": {"type": "camera_3dgs"}},
+            {"class": "ContentType", "properties": {"type": "lidar_2dgs"}},
+        ],
+        "geometricError": 100.0,
+        "root": {
+            "boundingVolume": {"box": [0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0, 5]},
+            "geometricError": 0.0,
+            "refine": "REPLACE",
+            "contents": [
+                {"uri": "camera.glb", "group": 0},
+                {"uri": "lidar.glb", "group": 1},
+            ],
+        },
+    }
+    (seg_dir / "tileset.json").write_text(json.dumps(ext_tileset))
+
+    # Root tileset
+    root_tileset = {
+        "asset": {"version": "1.1"},
+        "geometricError": 1000.0,
+        "root": {
+            "boundingVolume": {"box": [0, 0, 0, 50, 0, 0, 0, 50, 0, 0, 0, 50]},
+            "geometricError": 500.0,
+            "refine": "REPLACE",
+            "content": {"uri": "seg_00/tileset.json"},
+        },
+    }
+    tileset_path = tmp_path / "tileset.json"
+    tileset_path.write_text(json.dumps(root_tileset))
+
+    # Camera layer
+    camera_tiles = load_tileset(tileset_path, layer="camera_3dgs")
+    assert len(camera_tiles) == 1
+    assert isinstance(camera_tiles[0], Tile3DContent)
+    assert camera_tiles[0].cloud.num_points == 8
+
+    # LiDAR layer
+    lidar_tiles = load_tileset(tileset_path, layer="lidar_2dgs")
+    assert len(lidar_tiles) == 1
+    assert isinstance(lidar_tiles[0], LidarTile3DContent)
+    assert lidar_tiles[0].cloud.num_points == 12
+
+
 def test_legacy_single_content_backward_compat(tmp_path: Path) -> None:
     """Legacy single-content tileset works with default layer."""
     tileset_path = _build_local_tileset(tmp_path, n=20)
