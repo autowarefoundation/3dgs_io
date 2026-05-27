@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -202,7 +202,7 @@ def _save_from_tiles(
 
     assert bbox_min is not None and bbox_max is not None  # guaranteed by non-empty check
 
-    _save_gltf_parallel(save_tasks, options.save_options, options.max_workers)
+    _save_gltf_parallel(save_tasks, options)
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options, root_transform)
 
@@ -272,7 +272,7 @@ def _save_from_cloud(
             }
         )
 
-    _save_gltf_parallel(save_tasks, options.save_options, options.max_workers)
+    _save_gltf_parallel(save_tasks, options)
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options)
 
@@ -354,39 +354,43 @@ def _save_from_tileset(
         raise ValueError("Source tileset contains no loadable camera 3DGS tiles")
 
     children: list[dict[str, Any]] = []
-    save_tasks: list[tuple[spz.GaussianCloud, Path]] = []
+    futures: list[Future[None]] = []
 
-    for chunk_idx, key in enumerate(sorted(cells)):
-        cell = cells[key]
-        pos = np.concatenate(cell.positions)
-        chunk_gc = spz.GaussianCloud()
-        chunk_gc.positions = pos.reshape(-1)
-        chunk_gc.rotations = np.concatenate(cell.rotations).reshape(-1)
-        chunk_gc.scales = np.concatenate(cell.scales).reshape(-1)
-        chunk_gc.colors = np.concatenate(cell.colors).reshape(-1)
-        chunk_gc.alphas = np.concatenate(cell.alphas)
-        if cell.sh:
-            chunk_gc.sh = np.concatenate(cell.sh).reshape(-1)
-            if sh_degree_seen is not None:
-                chunk_gc.sh_degree = sh_degree_seen
-            else:
-                chunk_gc.sh_degree = _degree_from_coef_count(cell.sh[0].shape[1])
+    with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
+        for chunk_idx, key in enumerate(sorted(cells)):
+            cell = cells[key]
+            pos = np.concatenate(cell.positions)
+            chunk_gc = spz.GaussianCloud()
+            chunk_gc.positions = pos.reshape(-1)
+            chunk_gc.rotations = np.concatenate(cell.rotations).reshape(-1)
+            chunk_gc.scales = np.concatenate(cell.scales).reshape(-1)
+            chunk_gc.colors = np.concatenate(cell.colors).reshape(-1)
+            chunk_gc.alphas = np.concatenate(cell.alphas)
+            if cell.sh:
+                chunk_gc.sh = np.concatenate(cell.sh).reshape(-1)
+                if sh_degree_seen is not None:
+                    chunk_gc.sh_degree = sh_degree_seen
+                else:
+                    chunk_gc.sh_degree = _degree_from_coef_count(cell.sh[0].shape[1])
 
-        del cells[key]
+            del cells[key]
 
-        filename = f"chunk_{chunk_idx}.glb"
-        save_tasks.append((chunk_gc, output_dir / filename))
+            filename = f"chunk_{chunk_idx}.glb"
+            futures.append(
+                executor.submit(save_gltf, chunk_gc, output_dir / filename, options.save_options)
+            )
 
-        bounding_box = _aabb_to_3dtiles_box(pos.min(axis=0), pos.max(axis=0))
-        children.append(
-            {
-                "boundingVolume": {"box": bounding_box},
-                "geometricError": 0.0,
-                "content": {"uri": filename},
-            }
-        )
+            bounding_box = _aabb_to_3dtiles_box(pos.min(axis=0), pos.max(axis=0))
+            children.append(
+                {
+                    "boundingVolume": {"box": bounding_box},
+                    "geometricError": 0.0,
+                    "content": {"uri": filename},
+                }
+            )
 
-    _save_gltf_parallel(save_tasks, options.save_options, options.max_workers)
+    for future in futures:
+        future.result()
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options)
 
@@ -398,12 +402,11 @@ def _save_from_tileset(
 
 def _save_gltf_parallel(
     tasks: list[tuple[spz.GaussianCloud, Path]],
-    save_options: GltfSaveOptions,
-    max_workers: int | None,
+    options: TilesetSaveOptions,
 ) -> None:
     """Save multiple GaussianClouds to GLB files in parallel."""
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(save_gltf, gc, path, save_options) for gc, path in tasks]
+    with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
+        futures = [executor.submit(save_gltf, gc, path, options.save_options) for gc, path in tasks]
         for future in futures:
             future.result()
 

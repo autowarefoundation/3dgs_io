@@ -297,27 +297,28 @@ class TestSaveFromTileset:
         assert chunk_gc.num_points > 0
 
 
+def _make_tile(n: int = 50, seed: int = 42, spread: float = 5.0) -> Tile3DContent:
+    """Create a random Tile3DContent for testing."""
+    gc = _make_cloud(n, seed=seed, spread=spread)
+    positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
+    bmin = positions.min(axis=0).astype(np.float64)
+    bmax = positions.max(axis=0).astype(np.float64)
+    center = (bmin + bmax) / 2
+    half = (bmax - bmin) / 2
+    half_axes = np.diag(half)
+    return Tile3DContent(
+        cloud=gc,
+        transform=np.eye(4, dtype=np.float64).ravel(),
+        content_uri="dummy.glb",
+        bounding_volume=BoundingVolumeBox(center=center, half_axes=half_axes),
+    )
+
+
 class TestSaveFromTiles:
     """Tests for save_tileset with a list[Tile3DContent] source."""
 
-    @staticmethod
-    def _make_tile(n: int = 50, seed: int = 42, spread: float = 5.0) -> Tile3DContent:
-        gc = _make_cloud(n, seed=seed, spread=spread)
-        positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
-        bmin = positions.min(axis=0).astype(np.float64)
-        bmax = positions.max(axis=0).astype(np.float64)
-        center = (bmin + bmax) / 2
-        half = (bmax - bmin) / 2
-        half_axes = np.diag(half)
-        return Tile3DContent(
-            cloud=gc,
-            transform=np.eye(4, dtype=np.float64).ravel(),
-            content_uri="dummy.glb",
-            bounding_volume=BoundingVolumeBox(center=center, half_axes=half_axes),
-        )
-
     def test_produces_valid_tileset_json(self, tmp_path: Path) -> None:
-        tiles = [self._make_tile(seed=i) for i in range(3)]
+        tiles = [_make_tile(seed=i) for i in range(3)]
         out = tmp_path / "tiles"
         result = save_tileset(tiles, out)
         assert result.name == "tileset.json"
@@ -328,7 +329,7 @@ class TestSaveFromTiles:
 
     def test_all_points_preserved(self, tmp_path: Path) -> None:
         n1, n2 = 60, 80
-        tiles = [self._make_tile(n=n1, seed=1), self._make_tile(n=n2, seed=2)]
+        tiles = [_make_tile(n=n1, seed=1), _make_tile(n=n2, seed=2)]
         out = tmp_path / "tiles"
         save_tileset(tiles, out)
 
@@ -338,7 +339,7 @@ class TestSaveFromTiles:
         assert total == n1 + n2
 
     def test_bounding_volumes_preserved(self, tmp_path: Path) -> None:
-        tile = self._make_tile()
+        tile = _make_tile()
         out = tmp_path / "tiles"
         save_tileset([tile], out)
         tileset = json.loads((out / "tileset.json").read_text())
@@ -350,8 +351,8 @@ class TestSaveFromTiles:
         np.testing.assert_allclose(child_box, expected.tolist(), atol=1e-10)
 
     def test_root_bounding_volume_is_union(self, tmp_path: Path) -> None:
-        t1 = self._make_tile(n=30, seed=1, spread=5.0)
-        t2 = self._make_tile(n=30, seed=2, spread=5.0)
+        t1 = _make_tile(n=30, seed=1, spread=5.0)
+        t2 = _make_tile(n=30, seed=2, spread=5.0)
         out = tmp_path / "tiles"
         save_tileset([t1, t2], out)
         tileset = json.loads((out / "tileset.json").read_text())
@@ -363,7 +364,7 @@ class TestSaveFromTiles:
         assert root_box[11] >= 0  # hz
 
     def test_root_transform_written(self, tmp_path: Path) -> None:
-        tile = self._make_tile()
+        tile = _make_tile()
         # column-major translation (100, 200, 300)
         transform = np.eye(4, dtype=np.float64)
         transform[3, 0] = 100.0
@@ -404,14 +405,14 @@ class TestSaveFromTiles:
         assert got[14] == 30.0
 
     def test_identity_transform_omitted(self, tmp_path: Path) -> None:
-        tile = self._make_tile()
+        tile = _make_tile()
         out = tmp_path / "tiles"
         save_tileset([tile], out)
         tileset = json.loads((out / "tileset.json").read_text())
         assert "transform" not in tileset["root"]["children"][0]
 
     def test_no_root_transform_by_default(self, tmp_path: Path) -> None:
-        tile = self._make_tile()
+        tile = _make_tile()
         out = tmp_path / "tiles"
         save_tileset([tile], out)
         tileset = json.loads((out / "tileset.json").read_text())
@@ -442,7 +443,7 @@ class TestSaveFromTiles:
         assert n_roundtrip == n_original
 
     def test_spz_compression_forwarded(self, tmp_path: Path) -> None:
-        tile = self._make_tile()
+        tile = _make_tile()
         out = tmp_path / "tiles"
         opts = TilesetSaveOptions(
             save_options=GltfSaveOptions(spz_compression=True),
@@ -499,7 +500,7 @@ class TestParallelSaveGltf:
         assert total == 200
 
     def test_from_tiles_with_max_workers(self, tmp_path: Path) -> None:
-        tiles = [TestSaveFromTiles._make_tile(n=50, seed=i) for i in range(4)]
+        tiles = [_make_tile(n=50, seed=i) for i in range(4)]
         out = tmp_path / "tiles"
         opts = TilesetSaveOptions(max_workers=2)
         save_tileset(tiles, out, opts)
