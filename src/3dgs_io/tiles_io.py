@@ -366,6 +366,7 @@ def _traverse(
     leaves_only: bool,
     group_types: dict[int, LayerType],
     target_layer: LayerType,
+    _visited: frozenset[str] = frozenset(),
 ) -> None:
     transform = parent_transform
     local = tile.get("transform")
@@ -407,11 +408,12 @@ def _traverse(
 
             resolved = _resolve_uri(base_url, uri)
 
-            # External tileset: content URI points to another tileset.json.
-            # Must be checked before the content-type filter because the
-            # external tileset is a container that may hold any layer.
+            # Must be checked before the content-type filter because an
+            # external tileset may hold content for any layer.
             parsed_uri = urllib.parse.urlparse(resolved)
             if Path(parsed_uri.path).suffix.lower() == ".json":
+                if resolved in _visited:
+                    continue
                 ext_base, ext_data = _fetch_json(resolved)
                 ext_root = ext_data.get("root")
                 if ext_root is not None:
@@ -426,6 +428,7 @@ def _traverse(
                         leaves_only=leaves_only,
                         group_types=ext_groups,
                         target_layer=target_layer,
+                        _visited=_visited | {resolved},
                     )
                 continue
 
@@ -478,6 +481,7 @@ def _traverse(
             leaves_only=leaves_only,
             group_types=group_types,
             target_layer=target_layer,
+            _visited=_visited,
         )
 
 

@@ -50,15 +50,12 @@ network = pytest.mark.skipif(
 )
 
 
-# ── local-file tileset (no network) ─────────────────────────────────────────
+# ── test helpers ──────────────────────────────────────────────────────────────
 
 
-def _build_local_tileset(tmp_path: Path, n: int = 20) -> Path:
-    """Write a 3D Tiles 1.1 tileset with one SPZ-compressed GLB child."""
-    rng = np.random.default_rng(7)
+def _make_camera_cloud(rng: np.random.Generator, n: int) -> GaussianCloud:
+    """Create a small camera GaussianCloud for testing."""
     sh_c0 = 0.2820947917738781
-
-    gc = GaussianCloud()
     positions = rng.uniform(-5.0, 5.0, (n, 3)).astype(np.float32)
     rgb = rng.integers(0, 256, (n, 3), dtype=np.uint8)
     colors_sh = ((rgb.astype(np.float32) / 255.0) - 0.5) / sh_c0
@@ -69,12 +66,23 @@ def _build_local_tileset(tmp_path: Path, n: int = 20) -> Path:
     rots /= np.linalg.norm(rots, axis=1, keepdims=True)
     scales = rng.standard_normal((n, 3)).astype(np.float32)
 
+    gc = GaussianCloud()
     gc.positions = positions.reshape(-1)
     gc.colors = colors_sh.reshape(-1)
     gc.alphas = alphas
     gc.rotations = rots.reshape(-1)
     gc.scales = scales.reshape(-1)
     gc.sh = np.zeros(0, dtype=np.float32)
+    return gc
+
+
+# ── local-file tileset (no network) ─────────────────────────────────────────
+
+
+def _build_local_tileset(tmp_path: Path, n: int = 20) -> Path:
+    """Write a 3D Tiles 1.1 tileset with one SPZ-compressed GLB child."""
+    rng = np.random.default_rng(7)
+    gc = _make_camera_cloud(rng, n)
 
     tiles_dir = tmp_path / "0"
     tiles_dir.mkdir()
@@ -274,26 +282,9 @@ def _make_lidar_cloud(rng: np.random.Generator, n: int) -> LidarGaussianCloud:
 def _build_multi_content_tileset(tmp_path: Path, n_camera: int = 15, n_lidar: int = 10) -> Path:
     """Write a 3D Tiles 1.1 tileset with both camera 3DGS and LiDAR 2DGS content."""
     rng = np.random.default_rng(42)
-    sh_c0 = 0.2820947917738781
 
     # Camera 3DGS
-    gc = GaussianCloud()
-    positions = rng.uniform(-5.0, 5.0, (n_camera, 3)).astype(np.float32)
-    rgb = rng.integers(0, 256, (n_camera, 3), dtype=np.uint8)
-    colors_sh = ((rgb.astype(np.float32) / 255.0) - 0.5) / sh_c0
-    alpha_u8 = rng.integers(1, 255, (n_camera,), dtype=np.uint8)
-    alpha_01 = alpha_u8.astype(np.float64) / 255.0
-    alphas = np.log(alpha_01 / (1 - alpha_01)).astype(np.float32)
-    rots = rng.standard_normal((n_camera, 4)).astype(np.float32)
-    rots /= np.linalg.norm(rots, axis=1, keepdims=True)
-    scales = rng.standard_normal((n_camera, 3)).astype(np.float32)
-
-    gc.positions = positions.reshape(-1)
-    gc.colors = colors_sh.reshape(-1)
-    gc.alphas = alphas
-    gc.rotations = rots.reshape(-1)
-    gc.scales = scales.reshape(-1)
-    gc.sh = np.zeros(0, dtype=np.float32)
+    gc = _make_camera_cloud(rng, n_camera)
 
     # LiDAR 2DGS
     lidar = _make_lidar_cloud(rng, n_lidar)
@@ -466,34 +457,16 @@ def test_bounding_volume_lidar(tmp_path: Path) -> None:
 def _build_external_tileset(tmp_path: Path, n_per_seg: int = 10, n_segments: int = 2) -> Path:
     """Write a segmented tileset where root children point to external tileset.json files."""
     rng = np.random.default_rng(99)
-    sh_c0 = 0.2820947917738781
     root_children = []
 
     for seg_idx in range(n_segments):
         seg_dir = tmp_path / f"seg_{seg_idx:02d}"
         seg_dir.mkdir()
 
-        # Create GLB chunks in the segment directory
         n_chunks = 2
         child_tiles = []
         for chunk_idx in range(n_chunks):
-            gc = GaussianCloud()
-            positions = rng.uniform(-5.0, 5.0, (n_per_seg, 3)).astype(np.float32)
-            rgb = rng.integers(0, 256, (n_per_seg, 3), dtype=np.uint8)
-            colors_sh = ((rgb.astype(np.float32) / 255.0) - 0.5) / sh_c0
-            alpha_u8 = rng.integers(1, 255, (n_per_seg,), dtype=np.uint8)
-            alpha_01 = alpha_u8.astype(np.float64) / 255.0
-            alphas = np.log(alpha_01 / (1 - alpha_01)).astype(np.float32)
-            rots = rng.standard_normal((n_per_seg, 4)).astype(np.float32)
-            rots /= np.linalg.norm(rots, axis=1, keepdims=True)
-            scales = rng.standard_normal((n_per_seg, 3)).astype(np.float32)
-
-            gc.positions = positions.reshape(-1)
-            gc.colors = colors_sh.reshape(-1)
-            gc.alphas = alphas
-            gc.rotations = rots.reshape(-1)
-            gc.scales = scales.reshape(-1)
-            gc.sh = np.zeros(0, dtype=np.float32)
+            gc = _make_camera_cloud(rng, n_per_seg)
 
             glb_path = seg_dir / f"chunk_{chunk_idx}.glb"
             save_gltf(gc, glb_path, GltfSaveOptions(spz_compression=True))
@@ -612,29 +585,12 @@ def test_external_tileset_max_tiles(tmp_path: Path) -> None:
 def test_external_tileset_with_groups(tmp_path: Path) -> None:
     """External tileset with its own groups definition is handled correctly."""
     rng = np.random.default_rng(77)
-    sh_c0 = 0.2820947917738781
 
     seg_dir = tmp_path / "seg_00"
     seg_dir.mkdir()
 
     # Camera GLB
-    gc = GaussianCloud()
-    n = 8
-    positions = rng.uniform(-5.0, 5.0, (n, 3)).astype(np.float32)
-    rgb = rng.integers(0, 256, (n, 3), dtype=np.uint8)
-    colors_sh = ((rgb.astype(np.float32) / 255.0) - 0.5) / sh_c0
-    alpha_u8 = rng.integers(1, 255, (n,), dtype=np.uint8)
-    alpha_01 = alpha_u8.astype(np.float64) / 255.0
-    alphas = np.log(alpha_01 / (1 - alpha_01)).astype(np.float32)
-    rots = rng.standard_normal((n, 4)).astype(np.float32)
-    rots /= np.linalg.norm(rots, axis=1, keepdims=True)
-    scales = rng.standard_normal((n, 3)).astype(np.float32)
-    gc.positions = positions.reshape(-1)
-    gc.colors = colors_sh.reshape(-1)
-    gc.alphas = alphas
-    gc.rotations = rots.reshape(-1)
-    gc.scales = scales.reshape(-1)
-    gc.sh = np.zeros(0, dtype=np.float32)
+    gc = _make_camera_cloud(rng, 8)
     save_gltf(gc, seg_dir / "camera.glb", GltfSaveOptions(spz_compression=True))
 
     # LiDAR GLB
