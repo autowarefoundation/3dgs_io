@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,11 @@ class TilesetSaveOptions:
     save_options: GltfSaveOptions = field(default_factory=GltfSaveOptions)
     """Options forwarded to :func:`~3dgs_io.gltf_io.save_gltf` for each
     chunk GLB (e.g. SPZ compression, metadata)."""
+
+    max_workers: int | None = None
+    """Maximum number of threads used to write GLB tiles in parallel.
+    ``None`` (the default) lets :class:`~concurrent.futures.ThreadPoolExecutor`
+    choose automatically based on available CPUs."""
 
 
 @dataclass
@@ -165,10 +171,11 @@ def _save_from_tiles(
     children: list[dict[str, Any]] = []
     bbox_min: np.ndarray | None = None
     bbox_max: np.ndarray | None = None
+    save_tasks: list[tuple[spz.GaussianCloud, Path]] = []
 
     for i, tile in enumerate(tiles):
         filename = f"tile_{i}.glb"
-        save_gltf(tile.cloud, output_dir / filename, options.save_options)
+        save_tasks.append((tile.cloud, output_dir / filename))
 
         child: dict[str, Any] = {
             "geometricError": tile.geometric_error,
@@ -194,6 +201,8 @@ def _save_from_tiles(
         children.append(child)
 
     assert bbox_min is not None and bbox_max is not None  # guaranteed by non-empty check
+
+    _save_gltf_parallel(save_tasks, options)
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options, root_transform)
 
@@ -229,6 +238,7 @@ def _save_from_cloud(
     unique_keys, inverse = np.unique(cell_keys, return_inverse=True)
 
     children: list[dict[str, Any]] = []
+    save_tasks: list[tuple[spz.GaussianCloud, Path]] = []
 
     for chunk_idx, _key in enumerate(unique_keys):
         mask = inverse == chunk_idx
@@ -247,7 +257,7 @@ def _save_from_cloud(
             chunk_gc.sh = sh_reshaped[mask].reshape(-1).astype(np.float32)
 
         filename = f"chunk_{chunk_idx}.glb"
-        save_gltf(chunk_gc, output_dir / filename, options.save_options)
+        save_tasks.append((chunk_gc, output_dir / filename))
 
         chunk_positions = positions[mask]
         bounding_box = _aabb_to_3dtiles_box(
@@ -261,6 +271,8 @@ def _save_from_cloud(
                 "content": {"uri": filename},
             }
         )
+
+    _save_gltf_parallel(save_tasks, options)
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options)
 
@@ -342,38 +354,61 @@ def _save_from_tileset(
         raise ValueError("Source tileset contains no loadable camera 3DGS tiles")
 
     children: list[dict[str, Any]] = []
+    futures: list[Future[None]] = []
 
-    for chunk_idx, key in enumerate(sorted(cells)):
-        cell = cells[key]
-        pos = np.concatenate(cell.positions)
-        chunk_gc = spz.GaussianCloud()
-        chunk_gc.positions = pos.reshape(-1)
-        chunk_gc.rotations = np.concatenate(cell.rotations).reshape(-1)
-        chunk_gc.scales = np.concatenate(cell.scales).reshape(-1)
-        chunk_gc.colors = np.concatenate(cell.colors).reshape(-1)
-        chunk_gc.alphas = np.concatenate(cell.alphas)
-        if cell.sh:
-            chunk_gc.sh = np.concatenate(cell.sh).reshape(-1)
-            if sh_degree_seen is not None:
-                chunk_gc.sh_degree = sh_degree_seen
-            else:
-                chunk_gc.sh_degree = _degree_from_coef_count(cell.sh[0].shape[1])
+    with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
+        for chunk_idx, key in enumerate(sorted(cells)):
+            cell = cells[key]
+            pos = np.concatenate(cell.positions)
+            chunk_gc = spz.GaussianCloud()
+            chunk_gc.positions = pos.reshape(-1)
+            chunk_gc.rotations = np.concatenate(cell.rotations).reshape(-1)
+            chunk_gc.scales = np.concatenate(cell.scales).reshape(-1)
+            chunk_gc.colors = np.concatenate(cell.colors).reshape(-1)
+            chunk_gc.alphas = np.concatenate(cell.alphas)
+            if cell.sh:
+                chunk_gc.sh = np.concatenate(cell.sh).reshape(-1)
+                if sh_degree_seen is not None:
+                    chunk_gc.sh_degree = sh_degree_seen
+                else:
+                    chunk_gc.sh_degree = _degree_from_coef_count(cell.sh[0].shape[1])
 
-        del cells[key]
+            del cells[key]
 
-        filename = f"chunk_{chunk_idx}.glb"
-        save_gltf(chunk_gc, output_dir / filename, options.save_options)
+            filename = f"chunk_{chunk_idx}.glb"
+            futures.append(
+                executor.submit(save_gltf, chunk_gc, output_dir / filename, options.save_options)
+            )
 
-        bounding_box = _aabb_to_3dtiles_box(pos.min(axis=0), pos.max(axis=0))
-        children.append(
-            {
-                "boundingVolume": {"box": bounding_box},
-                "geometricError": 0.0,
-                "content": {"uri": filename},
-            }
-        )
+            bounding_box = _aabb_to_3dtiles_box(pos.min(axis=0), pos.max(axis=0))
+            children.append(
+                {
+                    "boundingVolume": {"box": bounding_box},
+                    "geometricError": 0.0,
+                    "content": {"uri": filename},
+                }
+            )
+
+    for future in futures:
+        future.result()
 
     return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options)
+
+
+# ---------------------------------------------------------------------------
+# Parallel GLB writer
+# ---------------------------------------------------------------------------
+
+
+def _save_gltf_parallel(
+    tasks: list[tuple[spz.GaussianCloud, Path]],
+    options: TilesetSaveOptions,
+) -> None:
+    """Save multiple GaussianClouds to GLB files in parallel."""
+    with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
+        futures = [executor.submit(save_gltf, gc, path, options.save_options) for gc, path in tasks]
+        for future in futures:
+            future.result()
 
 
 # ---------------------------------------------------------------------------
