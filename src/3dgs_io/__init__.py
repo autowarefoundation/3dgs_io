@@ -19,7 +19,7 @@ from .metadata import (
     serialize_metadata,
 )
 from .spz_io import load_ply, load_spz, save_ply, save_spz
-from .tiles_export import TilesetSaveOptions, save_tileset
+from .tiles_export import TilesetSaveOptions, compute_bounding_volume, save_tileset
 from .tiles_io import (
     BoundingVolume,
     BoundingVolumeBox,
@@ -39,6 +39,7 @@ __all__ = [
     "BoundingVolumeRegion",
     "BoundingVolumeSphere",
     "Checkpoint",
+    "compute_bounding_volume",
     "DatasetType",
     "Export",
     "GaussianCloud",

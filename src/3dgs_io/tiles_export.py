@@ -70,6 +70,35 @@ class _CellAccumulator:
 # ---------------------------------------------------------------------------
 
 
+def compute_bounding_volume(
+    camera_positions: np.ndarray,
+) -> BoundingVolumeBox:
+    """Compute an axis-aligned :class:`BoundingVolumeBox` from camera positions.
+
+    Parameters
+    ----------
+    camera_positions:
+        *(N, 3)* array of camera positions used during training.
+
+    Returns
+    -------
+    A :class:`BoundingVolumeBox` whose ``center`` is the midpoint and
+    ``half_axes`` is a diagonal matrix of per-axis half-extents.
+    """
+    cam = np.asarray(camera_positions, dtype=np.float64)
+    if cam.ndim != 2 or cam.shape[1] != 3:
+        raise ValueError(f"camera_positions must be (N, 3), got shape {cam.shape}")
+    if cam.shape[0] == 0:
+        raise ValueError("Cannot compute bounding volume from empty camera_positions")
+
+    bbox_min = cam.min(axis=0)
+    bbox_max = cam.max(axis=0)
+    center = (bbox_min + bbox_max) / 2
+    half_axes = np.diag((bbox_max - bbox_min) / 2)
+
+    return BoundingVolumeBox(center=center, half_axes=half_axes)
+
+
 def save_tileset(
     source: spz.GaussianCloud | str | Path | list[Tile3DContent],
     output_dir: str | Path,
