@@ -483,3 +483,49 @@ class TestSaveFromTiles:
         tileset = json.loads((out / "tileset.json").read_text())
         child_box = tileset["root"]["children"][0]["boundingVolume"]["box"]
         assert len(child_box) == 12
+
+
+class TestParallelSaveGltf:
+    """Tests for parallel GLB writing via max_workers."""
+
+    def test_from_cloud_with_max_workers(self, tmp_path: Path) -> None:
+        gc = _make_cloud(200, spread=10.0)
+        out = tmp_path / "tiles"
+        opts = TilesetSaveOptions(chunk_size=5.0, max_workers=2)
+        save_tileset(gc, out, opts)
+        glb_files = list(out.glob("chunk_*.glb"))
+        assert len(glb_files) >= 2
+        total = sum(load_gltf(f).num_points for f in glb_files)
+        assert total == 200
+
+    def test_from_tiles_with_max_workers(self, tmp_path: Path) -> None:
+        tiles = [TestSaveFromTiles._make_tile(n=50, seed=i) for i in range(4)]
+        out = tmp_path / "tiles"
+        opts = TilesetSaveOptions(max_workers=2)
+        save_tileset(tiles, out, opts)
+        glb_files = list(out.glob("tile_*.glb"))
+        assert len(glb_files) == 4
+        total = sum(load_gltf(f).num_points for f in glb_files)
+        assert total == 200
+
+    def test_from_tileset_with_max_workers(self, tmp_path: Path) -> None:
+        gc = _make_cloud(200, spread=10.0)
+        src = tmp_path / "source"
+        save_tileset(gc, src, TilesetSaveOptions(chunk_size=100.0))
+
+        out = tmp_path / "rechunked"
+        opts = TilesetSaveOptions(chunk_size=5.0, max_workers=2)
+        save_tileset(src / "tileset.json", out, opts)
+        glb_files = list(out.glob("chunk_*.glb"))
+        assert len(glb_files) >= 2
+        total = sum(load_gltf(f).num_points for f in glb_files)
+        assert total == 200
+
+    def test_max_workers_one_sequential(self, tmp_path: Path) -> None:
+        """max_workers=1 should still produce correct results."""
+        gc = _make_cloud(100, spread=10.0)
+        out = tmp_path / "tiles"
+        opts = TilesetSaveOptions(chunk_size=5.0, max_workers=1)
+        save_tileset(gc, out, opts)
+        total = sum(load_gltf(f).num_points for f in out.glob("chunk_*.glb"))
+        assert total == 100
