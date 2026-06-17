@@ -45,9 +45,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Drop gaussians whose distance to median exceeds this radius (default: inf)",
     )
 
-    p.add_argument("--sky-format", choices=("png", "exr"), default="png")
-
-    p.add_argument("--sky-intensity", type=float, default=0.4)
     p.add_argument("--exposure", type=float, default=1.6)
     p.add_argument("--near-plane", type=float, default=0.5)
     p.add_argument("--far-plane", type=float, default=300.0)
@@ -70,8 +67,6 @@ def _options_from_args(args: argparse.Namespace) -> SceneBundleOptions:
         max_aspect_ratio=args.max_aspect_ratio,
         opacity_threshold=args.opacity_threshold,
         bbox_radius=args.bbox_radius,
-        sky_format=args.sky_format,
-        sky_intensity=args.sky_intensity,
         exposure=args.exposure,
         near_plane=args.near_plane,
         far_plane=args.far_plane,

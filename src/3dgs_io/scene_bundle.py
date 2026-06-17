@@ -1,21 +1,18 @@
-"""Splatsim scene-bundle writer (alpasim USDZ → directory bundle).
+"""Splatsim scene-bundle writer (USDZ → directory bundle).
 
-This module is responsible only for the **3D-GS-related** outputs of the
-splatsim scene bundle:
+The bundle this module produces is the **3D-GS portion** of a splatsim scene:
 
 * ``scene.json``             — bundle index + producer info
 * ``tileset.json``           — Cesium 3D Tiles v1.0 + ``EXT_3dgs_spz`` extension
-* ``chunks/chunk_NNNN.spz``  — Niantic spz tiles produced from the alpasim
-  background gaussians
-* ``sky/manifest.json`` + ``sky/{px,nx,py,ny,pz,nz}.png`` — cubemap faces
-  (sRGB 8-bit) reconstructed from ``volume.nurec``
+* ``chunks/chunk_NNNNNN.spz`` — Niantic SPZ tiles produced by spatially
+  splitting the input cloud
 
-All other sidecars referenced from the spec (``map.osm`` / ``map.xodr`` /
-``carla_world/`` / ``tracks.parquet`` / ``trajectory.parquet``) are assumed
-to be produced by external tooling. If they happen to already exist next to
-the bundle at write time, :func:`save_scene_bundle` will surface them through
+All other sidecars referenced from the splatsim spec (``map.osm`` /
+``map.xodr`` / ``carla_world/`` / ``tracks.parquet`` / ``trajectory.parquet``)
+are assumed to be produced by external tooling. If they happen to exist next
+to the bundle at write time, :func:`save_scene_bundle` surfaces them through
 the ``scene.json`` ``extras`` block (pass-through); otherwise those fields
-are left as ``null``.
+are ``null``.
 """
 
 from __future__ import annotations
@@ -33,12 +30,11 @@ import spz
 
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
-from .usdz_io import AlpasimGaussianCloud, AlpasimSkyCubemap, load_usdz
+from .usdz_io import load_usdz
 
 __all__ = [
     "SceneBundleOptions",
     "SceneBundleResult",
-    "alpasim_to_spz",
     "save_scene_bundle",
 ]
 
@@ -47,13 +43,9 @@ _log = logging.getLogger(__name__)
 _TOOL_NAME = "splatsim-import-usdz"
 _TOOL_VERSION = "0.1.0"
 _SCENE_SCHEMA = "splatsim.scene/v1"
-_SKY_SCHEMA = "splatsim.sky_cubemap/v1"
 
 # spz / 3D Tiles tile content extension key.
 _EXT_3DGS_SPZ = "EXT_3dgs_spz"
-
-# Cubemap face order required by scene.json sky manifest.
-_CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +55,7 @@ _CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
 
 @dataclass
 class SceneBundleOptions:
-    """Tunables matching the public CLI flags (see ``splatsim-import-usdz``)."""
+    """Tunables matching the public CLI flags."""
 
     chunk_size: float = 50.0
     max_points_per_chunk: int = 200_000
@@ -72,9 +64,6 @@ class SceneBundleOptions:
     opacity_threshold: float = 0.0
     bbox_radius: float = math.inf
 
-    sky_format: str = "png"  # "png" (sRGB 8) / "exr" (linear fp16)
-
-    sky_intensity: float = 0.4
     exposure: float = 1.6
     near_plane: float = 0.5
     far_plane: float = 300.0
@@ -90,13 +79,12 @@ class SceneBundleResult:
     scene_json: Path
     tileset_json: Path
     chunks: list[Path] = field(default_factory=list)
-    sky_dir: Path | None = None
     n_gaussians: int = 0
     sh_degree: int = 0
 
 
 # ---------------------------------------------------------------------------
-# NuRec → spz.GaussianCloud
+# spz.GaussianCloud filtering (in-place on a copy)
 # ---------------------------------------------------------------------------
 
 
@@ -104,97 +92,79 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def alpasim_to_spz(
-    cloud: AlpasimGaussianCloud,
-    options: SceneBundleOptions | None = None,
-) -> spz.GaussianCloud:
-    """Convert :class:`AlpasimGaussianCloud` to :class:`spz.GaussianCloud`.
+def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneBundleOptions) -> spz.GaussianCloud:
+    """Drop non-finite / out-of-bbox / low-opacity gaussians and clamp scales.
 
-    Time-varying albedo Fourier coefficients (``features_albedo[:, 1:, :]``),
-    extra signals and training statistics are dropped. Scales are clamped per
-    the streak-avoidance heuristic described in the format spec (table ⑦).
+    The result is a fresh :class:`spz.GaussianCloud` so the caller's input is
+    not mutated.
     """
-    if options is None:
-        options = SceneBundleOptions()
-
-    positions = np.asarray(cloud.positions, dtype=np.float32)
-    rotations = np.asarray(cloud.rotations, dtype=np.float32)
-    scales_log = np.asarray(cloud.scales, dtype=np.float32)
-    densities = np.asarray(cloud.densities, dtype=np.float32).reshape(-1)
-    albedo = np.asarray(cloud.features_albedo, dtype=np.float32)  # (N, F, 3)
-    specular = np.asarray(cloud.features_specular, dtype=np.float32)  # (N, K)
-
-    n = positions.shape[0]
+    n = gc.num_points
     if n == 0:
-        raise ValueError("AlpasimGaussianCloud is empty")
-    if albedo.ndim == 3 and albedo.shape[1] >= 1:
-        sh_dc = albedo[:, 0, :]
-    elif albedo.ndim == 2 and albedo.shape[1] == 3:
-        sh_dc = albedo
-    else:
-        raise ValueError(
-            f"features_albedo must be (N, F>=1, 3) or (N, 3); got shape {albedo.shape}"
-        )
+        raise ValueError("Input GaussianCloud is empty")
 
-    # ---- 1. drop non-finite & out-of-bbox -----------------------------
+    positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
+    rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
+    scales_log = np.array(gc.scales, dtype=np.float32).reshape(n, 3)
+    alphas = np.array(gc.alphas, dtype=np.float32).reshape(n)
+    colors = np.array(gc.colors, dtype=np.float32).reshape(n, 3)
+    sh_flat = np.array(gc.sh, dtype=np.float32)
+    per_ch = sh_flat.size // (n * 3) if sh_flat.size > 0 else 0
+    sh = sh_flat.reshape(n, per_ch, 3) if per_ch > 0 else None
+
     finite = (
         np.isfinite(positions).all(axis=1)
         & np.isfinite(rotations).all(axis=1)
         & np.isfinite(scales_log).all(axis=1)
-        & np.isfinite(densities)
+        & np.isfinite(alphas)
     )
     keep = finite
     if math.isfinite(options.bbox_radius) and options.bbox_radius > 0:
-        median = np.median(positions[finite], axis=0)
-        dist = np.linalg.norm(positions - median, axis=1)
-        keep = keep & (dist <= options.bbox_radius)
+        if finite.any():
+            median = np.median(positions[finite], axis=0)
+            dist = np.linalg.norm(positions - median, axis=1)
+            keep = keep & (dist <= options.bbox_radius)
     if options.opacity_threshold > 0.0:
-        opacity = _sigmoid(densities)
+        opacity = _sigmoid(alphas)
         keep = keep & (opacity >= options.opacity_threshold)
+
     if not keep.all():
         positions = positions[keep]
         rotations = rotations[keep]
         scales_log = scales_log[keep]
-        densities = densities[keep]
-        sh_dc = sh_dc[keep]
-        specular = specular[keep]
+        alphas = alphas[keep]
+        colors = colors[keep]
+        if sh is not None:
+            sh = sh[keep]
     n = positions.shape[0]
     if n == 0:
         raise ValueError("All gaussians were filtered out — try relaxing options")
 
-    # ---- 2. quaternion normalisation (xyzw stays xyzw) ----------------
+    # Re-normalise quaternions (in case input wasn't unit-norm).
     norm = np.linalg.norm(rotations, axis=1, keepdims=True)
     norm = np.where(norm > 1e-12, norm, 1.0)
     rotations = (rotations / norm).astype(np.float32)
 
-    # ---- 3. scale clamp (streak avoidance) ----------------------------
-    scales_lin = np.exp(scales_log, dtype=np.float32)
+    # Scale clamp: floor each axis at min_scale, then cap by min_axis * max_aspect_ratio.
+    scales_lin = np.exp(scales_log).astype(np.float32)
     scales_lin = np.maximum(scales_lin, float(options.min_scale))
-    min_axis = scales_lin.min(axis=1, keepdims=True)
-    cap = min_axis * float(options.max_aspect_ratio)
+    cap = scales_lin.min(axis=1, keepdims=True) * float(options.max_aspect_ratio)
     scales_lin = np.minimum(scales_lin, cap)
     scales_log = np.log(scales_lin).astype(np.float32)
 
-    # ---- 4. assemble spz cloud ---------------------------------------
-    # SH layout: (N, per_ch, 3) -> flat (N*per_ch*3,).  NuRec features_specular
-    # already follows the coeff-major / RGB-inner convention used by spz.
-    per_ch = specular.shape[1] // 3
-    sh_deg = int(round(math.sqrt(per_ch + 1))) - 1  # (d+1)^2 - 1 == per_ch (incl. DC)
-
-    gc = spz.GaussianCloud()
-    gc.antialiased = False
-    gc.positions = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
-    gc.rotations = np.ascontiguousarray(rotations, dtype=np.float32).reshape(-1)
-    gc.scales = np.ascontiguousarray(scales_log, dtype=np.float32).reshape(-1)
-    gc.colors = np.ascontiguousarray(sh_dc, dtype=np.float32).reshape(-1)
-    gc.alphas = np.ascontiguousarray(densities, dtype=np.float32).reshape(-1)
-    if per_ch > 0 and sh_deg >= 1:
-        gc.sh_degree = sh_deg
-        gc.sh = np.ascontiguousarray(specular, dtype=np.float32).reshape(-1)
+    out = spz.GaussianCloud()
+    out.antialiased = gc.antialiased
+    out.positions = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
+    out.rotations = np.ascontiguousarray(rotations, dtype=np.float32).reshape(-1)
+    out.scales = np.ascontiguousarray(scales_log, dtype=np.float32).reshape(-1)
+    out.colors = np.ascontiguousarray(colors, dtype=np.float32).reshape(-1)
+    out.alphas = np.ascontiguousarray(alphas, dtype=np.float32).reshape(-1)
+    if sh is not None and sh.shape[1] > 0:
+        out.sh_degree = gc.sh_degree
+        out.sh = np.ascontiguousarray(sh, dtype=np.float32).reshape(-1)
     else:
-        gc.sh_degree = 0
-        gc.sh = np.zeros(0, dtype=np.float32)
-    return gc
+        out.sh_degree = 0
+        out.sh = np.zeros(0, dtype=np.float32)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -353,79 +323,6 @@ def _write_chunks_and_tileset(
 
 
 # ---------------------------------------------------------------------------
-# Sky cubemap
-# ---------------------------------------------------------------------------
-
-
-def _save_sky_cubemap(sky: AlpasimSkyCubemap, out_dir: Path, sky_format: str) -> tuple[Path, Path]:
-    sky_dir = out_dir / "sky"
-    sky_dir.mkdir(parents=True, exist_ok=True)
-
-    # textures: (1, 6, H, W, 3) fp16, RGB in linear-ish space.
-    tex = np.asarray(sky.textures, dtype=np.float32)
-    if tex.ndim != 5 or tex.shape[0] != 1 or tex.shape[1] != 6 or tex.shape[-1] != 3:
-        raise ValueError(f"Unexpected sky.textures shape: {tex.shape}")
-    faces = tex[0]
-    height, width = int(faces.shape[1]), int(faces.shape[2])
-
-    fmt = sky_format.lower()
-    if fmt == "png":
-        from PIL import Image  # noqa: PLC0415
-
-        for i, face_name in enumerate(_CUBE_FACES):
-            arr = np.clip(faces[i], 0.0, 1.0)
-            arr = (arr * 255.0 + 0.5).astype(np.uint8)
-            Image.fromarray(arr, mode="RGB").save(sky_dir / f"{face_name}.png")
-        encoding = "sRGB_8"
-    elif fmt == "exr":
-        try:
-            import Imath  # noqa: F401, PLC0415
-            import OpenEXR  # noqa: F401, PLC0415
-        except ImportError as e:
-            raise ImportError(
-                "sky_format='exr' requires the `OpenEXR` and `Imath` Python bindings."
-            ) from e
-        for i, face_name in enumerate(_CUBE_FACES):
-            arr = faces[i].astype(np.float16)
-            _write_exr(sky_dir / f"{face_name}.exr", arr)
-        encoding = "linear_fp16"
-    else:
-        raise ValueError(f"Unsupported sky_format: {sky_format!r}")
-
-    manifest = {
-        "schema": _SKY_SCHEMA,
-        "face_order": list(_CUBE_FACES),
-        "frame": "y_up",
-        "resolution": [width, height],
-        "encoding": encoding,
-        "n_grad_updates": int(sky.n_grad_updates),
-    }
-    manifest_path = sky_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    return manifest_path, sky_dir
-
-
-def _write_exr(path: Path, arr: np.ndarray) -> None:  # pragma: no cover - optional
-    import Imath  # noqa: PLC0415
-    import OpenEXR  # noqa: PLC0415
-
-    height, width, _ = arr.shape
-    header = OpenEXR.Header(width, height)
-    half = Imath.PixelType(Imath.PixelType.HALF)
-    header["channels"] = {
-        "R": Imath.Channel(half),
-        "G": Imath.Channel(half),
-        "B": Imath.Channel(half),
-    }
-    out = OpenEXR.OutputFile(str(path), header)
-    r = arr[..., 0].tobytes()
-    g = arr[..., 1].tobytes()
-    b = arr[..., 2].tobytes()
-    out.writePixels({"R": r, "G": g, "B": b})
-    out.close()
-
-
-# ---------------------------------------------------------------------------
 # scene.json
 # ---------------------------------------------------------------------------
 
@@ -443,20 +340,14 @@ _EXTRA_PATHS: dict[str, str] = {
 
 
 def _detect_existing_extras(out_dir: Path) -> dict[str, str | None]:
-    """Return ``extras`` dict pointing at any pre-existing sidecars in ``out_dir``.
-
-    Missing files map to ``None`` so the scene.json schema stays stable.
-    """
+    """Return an ``extras`` dict pointing at any pre-existing sidecars in ``out_dir``."""
     return {key: rel if (out_dir / rel).exists() else None for key, rel in _EXTRA_PATHS.items()}
 
 
 def _compose_scene_json(
     *,
-    cloud: AlpasimGaussianCloud,
     gc: spz.GaussianCloud,
     options: SceneBundleOptions,
-    has_sky: bool,
-    ground_z: float | None,
     extras: dict[str, str | None],
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -466,14 +357,8 @@ def _compose_scene_json(
             "tool": _TOOL_NAME,
             "tool_version": _TOOL_VERSION,
             "created_at": created_at,
-            "source_alpasim_version": cloud.version,
         },
-        "world": {
-            "up_axis": "z",
-            "units": "meters",
-            "nre_offset": [float(v) for v in cloud.nre_offset],
-            "ground_z": float(ground_z) if ground_z is not None else 0.0,
-        },
+        "world": {"up_axis": "z", "units": "meters"},
         "gaussians": {
             "tileset": "tileset.json",
             "tile_content_format": "spz/1",
@@ -488,14 +373,6 @@ def _compose_scene_json(
                 ),
             },
         },
-        "sky": (
-            {
-                "manifest": "sky/manifest.json",
-                "default_intensity": float(options.sky_intensity),
-            }
-            if has_sky
-            else None
-        ),
         "extras": extras,
         "render_defaults": {
             "exposure": float(options.exposure),
@@ -510,27 +387,16 @@ def _compose_scene_json(
 # ---------------------------------------------------------------------------
 
 
-def _estimate_ground_z(positions_flat: np.ndarray) -> float | None:
-    if positions_flat.size == 0:
-        return None
-    z = positions_flat.reshape(-1, 3)[:, 2]
-    z = z[np.isfinite(z)]
-    if z.size == 0:
-        return None
-    return float(np.percentile(z, 1.0))
-
-
 def save_scene_bundle(
     usdz_path: str | Path,
     out_dir: str | Path,
     options: SceneBundleOptions | None = None,
 ) -> SceneBundleResult:
-    """Convert an alpasim USDZ into the 3D-GS portion of a splatsim scene bundle.
+    """Convert a USDZ-wrapped :class:`spz.GaussianCloud` into a scene bundle.
 
-    Produces ``scene.json`` / ``tileset.json`` / ``chunks/*.spz`` and, when the
-    source USDZ carries a sky cubemap, the ``sky/`` directory. Non-gaussian
+    Produces ``scene.json`` / ``tileset.json`` / ``chunks/*.spz``. Non-gaussian
     sidecars (``map.osm`` / ``carla_world/`` / ``tracks.parquet`` / etc.) are
-    expected to be provided by upstream tooling — if they already exist in
+    expected to be provided by upstream tooling — if any already exist in
     ``out_dir`` they are recorded in ``scene.json``'s ``extras`` block.
     """
     usdz_path = Path(usdz_path)
@@ -539,28 +405,13 @@ def save_scene_bundle(
     if options is None:
         options = SceneBundleOptions()
 
-    cloud = load_usdz(usdz_path)
-    gc = alpasim_to_spz(cloud, options)
+    gc = load_usdz(usdz_path)
+    gc = _filter_and_clamp(gc, options)
 
     tileset_path, chunk_paths = _write_chunks_and_tileset(gc, out_dir, options)
 
-    sky_dir: Path | None = None
-    has_sky = False
-    if cloud.sky is not None and tuple(cloud.sky.textures.shape[2:4]) != (1, 1):
-        _, sky_dir = _save_sky_cubemap(cloud.sky, out_dir, options.sky_format)
-        has_sky = True
-
     extras = _detect_existing_extras(out_dir)
-
-    ground_z = _estimate_ground_z(np.array(gc.positions, dtype=np.float32))
-    scene = _compose_scene_json(
-        cloud=cloud,
-        gc=gc,
-        options=options,
-        has_sky=has_sky,
-        ground_z=ground_z,
-        extras=extras,
-    )
+    scene = _compose_scene_json(gc=gc, options=options, extras=extras)
     scene_path = out_dir / "scene.json"
     scene_path.write_text(json.dumps(scene, indent=2))
 
@@ -568,7 +419,6 @@ def save_scene_bundle(
         scene_json=scene_path,
         tileset_json=tileset_path,
         chunks=chunk_paths,
-        sky_dir=sky_dir,
         n_gaussians=int(gc.num_points),
         sh_degree=int(gc.sh_degree),
     )
@@ -578,7 +428,7 @@ def save_scene_bundle(
 def _result_summary(result: SceneBundleResult) -> dict[str, Any]:
     d = asdict(result)
     d["chunks"] = [str(p) for p in result.chunks]
-    for k in ("scene_json", "tileset_json", "sky_dir"):
+    for k in ("scene_json", "tileset_json"):
         v = d.get(k)
         if v is not None:
             d[k] = str(v)

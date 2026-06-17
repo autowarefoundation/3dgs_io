@@ -8,14 +8,8 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "msgpack>=1.0",
     "numpy>=2.1,<2.3",
     "spz",
-]
-
-[project.optional-dependencies]
-scene-bundle = [
-    "pillow>=10",
 ]
 
 # Note: the package directory is named ``3dgs_io`` (starts with a digit), so a
@@ -35,7 +29,6 @@ spz = { git = "https://github.com/nianticlabs/spz.git", rev="v2.1.0"}
 [dependency-groups]
 dev = [
     "furo>=2024.8.6",
-    "pillow>=10",
     "pre-commit>=4.0.0",
     "pytest>=9.0.3",
     "ruff>=0.14.0",

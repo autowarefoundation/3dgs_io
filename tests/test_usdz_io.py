@@ -1,119 +1,91 @@
-"""Tests for alpasim USDZ I/O."""
+"""Tests for USDZ I/O (spz.GaussianCloud ↔ USDZ archive)."""
 
 from __future__ import annotations
 
 import importlib
-import os
 import zipfile
 from pathlib import Path
 
 import numpy as np
 import pytest
+import spz
 
 _mod = importlib.import_module("3dgs_io")
-AlpasimGaussianCloud = _mod.AlpasimGaussianCloud
-AlpasimSkyCubemap = _mod.AlpasimSkyCubemap
 load_usdz = _mod.load_usdz
 save_usdz = _mod.save_usdz
 
 
-def _make_cloud(n: int = 32) -> AlpasimGaussianCloud:
+def _make_cloud(n: int = 64, sh_degree: int = 3) -> spz.GaussianCloud:
     rng = np.random.default_rng(0)
-    positions = rng.standard_normal((n, 3)).astype(np.float16)
-    rotations = rng.standard_normal((n, 4)).astype(np.float16)
-    scales = rng.standard_normal((n, 3)).astype(np.float16)
-    densities = rng.standard_normal((n, 1)).astype(np.float16)
-    features_albedo = rng.standard_normal((n, 5, 3)).astype(np.float16)
-    features_specular = rng.standard_normal((n, 45)).astype(np.float16)
-    camera_extra = rng.standard_normal((n, 20)).astype(np.float16)
-    invisible = rng.integers(0, 1000, size=(n,), dtype=np.int32)
-    sky = AlpasimSkyCubemap(
-        textures=rng.standard_normal((1, 6, 4, 4, 3)).astype(np.float16),
-        texture_grads=rng.standard_normal((6, 2, 2)).astype(np.float16),
-        n_grad_updates=42,
-    )
-    return AlpasimGaussianCloud(
-        positions=positions,
-        rotations=rotations,
-        scales=scales,
-        densities=densities,
-        features_albedo=features_albedo,
-        features_specular=features_specular,
-        camera_extra_signal=camera_extra,
-        n_active_features=3,
-        timestamps_us_min=27563309000,
-        timestamps_us_max=27583309000,
-        invisible_steps=invisible,
-        sky=sky,
-        nre_offset=(-1.0, 2.0, 3.5),
-    )
+    gc = spz.GaussianCloud()
+    gc.antialiased = False
+    gc.positions = rng.standard_normal(n * 3).astype(np.float32)
+    quats = rng.standard_normal((n, 4)).astype(np.float32)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+    gc.rotations = quats.reshape(-1)
+    gc.scales = rng.uniform(-3.0, 0.5, size=n * 3).astype(np.float32)
+    gc.alphas = rng.standard_normal(n).astype(np.float32)
+    gc.colors = rng.uniform(0.0, 1.0, size=n * 3).astype(np.float32)
+    per_ch = (sh_degree + 1) ** 2 - 1
+    if per_ch > 0:
+        gc.sh_degree = sh_degree
+        gc.sh = rng.standard_normal(n * per_ch * 3).astype(np.float32)
+    else:
+        gc.sh_degree = 0
+        gc.sh = np.zeros(0, dtype=np.float32)
+    return gc
 
 
-def test_roundtrip_bytewise_equal(tmp_path: Path) -> None:
-    cloud = _make_cloud()
+def test_roundtrip_preserves_num_points_and_shapes(tmp_path: Path) -> None:
+    gc = _make_cloud(n=128)
     out = tmp_path / "scene.usdz"
-    save_usdz(cloud, out)
+    save_usdz(gc, out)
     loaded = load_usdz(out)
 
-    assert loaded.num_points == cloud.num_points
-    np.testing.assert_array_equal(loaded.positions, cloud.positions)
-    np.testing.assert_array_equal(loaded.rotations, cloud.rotations)
-    np.testing.assert_array_equal(loaded.scales, cloud.scales)
-    np.testing.assert_array_equal(loaded.densities, cloud.densities)
-    np.testing.assert_array_equal(loaded.features_albedo, cloud.features_albedo)
-    np.testing.assert_array_equal(loaded.features_specular, cloud.features_specular)
-    np.testing.assert_array_equal(loaded.camera_extra_signal, cloud.camera_extra_signal)
-    np.testing.assert_array_equal(loaded.invisible_steps, cloud.invisible_steps)
-    assert loaded.sky is not None
-    np.testing.assert_array_equal(loaded.sky.textures, cloud.sky.textures)
-    np.testing.assert_array_equal(loaded.sky.texture_grads, cloud.sky.texture_grads)
-    assert loaded.sky.n_grad_updates == cloud.sky.n_grad_updates
-
-    assert loaded.timestamps_us_min == cloud.timestamps_us_min
-    assert loaded.timestamps_us_max == cloud.timestamps_us_max
-    assert loaded.n_active_features == cloud.n_active_features
-    assert loaded.nre_offset == pytest.approx(cloud.nre_offset)
+    assert loaded.num_points == gc.num_points
+    assert loaded.sh_degree == gc.sh_degree
+    assert loaded.positions.shape == gc.positions.shape
+    assert loaded.rotations.shape == gc.rotations.shape
+    assert loaded.scales.shape == gc.scales.shape
+    assert loaded.colors.shape == gc.colors.shape
+    assert loaded.alphas.shape == gc.alphas.shape
+    assert loaded.sh.shape == gc.sh.shape
 
 
-def test_saved_archive_contains_required_files(tmp_path: Path) -> None:
-    cloud = _make_cloud()
+def test_roundtrip_values_close(tmp_path: Path) -> None:
+    """spz applies lossy quantisation; check values survive within the codec's tolerance."""
+    gc = _make_cloud(n=64)
     out = tmp_path / "scene.usdz"
-    save_usdz(cloud, out)
+    save_usdz(gc, out)
+    loaded = load_usdz(out)
+
+    np.testing.assert_allclose(loaded.positions, gc.positions, atol=1e-3)
+    # quaternions: spz packs to fixed point; allow loose tolerance and check unit-norm.
+    qs = np.asarray(loaded.rotations).reshape(-1, 4)
+    np.testing.assert_allclose(np.linalg.norm(qs, axis=1), 1.0, atol=1e-2)
+
+
+def test_archive_contents(tmp_path: Path) -> None:
+    gc = _make_cloud(n=16)
+    out = tmp_path / "scene.usdz"
+    save_usdz(gc, out)
     with zipfile.ZipFile(out) as zf:
         names = set(zf.namelist())
-    assert {"default.usda", "volume.usda", "volume.nurec"} <= names
+    assert names == {"default.usda", "model.spz"}
 
 
-def test_save_without_sky_writes_placeholder(tmp_path: Path) -> None:
-    cloud = _make_cloud()
-    cloud.sky = None
-    out = tmp_path / "no_sky.usdz"
-    save_usdz(cloud, out)
-    loaded = load_usdz(out)
-    assert loaded.sky is not None  # placeholder is written
-    assert loaded.sky.textures.shape == (1, 6, 1, 1, 3)
-
-
-def test_load_missing_volume_nurec_raises(tmp_path: Path) -> None:
+def test_load_missing_model_raises(tmp_path: Path) -> None:
     out = tmp_path / "bad.usdz"
     with zipfile.ZipFile(out, "w") as zf:
         zf.writestr("default.usda", "#usda 1.0\n")
-    with pytest.raises(ValueError, match="volume.nurec"):
+    with pytest.raises(ValueError, match="model.spz"):
         load_usdz(out)
 
 
-_SAMPLE = Path.home() / "Downloads" / "00040136-e651-4abd-991d-0655ccda9430.usdz"
-
-
-@pytest.mark.skipif(
-    not _SAMPLE.exists() or os.environ.get("SKIP_USDZ_SAMPLE") == "1",
-    reason="alpasim sample USDZ not available",
-)
-def test_load_sample_usdz() -> None:
-    cloud = load_usdz(_SAMPLE)
-    assert cloud.num_points > 0
-    assert cloud.positions.shape == (cloud.num_points, 3)
-    assert cloud.features_albedo.shape[-1] == 3
-    assert cloud.features_specular.shape[1] % 3 == 0
-    assert cloud.sky is not None
-    assert cloud.version
+def test_save_creates_parent_dir(tmp_path: Path) -> None:
+    gc = _make_cloud(n=8)
+    out = tmp_path / "nested" / "subdir" / "scene.usdz"
+    save_usdz(gc, out)
+    assert out.is_file()
+    loaded = load_usdz(out)
+    assert loaded.num_points == 8
