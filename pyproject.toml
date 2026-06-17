@@ -13,6 +13,17 @@ dependencies = [
     "spz",
 ]
 
+[project.optional-dependencies]
+scene-bundle = [
+    "pillow>=10",
+]
+
+# Note: the package directory is named ``3dgs_io`` (starts with a digit), so a
+# ``[project.scripts]`` console-script entry is not possible — the generated
+# wrapper would emit ``from 3dgs_io.* import ...`` which is a SyntaxError, and
+# uv_build refuses ``module-name`` entries that aren't valid Python identifiers.
+# Run the CLI with ``python -m 3dgs_io`` or ``python -m 3dgs_io.scene_bundle_cli``.
+
 
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
@@ -24,6 +35,7 @@ spz = { git = "https://github.com/nianticlabs/spz.git", rev="v2.1.0"}
 [dependency-groups]
 dev = [
     "furo>=2024.8.6",
+    "pillow>=10",
     "pre-commit>=4.0.0",
     "pytest>=9.0.3",
     "ruff>=0.14.0",

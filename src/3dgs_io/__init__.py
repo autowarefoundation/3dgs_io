@@ -18,6 +18,12 @@ from .metadata import (
     parse_metadata,
     serialize_metadata,
 )
+from .scene_bundle import (
+    SceneBundleOptions,
+    SceneBundleResult,
+    alpasim_to_spz,
+    save_scene_bundle,
+)
 from .spz_io import load_ply, load_spz, save_ply, save_spz
 from .tiles_export import TilesetSaveOptions, compute_bounding_volume, save_tileset
 from .tiles_io import (
@@ -58,7 +64,11 @@ __all__ = [
     "LidarTile3DContent",
     "Model",
     "Placement",
+    "SceneBundleOptions",
+    "SceneBundleResult",
     "TrainingData",
+    "alpasim_to_spz",
+    "save_scene_bundle",
     "load_gltf",
     "load_gltf_with_metadata",
     "load_lidar_gltf",
