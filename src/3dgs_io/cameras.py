@@ -261,14 +261,27 @@ def serialize_cameras(cameras: list[Camera]) -> dict[str, Any]:
 
 
 def parse_cameras(doc: dict[str, Any]) -> list[Camera]:
-    """Inverse of :func:`serialize_cameras`. Accepts a parsed JSON object."""
+    """Inverse of :func:`serialize_cameras`. Accepts a parsed JSON object.
+
+    Rejects duplicate camera names so the load path enforces the same
+    invariant as :func:`serialize_cameras` (downstream tooling keys by
+    name and silently dropping a duplicate would be a surprise).
+    """
     schema = doc.get("schema")
     if schema != CAMERAS_SCHEMA:
         raise ValueError(f"unexpected cameras schema {schema!r}; expected {CAMERAS_SCHEMA!r}")
     raw = doc.get("cameras")
     if not isinstance(raw, list):
         raise ValueError("cameras document is missing the 'cameras' list")
-    return [Camera.from_dict(entry) for entry in raw]
+    out: list[Camera] = []
+    seen: set[str] = set()
+    for entry in raw:
+        cam = Camera.from_dict(entry)
+        if cam.name in seen:
+            raise ValueError(f"duplicate camera name: {cam.name!r}")
+        seen.add(cam.name)
+        out.append(cam)
+    return out
 
 
 def load_cameras_from_usdz(path: str | Path) -> list[Camera]:

@@ -169,44 +169,9 @@ def test_intrinsics_defaults_pinhole_no_distortion() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_minimal_tileset_with_glb(tmp_path: Path) -> Path:
-    """Reuse the scene-usdz test fixture pattern."""
-    import spz
-
-    save_gltf = _mod.save_gltf
-    n = 32
-    rng = np.random.default_rng(0)
-    gc = spz.GaussianCloud()
-    gc.antialiased = False
-    gc.positions = rng.uniform(-10, 10, size=n * 3).astype(np.float32)
-    quats = rng.standard_normal((n, 4)).astype(np.float32)
-    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
-    gc.rotations = quats.reshape(-1)
-    gc.scales = rng.uniform(-3, 0, size=n * 3).astype(np.float32)
-    gc.alphas = rng.standard_normal(n).astype(np.float32)
-    gc.colors = rng.uniform(0, 1, size=n * 3).astype(np.float32)
-    gc.sh_degree = 0
-    gc.sh = np.zeros(0, dtype=np.float32)
-    save_gltf(gc, tmp_path / "model.glb")
-
-    doc = {
-        "asset": {"version": "1.1"},
-        "geometricError": 100.0,
-        "root": {
-            "boundingVolume": {"box": [0, 0, 0, 100, 0, 0, 0, 100, 0, 0, 0, 100]},
-            "geometricError": 0,
-            "refine": "ADD",
-            "content": {"uri": "model.glb"},
-        },
-    }
-    tp = tmp_path / "tileset.json"
-    tp.write_text(json.dumps(doc))
-    return tp
-
-
-def test_save_scene_usdz_embeds_cameras_json(tmp_path: Path) -> None:
+def test_save_scene_usdz_embeds_cameras_json(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
     save_scene_usdz = _mod.save_scene_usdz
-    ts = _make_minimal_tileset_with_glb(tmp_path)
+    ts = make_minimal_tileset_with_glb(tmp_path)
     cams = [_camera("front_left"), _camera("front_right")]
     cams[1].extrinsics = _extrinsics(tx=-1.5)
     out = tmp_path / "scene.usdz"
@@ -225,9 +190,9 @@ def test_save_scene_usdz_embeds_cameras_json(tmp_path: Path) -> None:
     assert {c["name"] for c in cameras_doc["cameras"]} == {"front_left", "front_right"}
 
 
-def test_load_cameras_from_usdz_round_trip(tmp_path: Path) -> None:
+def test_load_cameras_from_usdz_round_trip(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
     save_scene_usdz = _mod.save_scene_usdz
-    ts = _make_minimal_tileset_with_glb(tmp_path)
+    ts = make_minimal_tileset_with_glb(tmp_path)
     original = [_camera("c0"), _camera("c1")]
     original[1].extrinsics = _extrinsics(tx=42.0)
     out = tmp_path / "scene.usdz"
@@ -241,18 +206,22 @@ def test_load_cameras_from_usdz_round_trip(tmp_path: Path) -> None:
     assert by_name["c0"].intrinsics.distortion_model == "opencv"
 
 
-def test_load_cameras_from_usdz_missing_raises(tmp_path: Path) -> None:
+def test_load_cameras_from_usdz_missing_raises(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
     save_scene_usdz = _mod.save_scene_usdz
-    ts = _make_minimal_tileset_with_glb(tmp_path)
+    ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out)  # no cameras=
     with pytest.raises(FileNotFoundError, match="no cameras.json"):
         load_cameras_from_usdz(out)
 
 
-def test_cameras_and_extras_collision_rejected(tmp_path: Path) -> None:
+def test_cameras_and_extras_collision_rejected(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
     save_scene_usdz = _mod.save_scene_usdz
-    ts = _make_minimal_tileset_with_glb(tmp_path)
+    ts = make_minimal_tileset_with_glb(tmp_path)
     fake = tmp_path / "cameras.json"
     fake.write_text("{}")
     out = tmp_path / "scene.usdz"
@@ -265,9 +234,9 @@ def test_cameras_and_extras_collision_rejected(tmp_path: Path) -> None:
         )
 
 
-def test_cli_cameras_flag(tmp_path: Path) -> None:
+def test_cli_cameras_flag(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
-    ts = _make_minimal_tileset_with_glb(tmp_path)
+    ts = make_minimal_tileset_with_glb(tmp_path)
     cams = [_camera("front_left"), _camera("front_right")]
     cams_doc = serialize_cameras(cams)
     cams_path = tmp_path / "cameras.json"

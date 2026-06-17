@@ -70,7 +70,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Embed SRC (file or directory) at archive path ARC. Repeatable. "
             "Known archive paths get recorded in scene.json's extras block: "
             "map.osm, map.xodr, carla_world/manifest.json, tracks.parquet, "
-            "trajectory.parquet, cameras.json."
+            "trajectory.parquet, cameras.json, sequence_tracks.json."
         ),
     )
 
@@ -148,11 +148,18 @@ def main(argv: list[str] | None = None) -> int:
     extras = dict(args.extras) if args.extras else None
     cameras = None
     if args.cameras is not None:
-        cameras_doc = json.loads(Path(args.cameras).read_text(encoding="utf-8-sig"))
+        cameras_path = Path(args.cameras).expanduser()
+        cameras_doc = json.loads(cameras_path.read_text(encoding="utf-8-sig"))
         cameras = parse_cameras(cameras_doc)
     tracks = None
     if args.tracks is not None:
-        tracks_doc = json.loads(Path(args.tracks).read_text(encoding="utf-8-sig"))
+        tracks_path = Path(args.tracks).expanduser()
+        tracks_doc = json.loads(tracks_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(tracks_doc, dict):
+            raise ValueError(
+                f"--tracks: {tracks_path} top-level value must be a JSON object, "
+                f"got {type(tracks_doc).__name__}"
+            )
         # Auto-detect: our schema has top-level "schema" key; alpasim's doesn't.
         if tracks_doc.get("schema") == "splatsim.sequence_tracks/v1":
             tracks = parse_tracks(tracks_doc)

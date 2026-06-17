@@ -47,10 +47,18 @@ schema.
 from __future__ import annotations
 
 import json
+import logging
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
+
+_ALPASIM_KNOWN_TRACKS_KEYS = frozenset(
+    {"tracks_id", "tracks_poses", "tracks_timestamps_us", "tracks_label_class", "tracks_flags"}
+)
+_ALPASIM_KNOWN_CUBOID_KEYS = frozenset({"cuboids_dims"})
 
 __all__ = [
     "TRACKS_SCHEMA",
@@ -158,14 +166,26 @@ def serialize_tracks(tracks: list[Track]) -> dict[str, Any]:
 
 
 def parse_tracks(doc: dict[str, Any]) -> list[Track]:
-    """Inverse of :func:`serialize_tracks`."""
+    """Inverse of :func:`serialize_tracks`.
+
+    Rejects duplicate ``track_id`` so the load path enforces the same
+    invariant as :func:`serialize_tracks`.
+    """
     schema = doc.get("schema")
     if schema != TRACKS_SCHEMA:
         raise ValueError(f"unexpected tracks schema {schema!r}; expected {TRACKS_SCHEMA!r}")
     raw = doc.get("tracks")
     if not isinstance(raw, list):
         raise ValueError("tracks document is missing the 'tracks' list")
-    return [Track.from_dict(entry) for entry in raw]
+    out: list[Track] = []
+    seen: set[str] = set()
+    for entry in raw:
+        track = Track.from_dict(entry)
+        if track.track_id in seen:
+            raise ValueError(f"duplicate track_id: {track.track_id!r}")
+        seen.add(track.track_id)
+        out.append(track)
+    return out
 
 
 def load_tracks_from_usdz(path: str | Path) -> list[Track]:
@@ -223,6 +243,20 @@ def parse_alpasim_sequence_tracks(doc: dict[str, Any]) -> list[Track]:
             continue
         td = chunk.get("tracks_data") or {}
         cd = chunk.get("cuboidtracks_data") or {}
+        unknown_tracks_keys = set(td) - _ALPASIM_KNOWN_TRACKS_KEYS
+        if unknown_tracks_keys:
+            _log.warning(
+                "alpasim chunk %r: dropping unknown tracks_data keys %s",
+                chunk_id,
+                sorted(unknown_tracks_keys),
+            )
+        unknown_cuboid_keys = set(cd) - _ALPASIM_KNOWN_CUBOID_KEYS
+        if unknown_cuboid_keys:
+            _log.warning(
+                "alpasim chunk %r: dropping unknown cuboidtracks_data keys %s",
+                chunk_id,
+                sorted(unknown_cuboid_keys),
+            )
         ids = td.get("tracks_id") or []
         poses = td.get("tracks_poses") or []
         tss = td.get("tracks_timestamps_us") or []
