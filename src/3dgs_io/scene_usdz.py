@@ -1,18 +1,26 @@
-"""Splatsim scene-bundle writer (USDZ → directory bundle).
+"""Single-file USDZ writer that packs an entire splatsim scene bundle.
 
-The bundle this module produces is the **3D-GS portion** of a splatsim scene:
+Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
 
-* ``scene.json``             — bundle index + producer info
-* ``tileset.json``           — Cesium 3D Tiles v1.0 + ``EXT_3dgs_spz`` extension
-* ``chunks/chunk_NNNNNN.spz`` — Niantic SPZ tiles produced by spatially
-  splitting the input cloud
+    default.usda                 # USDZ root stage (asset reference to tileset.json)
+    scene.json                   # splatsim.scene/v1 bundle index
+    tileset.json                 # Cesium 3D Tiles v1.0 + EXT_3dgs_spz
+    chunks/chunk_NNNNNN.spz      # Niantic SPZ tiles (spatially split)
+    <user-supplied extras>       # verbatim files / dirs at user-chosen paths
 
-All other sidecars referenced from the splatsim spec (``map.osm`` /
-``map.xodr`` / ``carla_world/`` / ``tracks.parquet`` / ``trajectory.parquet``)
-are assumed to be produced by external tooling. If they happen to exist next
-to the bundle at write time, :func:`save_scene_bundle` surfaces them through
-the ``scene.json`` ``extras`` block (pass-through); otherwise those fields
-are ``null``.
+Recognised "well-known" extras keys (or any extras whose archive path matches
+the recognised paths) are recorded in ``scene.json``'s ``extras`` block so
+downstream tooling can resolve them without scanning the archive:
+
+================================  =================================
+archive path                      scene.json key
+================================  =================================
+``map.osm``                       ``extras.map_lanelet2``
+``map.xodr``                      ``extras.map_opendrive``
+``carla_world/manifest.json``     ``extras.carla_world``
+``tracks.parquet``                ``extras.tracks``
+``trajectory.parquet``            ``extras.trajectory``
+================================  =================================
 """
 
 from __future__ import annotations
@@ -21,6 +29,9 @@ import datetime as _dt
 import json
 import logging
 import math
+import tempfile
+import zipfile
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -30,31 +41,57 @@ import spz
 
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
-from .usdz_io import load_usdz
 
 __all__ = [
-    "SceneBundleOptions",
-    "SceneBundleResult",
-    "save_scene_bundle",
+    "SceneUsdzOptions",
+    "SceneUsdzResult",
+    "save_scene_usdz",
 ]
 
 _log = logging.getLogger(__name__)
 
-_TOOL_NAME = "splatsim-import-usdz"
+_TOOL_NAME = "3dgs_io.scene_usdz"
 _TOOL_VERSION = "0.1.0"
 _SCENE_SCHEMA = "splatsim.scene/v1"
 
-# spz / 3D Tiles tile content extension key.
+# 3D Tiles tile-content extension key for spz payloads.
 _EXT_3DGS_SPZ = "EXT_3dgs_spz"
+
+# Archive entries owned by the writer; user extras must not collide.
+_RESERVED_PATHS = frozenset({"default.usda", "scene.json", "tileset.json"})
+_RESERVED_PREFIXES: tuple[str, ...] = ("chunks/",)
+
+_DEFAULT_USDA = """#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    custom asset gaussianTileset = @./tileset.json@
+    custom asset sceneIndex      = @./scene.json@
+}
+"""
+
+# Recognised archive paths that get auto-recorded in scene.json's extras.
+_KNOWN_EXTRAS: dict[str, str] = {
+    "map.osm": "map_lanelet2",
+    "map.xodr": "map_opendrive",
+    "carla_world/manifest.json": "carla_world",
+    "tracks.parquet": "tracks",
+    "trajectory.parquet": "trajectory",
+}
 
 
 # ---------------------------------------------------------------------------
-# Options
+# Options + Result
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class SceneBundleOptions:
+class SceneUsdzOptions:
     """Tunables matching the public CLI flags."""
 
     chunk_size: float = 50.0
@@ -69,23 +106,21 @@ class SceneBundleOptions:
     far_plane: float = 300.0
 
     geometric_error: float = 100.0
-    """Root ``geometricError`` written into ``tileset.json``."""
 
 
 @dataclass
-class SceneBundleResult:
-    """Summary of files produced by :func:`save_scene_bundle`."""
+class SceneUsdzResult:
+    """Summary of what was packed into the output USDZ."""
 
-    scene_json: Path
-    tileset_json: Path
-    chunks: list[Path] = field(default_factory=list)
+    out_path: Path
     n_gaussians: int = 0
     sh_degree: int = 0
+    n_chunks: int = 0
+    extras: dict[str, str | None] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# spz.GaussianCloud filtering — returns the working numpy arrays directly so
-# the chunk writer can reuse them without a second extraction pass.
+# Cloud filtering & spatial chunking
 # ---------------------------------------------------------------------------
 
 
@@ -110,12 +145,8 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneBundleOptions) -> _CloudArrays:
-    """Drop non-finite / out-of-bbox / low-opacity gaussians and clamp scales.
-
-    Returns the working numpy arrays directly; the caller (chunk writer) reuses
-    them without re-extracting from a temporary :class:`spz.GaussianCloud`.
-    """
+def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneUsdzOptions) -> _CloudArrays:
+    """Drop non-finite / out-of-bbox / low-opacity gaussians and clamp scales."""
     n = gc.num_points
     if n == 0:
         raise ValueError("Input GaussianCloud is empty")
@@ -156,13 +187,12 @@ def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneBundleOptions) -> _Cl
     if positions.shape[0] == 0:
         raise ValueError("All gaussians were filtered out — try relaxing options")
 
-    # Re-normalise quaternions, replacing degenerate (zero-norm) rows with identity.
+    # Re-normalise quaternions, replacing degenerate rows with identity.
     norm = np.linalg.norm(rotations, axis=1, keepdims=True)
     degenerate = (norm <= 1e-12).squeeze(-1)
     safe_norm = np.where(norm > 1e-12, norm, 1.0)
     rotations = (rotations / safe_norm).astype(np.float32)
     if degenerate.any():
-        # xyzw identity quaternion
         rotations[degenerate] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
     # Scale clamp: floor each axis at min_scale, then cap by min_axis * max_aspect_ratio.
@@ -184,13 +214,7 @@ def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneBundleOptions) -> _Cl
     )
 
 
-# ---------------------------------------------------------------------------
-# Spatial chunking + per-tile spz writer + tileset.json
-# ---------------------------------------------------------------------------
-
-
 def _split_oversized_chunk(member_idx: np.ndarray, max_n: int) -> list[np.ndarray]:
-    """Split a single cell into <= ``max_n`` sub-chunks by simple slicing."""
     if max_n <= 0 or member_idx.size <= max_n:
         return [member_idx]
     n_splits = math.ceil(member_idx.size / max_n)
@@ -200,7 +224,6 @@ def _split_oversized_chunk(member_idx: np.ndarray, max_n: int) -> list[np.ndarra
 def _aabb_to_3dtiles_box(bbox_min: np.ndarray, bbox_max: np.ndarray) -> list[float]:
     center = ((bbox_min + bbox_max) / 2).astype(np.float64)
     half = ((bbox_max - bbox_min) / 2).astype(np.float64)
-    # Guard against zero-extent boxes (single-point chunks).
     half = np.where(half > 0, half, 1e-6)
     return [
         float(center[0]),
@@ -219,9 +242,8 @@ def _aabb_to_3dtiles_box(bbox_min: np.ndarray, bbox_max: np.ndarray) -> list[flo
 
 
 def _split_cloud_into_chunks(
-    arrays: _CloudArrays, options: SceneBundleOptions
+    arrays: _CloudArrays, options: SceneUsdzOptions
 ) -> tuple[list[spz.GaussianCloud], list[tuple[np.ndarray, np.ndarray]]]:
-    """Return per-cell sub-clouds + per-cell (bbox_min, bbox_max)."""
     positions = arrays.positions
     bbox_min = positions.min(axis=0)
     bbox_max = positions.max(axis=0)
@@ -257,25 +279,15 @@ def _split_cloud_into_chunks(
     return chunks, bounds
 
 
-def _write_chunks_and_tileset(
-    arrays: _CloudArrays,
-    out_dir: Path,
-    options: SceneBundleOptions,
-) -> tuple[Path, list[Path]]:
-    chunks_dir = out_dir / "chunks"
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-
-    sub_clouds, bounds = _split_cloud_into_chunks(arrays, options)
-    chunk_paths: list[Path] = []
+def _build_tileset(
+    sub_clouds: list[spz.GaussianCloud],
+    bounds: list[tuple[np.ndarray, np.ndarray]],
+    options: SceneUsdzOptions,
+) -> dict[str, Any]:
     children: list[dict[str, Any]] = []
     bbox_min_all = bounds[0][0].copy()
     bbox_max_all = bounds[0][1].copy()
-
     for i, (sub, (bmin, bmax)) in enumerate(zip(sub_clouds, bounds, strict=True)):
-        name = f"chunk_{i:06d}.spz"
-        path = chunks_dir / name
-        save_spz(sub, path)
-        chunk_paths.append(path)
         bbox_min_all = np.minimum(bbox_min_all, bmin)
         bbox_max_all = np.maximum(bbox_max_all, bmax)
         children.append(
@@ -283,20 +295,17 @@ def _write_chunks_and_tileset(
                 "boundingVolume": {"box": _aabb_to_3dtiles_box(bmin, bmax)},
                 "geometricError": 0.0,
                 "content": {
-                    "uri": f"chunks/{name}",
+                    "uri": f"chunks/chunk_{i:06d}.spz",
                     "extensions": {
                         _EXT_3DGS_SPZ: {"format": "spz/1", "n_points": int(sub.num_points)},
                     },
                 },
             }
         )
-
     root: dict[str, Any] = {
         "boundingVolume": {"box": _aabb_to_3dtiles_box(bbox_min_all, bbox_max_all)},
         "geometricError": float(options.geometric_error),
         "refine": "ADD",
-        # Row-major identity (Cesium 3D Tiles transforms are column-major, but
-        # identity is symmetric so this is unambiguous).
         "transform": [
             1.0,
             0.0,
@@ -317,17 +326,60 @@ def _write_chunks_and_tileset(
         ],
         "children": children,
     }
-
-    tileset = {
+    return {
         "asset": {"version": "1.0", "tilesetVersion": "splatsim-spz/1.0"},
         "extensionsRequired": [_EXT_3DGS_SPZ],
         "extensionsUsed": [_EXT_3DGS_SPZ],
         "geometricError": float(options.geometric_error),
         "root": root,
     }
-    tileset_path = out_dir / "tileset.json"
-    tileset_path.write_text(json.dumps(tileset, indent=2))
-    return tileset_path, chunk_paths
+
+
+# ---------------------------------------------------------------------------
+# Extras handling
+# ---------------------------------------------------------------------------
+
+
+def _normalise_arc_path(p: str) -> str:
+    """Strip leading slashes and collapse separator inconsistencies."""
+    return p.lstrip("/").replace("\\", "/")
+
+
+def _collect_extras_entries(
+    extras: Mapping[str, str | Path] | None,
+) -> list[tuple[str, Path]]:
+    """Expand directory sources into per-file (archive_path, src_path) entries."""
+    if not extras:
+        return []
+    out: list[tuple[str, Path]] = []
+    for raw_key, raw_src in extras.items():
+        arc_key = _normalise_arc_path(raw_key)
+        if not arc_key:
+            raise ValueError("extras key must not be empty")
+        if arc_key in _RESERVED_PATHS or any(
+            arc_key == p.rstrip("/") or arc_key.startswith(p) for p in _RESERVED_PREFIXES
+        ):
+            raise ValueError(f"extras key {raw_key!r} collides with a reserved scene-bundle path")
+        src = Path(raw_src)
+        if not src.exists():
+            raise FileNotFoundError(f"extras source not found: {src}")
+        if src.is_dir():
+            for sub in sorted(src.rglob("*")):
+                if sub.is_file():
+                    rel = sub.relative_to(src).as_posix()
+                    out.append((f"{arc_key}/{rel}", sub))
+        else:
+            out.append((arc_key, src))
+    return out
+
+
+def _detect_known_extras(archive_paths: set[str]) -> dict[str, str | None]:
+    """Map known archive paths → scene.json ``extras`` field values."""
+    detected: dict[str, str | None] = {key: None for key in _KNOWN_EXTRAS.values()}
+    for path, scene_key in _KNOWN_EXTRAS.items():
+        if path in archive_paths:
+            detected[scene_key] = path
+    return detected
 
 
 # ---------------------------------------------------------------------------
@@ -335,27 +387,10 @@ def _write_chunks_and_tileset(
 # ---------------------------------------------------------------------------
 
 
-# Sidecars that may exist next to the bundle directory (produced by external
-# tooling). We never create or convert these; we only record their presence in
-# ``scene.json`` ``extras`` when they happen to be in place.
-_EXTRA_PATHS: dict[str, str] = {
-    "map_lanelet2": "map.osm",
-    "map_opendrive": "map.xodr",
-    "carla_world": "carla_world/manifest.json",
-    "tracks": "tracks.parquet",
-    "trajectory": "trajectory.parquet",
-}
-
-
-def _detect_existing_extras(out_dir: Path) -> dict[str, str | None]:
-    """Return an ``extras`` dict pointing at any pre-existing sidecars in ``out_dir``."""
-    return {key: rel if (out_dir / rel).exists() else None for key, rel in _EXTRA_PATHS.items()}
-
-
 def _compose_scene_json(
     *,
     arrays: _CloudArrays,
-    options: SceneBundleOptions,
+    options: SceneUsdzOptions,
     extras: dict[str, str | None],
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -391,51 +426,98 @@ def _compose_scene_json(
 
 
 # ---------------------------------------------------------------------------
-# Top-level entry point
+# Public API
 # ---------------------------------------------------------------------------
 
 
-def save_scene_bundle(
-    usdz_path: str | Path,
-    out_dir: str | Path,
-    options: SceneBundleOptions | None = None,
-) -> SceneBundleResult:
-    """Convert a USDZ-wrapped :class:`spz.GaussianCloud` into a scene bundle.
+def save_scene_usdz(
+    cloud: spz.GaussianCloud,
+    out_path: str | Path,
+    *,
+    extras: Mapping[str, str | Path] | None = None,
+    options: SceneUsdzOptions | None = None,
+) -> SceneUsdzResult:
+    """Pack ``cloud`` and ``extras`` into a single self-contained USDZ archive.
 
-    Produces ``scene.json`` / ``tileset.json`` / ``chunks/*.spz``. Non-gaussian
-    sidecars (``map.osm`` / ``carla_world/`` / ``tracks.parquet`` / etc.) are
-    expected to be provided by upstream tooling — if any already exist in
-    ``out_dir`` they are recorded in ``scene.json``'s ``extras`` block.
+    The output is a ``ZIP_STORED`` archive with ``default.usda`` first (USDZ
+    requirement), followed by ``scene.json`` / ``tileset.json`` / per-tile
+    ``chunks/chunk_NNNNNN.spz``, then any user-supplied ``extras``.
+
+    Parameters
+    ----------
+    cloud:
+        The gaussian payload. Loaded with any of the ``load_gltf`` /
+        ``load_spz`` / ``load_ply`` / ``load_usdz`` helpers.
+    out_path:
+        Destination ``.usdz`` path.
+    extras:
+        Mapping of archive-relative path → file or directory on disk. Files
+        are added verbatim; directories are recursively zipped under the key
+        as a prefix. Reserved paths (``default.usda`` / ``scene.json`` /
+        ``tileset.json`` / ``chunks/*``) are rejected with ``ValueError``.
+
+        Any of the recognised paths in :data:`_KNOWN_EXTRAS` get auto-recorded
+        in ``scene.json``'s ``extras`` block:
+
+        * ``map.osm`` → ``extras.map_lanelet2``
+        * ``map.xodr`` → ``extras.map_opendrive``
+        * ``carla_world/manifest.json`` → ``extras.carla_world``
+        * ``tracks.parquet`` → ``extras.tracks``
+        * ``trajectory.parquet`` → ``extras.trajectory``
+    options:
+        Tunables for filtering, scale clamping, chunk size, and render
+        defaults written into ``scene.json``.
     """
-    usdz_path = Path(usdz_path)
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     if options is None:
-        options = SceneBundleOptions()
+        options = SceneUsdzOptions()
 
-    arrays = _filter_and_clamp(load_usdz(usdz_path), options)
-    tileset_path, chunk_paths = _write_chunks_and_tileset(arrays, out_dir, options)
+    arrays = _filter_and_clamp(cloud, options)
+    sub_clouds, bounds = _split_cloud_into_chunks(arrays, options)
+    tileset_doc = _build_tileset(sub_clouds, bounds, options)
 
-    extras = _detect_existing_extras(out_dir)
-    scene = _compose_scene_json(arrays=arrays, options=options, extras=extras)
-    scene_path = out_dir / "scene.json"
-    scene_path.write_text(json.dumps(scene, indent=2))
+    extras_entries = _collect_extras_entries(extras)
+    archive_paths = {arc for arc, _ in extras_entries}
+    extras_meta = _detect_known_extras(archive_paths)
+    scene_doc = _compose_scene_json(arrays=arrays, options=options, extras=extras_meta)
 
-    return SceneBundleResult(
-        scene_json=scene_path,
-        tileset_json=tileset_path,
-        chunks=chunk_paths,
+    # Materialise chunks to a tempdir, then assemble the USDZ from disk so
+    # large extras (multi-GB CARLA trees, etc.) never get loaded into RAM.
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        chunk_entries: list[tuple[str, Path]] = []
+        for i, sub in enumerate(sub_clouds):
+            cp = td_path / f"chunk_{i:06d}.spz"
+            save_spz(sub, cp)
+            chunk_entries.append((f"chunks/chunk_{i:06d}.spz", cp))
+
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+            _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
+            _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
+            _zip_write_str(zf, "tileset.json", json.dumps(tileset_doc, indent=2))
+            for arc, src in chunk_entries:
+                zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
+            for arc, src in extras_entries:
+                zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
+
+    return SceneUsdzResult(
+        out_path=out_path,
         n_gaussians=arrays.n,
         sh_degree=arrays.sh_degree,
+        n_chunks=len(sub_clouds),
+        extras=extras_meta,
     )
 
 
-# Used by the CLI to log a structured summary.
-def _result_summary(result: SceneBundleResult) -> dict[str, Any]:
+def _zip_write_str(zf: zipfile.ZipFile, name: str, content: str) -> None:
+    zi = zipfile.ZipInfo(name)
+    zi.compress_type = zipfile.ZIP_STORED
+    zf.writestr(zi, content.encode("utf-8"))
+
+
+def _result_summary(result: SceneUsdzResult) -> dict[str, Any]:
+    """Stringified summary used by the CLI."""
     d = asdict(result)
-    d["chunks"] = [str(p) for p in result.chunks]
-    for k in ("scene_json", "tileset_json"):
-        v = d.get(k)
-        if v is not None:
-            d[k] = str(v)
+    d["out_path"] = str(result.out_path)
     return d
