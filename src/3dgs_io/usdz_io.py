@@ -7,10 +7,6 @@ A gaussian cloud is wrapped in a `ZIP_STORED` USDZ archive containing:
   USDZ payload (openable in USDView etc.) even though USD has no native
   support for SPZ gaussians.
 * ``model.spz`` — the Niantic SPZ binary (the entire cloud).
-
-This module does NOT preserve the alpasim NuRec layout (no
-``volume.nurec`` / no msgpack / no NuRec render config). A USDZ produced
-here is not loadable by NuRec or Omniverse-NuRec.
 """
 
 from __future__ import annotations
