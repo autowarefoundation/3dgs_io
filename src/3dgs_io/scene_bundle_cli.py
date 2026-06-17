@@ -24,12 +24,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m 3dgs_io",
         description=(
-            "Convert an alpasim USDZ into the 3D-GS portion of a splatsim scene "
-            "bundle (scene.json + tileset.json + chunks/*.spz + sky/). "
+            "Convert a USDZ-wrapped spz.GaussianCloud into the 3D-GS portion of a "
+            "splatsim scene bundle (scene.json + tileset.json + chunks/*.spz). "
             "Non-gaussian sidecars are expected to be produced by other tools."
         ),
     )
-    p.add_argument("usdz", type=Path, help="Input alpasim USDZ archive")
+    p.add_argument("usdz", type=Path, help="Input USDZ archive (default.usda + model.spz)")
     p.add_argument("out_dir", type=Path, help="Output directory for the bundle")
 
     # Match the table ⑩ defaults from the format spec.
