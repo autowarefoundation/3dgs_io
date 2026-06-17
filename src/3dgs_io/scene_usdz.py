@@ -1,16 +1,21 @@
-"""Single-file USDZ writer that packs an entire splatsim scene bundle.
+"""Single-file USDZ writer for a Cesium 3D Tiles ``tileset.json``.
+
+The writer is **driven by a tileset.json** so the source's root world-anchor
+transform (Cesium 3D Tiles ``root.transform`` — 4×4 column-major) is
+preserved verbatim into the output archive. Gaussian payloads stay in the
+root-local frame; the world offset lives in ``tileset.json``'s
+``root.transform`` exactly as in the input.
 
 Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
 
     default.usda                 # USDZ root stage (asset reference to tileset.json)
     scene.json                   # splatsim.scene/v1 bundle index
-    tileset.json                 # Cesium 3D Tiles v1.0 + EXT_3dgs_spz
+    tileset.json                 # Cesium 3D Tiles v1.0 + EXT_3dgs_spz, root.transform preserved
     chunks/chunk_NNNNNN.spz      # Niantic SPZ tiles (spatially split)
     <user-supplied extras>       # verbatim files / dirs at user-chosen paths
 
-Recognised "well-known" extras keys (or any extras whose archive path matches
-the recognised paths) are recorded in ``scene.json``'s ``extras`` block so
-downstream tooling can resolve them without scanning the archive:
+Recognised "well-known" extras paths get auto-recorded in ``scene.json``'s
+``extras`` block so downstream tooling can resolve them without scanning:
 
 ================================  =================================
 archive path                      scene.json key
@@ -31,7 +36,7 @@ import logging
 import math
 import tempfile
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -39,8 +44,10 @@ from typing import Any, NamedTuple
 import numpy as np
 import spz
 
+from .gltf_io import load_gltf
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
+from .tiles_io import _apply_rotation_to_quats
 
 __all__ = [
     "SceneUsdzOptions",
@@ -60,6 +67,25 @@ _EXT_3DGS_SPZ = "EXT_3dgs_spz"
 # Archive entries owned by the writer; user extras must not collide.
 _RESERVED_PATHS = frozenset({"default.usda", "scene.json", "tileset.json"})
 _RESERVED_PREFIXES: tuple[str, ...] = ("chunks/",)
+
+_IDENTITY_16: tuple[float, ...] = (
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.0,
+)
 
 _DEFAULT_USDA = """#usda 1.0
 (
@@ -117,6 +143,125 @@ class SceneUsdzResult:
     sh_degree: int = 0
     n_chunks: int = 0
     extras: dict[str, str | None] = field(default_factory=dict)
+    root_transform: list[float] = field(default_factory=lambda: list(_IDENTITY_16))
+
+
+# ---------------------------------------------------------------------------
+# tileset.json loader: produces (cloud_in_root_local_frame, root_transform).
+# ---------------------------------------------------------------------------
+
+
+def _walk_leaves(
+    tile: Mapping[str, Any], parent_transform: np.ndarray
+) -> Iterator[tuple[str, np.ndarray]]:
+    """Walk a tile subtree and yield ``(content_uri, cumulative_transform)``
+    for each leaf that holds tile content.
+
+    The root tile's own ``transform`` MUST be stripped by the caller — we
+    anchor the output's ``root.transform`` to the source's, so positions in
+    the resulting payload stay in root-local frame.
+    """
+    local = tile.get("transform")
+    if local is not None:
+        # 3D Tiles transforms are column-major; reshape and transpose to row-major.
+        local_mat = np.array(local, dtype=np.float64).reshape(4, 4).T
+        transform = local_mat @ parent_transform
+    else:
+        transform = parent_transform
+    children = tile.get("children", [])
+    is_leaf = not children
+    if is_leaf:
+        contents: list[Mapping[str, Any]] = list(tile.get("contents") or [])
+        if "content" in tile and tile["content"] is not None:
+            contents.append(tile["content"])
+        for entry in contents:
+            uri = entry.get("uri") or entry.get("url")
+            if uri:
+                yield uri, transform
+    for child in children:
+        yield from _walk_leaves(child, transform)
+
+
+def _apply_transform_to_cloud(gc: spz.GaussianCloud, transform: np.ndarray) -> spz.GaussianCloud:
+    """Apply a 4×4 row-major rigid transform to positions + quaternions."""
+    n = gc.num_points
+    positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
+    rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
+    r = transform[:3, :3].astype(np.float32)
+    t = transform[:3, 3].astype(np.float32)
+    new_positions = positions @ r.T + t
+    new_rotations = _apply_rotation_to_quats(r, rotations)
+
+    out = spz.GaussianCloud()
+    out.antialiased = gc.antialiased
+    out.positions = np.ascontiguousarray(new_positions, dtype=np.float32).reshape(-1)
+    out.rotations = np.ascontiguousarray(new_rotations, dtype=np.float32).reshape(-1)
+    out.scales = np.array(gc.scales, dtype=np.float32)
+    out.colors = np.array(gc.colors, dtype=np.float32)
+    out.alphas = np.array(gc.alphas, dtype=np.float32)
+    out.sh = np.array(gc.sh, dtype=np.float32)
+    out.sh_degree = gc.sh_degree
+    return out
+
+
+def _concat_clouds(clouds: list[spz.GaussianCloud]) -> spz.GaussianCloud:
+    sh_deg = clouds[0].sh_degree
+    for c in clouds[1:]:
+        if c.sh_degree != sh_deg:
+            raise ValueError(f"Cannot merge tiles with mixed sh_degree: {sh_deg} vs {c.sh_degree}")
+    out = spz.GaussianCloud()
+    out.antialiased = clouds[0].antialiased
+    out.sh_degree = sh_deg
+    out.positions = np.concatenate([np.array(c.positions, dtype=np.float32) for c in clouds])
+    out.rotations = np.concatenate([np.array(c.rotations, dtype=np.float32) for c in clouds])
+    out.scales = np.concatenate([np.array(c.scales, dtype=np.float32) for c in clouds])
+    out.colors = np.concatenate([np.array(c.colors, dtype=np.float32) for c in clouds])
+    out.alphas = np.concatenate([np.array(c.alphas, dtype=np.float32) for c in clouds])
+    out.sh = np.concatenate([np.array(c.sh, dtype=np.float32) for c in clouds])
+    return out
+
+
+def _load_from_tileset(tileset_path: Path) -> tuple[spz.GaussianCloud, list[float]]:
+    """Parse ``tileset.json`` and return ``(cloud_in_root_local_frame, root_transform)``."""
+    base = tileset_path.parent
+    doc = json.loads(tileset_path.read_text())
+    root = doc.get("root")
+    if root is None:
+        raise ValueError(f"{tileset_path}: missing 'root' tile")
+
+    root_transform_list = root.get("transform")
+    if root_transform_list is None:
+        root_transform_list = list(_IDENTITY_16)
+    else:
+        if len(root_transform_list) != 16:
+            raise ValueError(
+                f"{tileset_path}: root.transform must have 16 elements, "
+                f"got {len(root_transform_list)}"
+            )
+        root_transform_list = [float(v) for v in root_transform_list]
+
+    # Walk leaves with the root's own transform stripped so positions accumulate
+    # only the sub-root local transforms.
+    root_without_transform: dict[str, Any] = {k: v for k, v in root.items() if k != "transform"}
+    leaves = list(_walk_leaves(root_without_transform, np.eye(4, dtype=np.float64)))
+    if not leaves:
+        raise ValueError(f"{tileset_path}: no tile content found")
+
+    clouds: list[spz.GaussianCloud] = []
+    for uri, transform in leaves:
+        if "://" in uri:
+            raise ValueError(f"Remote tile content not supported: {uri!r}")
+        content_path = (base / uri).resolve()
+        ext = content_path.suffix.lower()
+        if ext not in (".glb", ".gltf"):
+            raise ValueError(f"Only glTF tile content is supported; got {content_path}")
+        gc = load_gltf(content_path)
+        if not np.allclose(transform, np.eye(4)):
+            gc = _apply_transform_to_cloud(gc, transform)
+        clouds.append(gc)
+
+    cloud = clouds[0] if len(clouds) == 1 else _concat_clouds(clouds)
+    return cloud, root_transform_list
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +428,7 @@ def _build_tileset(
     sub_clouds: list[spz.GaussianCloud],
     bounds: list[tuple[np.ndarray, np.ndarray]],
     options: SceneUsdzOptions,
+    root_transform: list[float],
 ) -> dict[str, Any]:
     children: list[dict[str, Any]] = []
     bbox_min_all = bounds[0][0].copy()
@@ -306,24 +452,7 @@ def _build_tileset(
         "boundingVolume": {"box": _aabb_to_3dtiles_box(bbox_min_all, bbox_max_all)},
         "geometricError": float(options.geometric_error),
         "refine": "ADD",
-        "transform": [
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            1.0,
-        ],
+        "transform": root_transform,
         "children": children,
     }
     return {
@@ -341,7 +470,6 @@ def _build_tileset(
 
 
 def _normalise_arc_path(p: str) -> str:
-    """Strip leading slashes and collapse separator inconsistencies."""
     return p.lstrip("/").replace("\\", "/")
 
 
@@ -374,7 +502,6 @@ def _collect_extras_entries(
 
 
 def _detect_known_extras(archive_paths: set[str]) -> dict[str, str | None]:
-    """Map known archive paths → scene.json ``extras`` field values."""
     detected: dict[str, str | None] = {key: None for key in _KNOWN_EXTRAS.values()}
     for path, scene_key in _KNOWN_EXTRAS.items():
         if path in archive_paths:
@@ -392,6 +519,8 @@ def _compose_scene_json(
     arrays: _CloudArrays,
     options: SceneUsdzOptions,
     extras: dict[str, str | None],
+    root_transform: list[float],
+    source_tileset: str,
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
@@ -400,8 +529,13 @@ def _compose_scene_json(
             "tool": _TOOL_NAME,
             "tool_version": _TOOL_VERSION,
             "created_at": created_at,
+            "source_tileset": source_tileset,
         },
-        "world": {"up_axis": "z", "units": "meters"},
+        "world": {
+            "up_axis": "z",
+            "units": "meters",
+            "root_transform": root_transform,
+        },
         "gaussians": {
             "tileset": "tileset.json",
             "tile_content_format": "spz/1",
@@ -431,56 +565,57 @@ def _compose_scene_json(
 
 
 def save_scene_usdz(
-    cloud: spz.GaussianCloud,
+    tileset_path: str | Path,
     out_path: str | Path,
     *,
     extras: Mapping[str, str | Path] | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
-    """Pack ``cloud`` and ``extras`` into a single self-contained USDZ archive.
+    """Pack a Cesium ``tileset.json`` (+ extras) into a single self-contained USDZ.
 
-    The output is a ``ZIP_STORED`` archive with ``default.usda`` first (USDZ
-    requirement), followed by ``scene.json`` / ``tileset.json`` / per-tile
-    ``chunks/chunk_NNNNNN.spz``, then any user-supplied ``extras``.
+    The input tileset's ``root.transform`` (the world anchor — typically an
+    ECEF placement for Cesium) is preserved verbatim into the output
+    ``tileset.json``. Per-tile transforms below the root are baked into the
+    payload positions/rotations so the output stays a single flat tree.
 
     Parameters
     ----------
-    cloud:
-        The gaussian payload. Loaded with any of the ``load_gltf`` /
-        ``load_spz`` / ``load_ply`` / ``load_usdz`` helpers.
+    tileset_path:
+        Path to a Cesium 3D Tiles ``tileset.json``. Its ``root`` must have a
+        ``content`` (or descend through ``children`` to leaves with content),
+        each pointing at a glTF ``.glb`` / ``.gltf``. Remote URIs are not
+        supported.
     out_path:
         Destination ``.usdz`` path.
     extras:
         Mapping of archive-relative path → file or directory on disk. Files
         are added verbatim; directories are recursively zipped under the key
-        as a prefix. Reserved paths (``default.usda`` / ``scene.json`` /
+        prefix. Reserved paths (``default.usda`` / ``scene.json`` /
         ``tileset.json`` / ``chunks/*``) are rejected with ``ValueError``.
-
-        Any of the recognised paths in :data:`_KNOWN_EXTRAS` get auto-recorded
-        in ``scene.json``'s ``extras`` block:
-
-        * ``map.osm`` → ``extras.map_lanelet2``
-        * ``map.xodr`` → ``extras.map_opendrive``
-        * ``carla_world/manifest.json`` → ``extras.carla_world``
-        * ``tracks.parquet`` → ``extras.tracks``
-        * ``trajectory.parquet`` → ``extras.trajectory``
     options:
-        Tunables for filtering, scale clamping, chunk size, and render
-        defaults written into ``scene.json``.
+        Filtering, scale clamping, chunk size, and render defaults.
     """
+    tileset_path = Path(tileset_path)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if options is None:
         options = SceneUsdzOptions()
 
+    cloud, root_transform = _load_from_tileset(tileset_path)
     arrays = _filter_and_clamp(cloud, options)
     sub_clouds, bounds = _split_cloud_into_chunks(arrays, options)
-    tileset_doc = _build_tileset(sub_clouds, bounds, options)
+    tileset_doc = _build_tileset(sub_clouds, bounds, options, root_transform)
 
     extras_entries = _collect_extras_entries(extras)
     archive_paths = {arc for arc, _ in extras_entries}
     extras_meta = _detect_known_extras(archive_paths)
-    scene_doc = _compose_scene_json(arrays=arrays, options=options, extras=extras_meta)
+    scene_doc = _compose_scene_json(
+        arrays=arrays,
+        options=options,
+        extras=extras_meta,
+        root_transform=root_transform,
+        source_tileset=tileset_path.name,
+    )
 
     # Materialise chunks to a tempdir, then assemble the USDZ from disk so
     # large extras (multi-GB CARLA trees, etc.) never get loaded into RAM.
@@ -507,6 +642,7 @@ def save_scene_usdz(
         sh_degree=arrays.sh_degree,
         n_chunks=len(sub_clouds),
         extras=extras_meta,
+        root_transform=root_transform,
     )
 
 

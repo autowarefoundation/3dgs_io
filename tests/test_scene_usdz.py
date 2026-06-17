@@ -1,9 +1,10 @@
-"""Tests for the single-file USDZ scene-bundle writer.
+"""Tests for the tileset-driven single-file USDZ scene-bundle writer.
 
-`save_scene_usdz` packs an spz.GaussianCloud + optional sidecar files/dirs
-into one self-contained `ZIP_STORED` USDZ archive. The archive carries
-`default.usda` / `scene.json` / `tileset.json` / `chunks/*.spz` (always) and
-whatever extras the caller supplies (verbatim).
+`save_scene_usdz` reads a Cesium 3D Tiles tileset.json (which carries the
+world-anchoring root.transform), loads the referenced glTF tile content(s),
+and packs everything plus user-supplied sidecars into one self-contained
+`ZIP_STORED` USDZ archive. The source tileset's root.transform is preserved
+verbatim into the output's tileset.json.
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ import spz
 
 _mod = importlib.import_module("3dgs_io")
 SceneUsdzOptions = _mod.SceneUsdzOptions
+save_gltf = _mod.save_gltf
 save_scene_usdz = _mod.save_scene_usdz
-save_usdz = _mod.save_usdz
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,57 @@ def _make_cloud(n: int = 256, sh_degree: int = 3) -> spz.GaussianCloud:
     return gc
 
 
+# A non-identity ECEF-flavoured 4×4 (column-major, like the rainbow_bridge sample).
+_NONIDENT_TRANSFORM = [
+    -0.7878095269807162,
+    -0.5554480619228042,
+    -0.26614582413523163,
+    0.0,
+    0.2049411947563169,
+    -0.6438890004038338,
+    0.7371608113911139,
+    0.0,
+    -0.5808229126767246,
+    0.5261980669530751,
+    0.6210960782717704,
+    0.0,
+    -3961517.719569116,
+    3352351.3421289744,
+    3695591.763367203,
+    1.0,
+]
+
+
+def _make_tileset(
+    tmp_path: Path,
+    *,
+    cloud: spz.GaussianCloud | None = None,
+    transform: list[float] | None = None,
+    glb_name: str = "model.glb",
+) -> Path:
+    """Write ``model.glb`` + ``tileset.json`` under ``tmp_path``."""
+    if cloud is None:
+        cloud = _make_cloud()
+    save_gltf(cloud, tmp_path / glb_name)
+    doc = {
+        "asset": {"version": "1.1", "generator": "test"},
+        "geometricError": 100.0,
+        "root": {
+            "boundingVolume": {
+                "box": [0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0]
+            },
+            "geometricError": 0,
+            "refine": "ADD",
+            "content": {"uri": glb_name},
+        },
+    }
+    if transform is not None:
+        doc["root"]["transform"] = transform
+    tp = tmp_path / "tileset.json"
+    tp.write_text(json.dumps(doc))
+    return tp
+
+
 def _names(usdz: Path) -> list[str]:
     with zipfile.ZipFile(usdz) as zf:
         return zf.namelist()
@@ -65,8 +117,9 @@ def _read(usdz: Path, name: str) -> bytes:
 
 
 def test_writes_default_usda_scene_tileset_and_chunks(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
-    res = save_scene_usdz(_make_cloud(), out, options=SceneUsdzOptions(chunk_size=8.0))
+    res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
 
     names = _names(out)
     assert names[0] == "default.usda", "default.usda must come first per USDZ spec"
@@ -79,11 +132,69 @@ def test_writes_default_usda_scene_tileset_and_chunks(tmp_path: Path) -> None:
 
 
 def test_zip_entries_are_uncompressed(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
-    save_scene_usdz(_make_cloud(), out)
+    save_scene_usdz(ts, out)
     with zipfile.ZipFile(out) as zf:
         for info in zf.infolist():
             assert info.compress_type == zipfile.ZIP_STORED, f"{info.filename} is compressed"
+
+
+# ---------------------------------------------------------------------------
+# Root transform propagation (the whole point of this redesign)
+# ---------------------------------------------------------------------------
+
+
+def test_root_transform_preserved_in_output_tileset(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path, transform=_NONIDENT_TRANSFORM)
+    out = tmp_path / "scene.usdz"
+    res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
+
+    out_tileset = json.loads(_read(out, "tileset.json"))
+    assert out_tileset["root"]["transform"] == _NONIDENT_TRANSFORM
+    assert res.root_transform == _NONIDENT_TRANSFORM
+
+
+def test_root_transform_recorded_in_scene_json(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path, transform=_NONIDENT_TRANSFORM)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
+    scene = json.loads(_read(out, "scene.json"))
+    assert scene["world"]["root_transform"] == _NONIDENT_TRANSFORM
+
+
+def test_missing_root_transform_defaults_to_identity(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path, transform=None)
+    out = tmp_path / "scene.usdz"
+    res = save_scene_usdz(ts, out)
+    identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    assert res.root_transform == identity
+    out_tileset = json.loads(_read(out, "tileset.json"))
+    assert out_tileset["root"]["transform"] == identity
+
+
+def test_positions_stay_in_root_local_frame(tmp_path: Path) -> None:
+    """The big ECEF translation in root.transform must NOT be applied to positions.
+
+    Positions inside the resulting chunks should match the source cloud's
+    range (~ -20 to 20 from the test fixture), not the ECEF magnitude of ~6e6.
+    """
+    spz_io = importlib.import_module("3dgs_io.spz_io")
+    cloud = _make_cloud(n=256)
+    ts = _make_tileset(tmp_path, cloud=cloud, transform=_NONIDENT_TRANSFORM)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=100.0))
+
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with zipfile.ZipFile(out) as zf:
+        zf.extractall(extracted)
+    for chunk_path in sorted((extracted / "chunks").glob("chunk_*.spz")):
+        gc = spz_io.load_spz(chunk_path)
+        pos = np.array(gc.positions, dtype=np.float32).reshape(-1, 3)
+        assert pos.size > 0
+        # Far below the ECEF-magnitude (~6.4M) the root.transform would imply.
+        assert np.abs(pos).max() < 1000.0, "positions accidentally transformed into ECEF"
 
 
 # ---------------------------------------------------------------------------
@@ -92,15 +203,17 @@ def test_zip_entries_are_uncompressed(tmp_path: Path) -> None:
 
 
 def test_scene_json_schema(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
-    save_scene_usdz(_make_cloud(), out, options=SceneUsdzOptions(chunk_size=8.0))
+    save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
     scene = json.loads(_read(out, "scene.json"))
     assert scene["schema"] == "splatsim.scene/v1"
+    assert scene["producer"]["source_tileset"] == "tileset.json"
     assert scene["world"]["up_axis"] == "z"
+    assert "root_transform" in scene["world"]
     assert scene["gaussians"]["tileset"] == "tileset.json"
     assert scene["gaussians"]["sh_degree"] == 3
     assert scene["gaussians"]["n_gaussians"] > 0
-    # Without extras, every key is None.
     assert scene["extras"] == {
         "map_lanelet2": None,
         "map_opendrive": None,
@@ -111,12 +224,13 @@ def test_scene_json_schema(tmp_path: Path) -> None:
 
 
 def test_tileset_uses_ext_3dgs_spz(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
-    save_scene_usdz(_make_cloud(), out, options=SceneUsdzOptions(chunk_size=8.0))
-    ts = json.loads(_read(out, "tileset.json"))
-    assert ts["asset"]["tilesetVersion"] == "splatsim-spz/1.0"
-    assert "EXT_3dgs_spz" in ts["extensionsRequired"]
-    children = ts["root"]["children"]
+    save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
+    out_ts = json.loads(_read(out, "tileset.json"))
+    assert out_ts["asset"]["tilesetVersion"] == "splatsim-spz/1.0"
+    assert "EXT_3dgs_spz" in out_ts["extensionsRequired"]
+    children = out_ts["root"]["children"]
     assert children
     for c in children:
         assert c["content"]["uri"].startswith("chunks/chunk_")
@@ -126,31 +240,100 @@ def test_tileset_uses_ext_3dgs_spz(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tileset input validation
+# ---------------------------------------------------------------------------
+
+
+def test_tileset_missing_root_raises(tmp_path: Path) -> None:
+    bad = tmp_path / "tileset.json"
+    bad.write_text(json.dumps({"asset": {"version": "1.1"}}))
+    with pytest.raises(ValueError, match="missing 'root'"):
+        save_scene_usdz(bad, tmp_path / "out.usdz")
+
+
+def test_tileset_no_content_raises(tmp_path: Path) -> None:
+    bad = tmp_path / "tileset.json"
+    bad.write_text(json.dumps({"asset": {"version": "1.1"}, "root": {"geometricError": 0}}))
+    with pytest.raises(ValueError, match="no tile content"):
+        save_scene_usdz(bad, tmp_path / "out.usdz")
+
+
+def test_tileset_remote_uri_raises(tmp_path: Path) -> None:
+    bad = tmp_path / "tileset.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "asset": {"version": "1.1"},
+                "root": {
+                    "geometricError": 0,
+                    "content": {"uri": "https://example.com/model.glb"},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="Remote tile content"):
+        save_scene_usdz(bad, tmp_path / "out.usdz")
+
+
+def test_tileset_non_gltf_content_raises(tmp_path: Path) -> None:
+    spz_path = tmp_path / "model.spz"
+    spz_path.write_bytes(b"not really")
+    bad = tmp_path / "tileset.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "asset": {"version": "1.1"},
+                "root": {"geometricError": 0, "content": {"uri": "model.spz"}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="glTF tile content"):
+        save_scene_usdz(bad, tmp_path / "out.usdz")
+
+
+def test_tileset_bad_transform_length_raises(tmp_path: Path) -> None:
+    bad = tmp_path / "tileset.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "asset": {"version": "1.1"},
+                "root": {
+                    "geometricError": 0,
+                    "transform": [1.0, 0.0, 0.0],  # only 3 elements
+                    "content": {"uri": "model.glb"},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="16 elements"):
+        save_scene_usdz(bad, tmp_path / "out.usdz")
+
+
+# ---------------------------------------------------------------------------
 # Extras: file and directory sources, known + arbitrary keys
 # ---------------------------------------------------------------------------
 
 
 def test_extras_file_is_embedded_verbatim(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     src = tmp_path / "tracks.parquet"
     src.write_bytes(b"PAR1\x00fake-parquet")
 
     out = tmp_path / "scene.usdz"
-    save_scene_usdz(_make_cloud(), out, extras={"tracks.parquet": src})
+    save_scene_usdz(ts, out, extras={"tracks.parquet": src})
 
-    names = _names(out)
-    assert "tracks.parquet" in names
+    assert "tracks.parquet" in _names(out)
     assert _read(out, "tracks.parquet") == b"PAR1\x00fake-parquet"
-
     scene = json.loads(_read(out, "scene.json"))
     assert scene["extras"]["tracks"] == "tracks.parquet"
 
 
 def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     src_dir = tmp_path / "carla_root"
     src_dir.mkdir()
     (src_dir / "manifest.json").write_text('{"schema": "splatsim.carla_world/v1"}')
     (src_dir / "extra.bin").write_bytes(b"\x00\x01")
-
     osm = tmp_path / "map.osm"
     osm.write_text("<osm/>")
     xodr = tmp_path / "map.xodr"
@@ -160,7 +343,7 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
 
     out = tmp_path / "scene.usdz"
     save_scene_usdz(
-        _make_cloud(),
+        ts,
         out,
         extras={
             "carla_world": src_dir,
@@ -187,29 +370,31 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
 
 
 def test_arbitrary_extras_path_is_embedded_but_not_in_scene_meta(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     f = tmp_path / "anything.bin"
     f.write_bytes(b"\xaa\xbb\xcc")
     out = tmp_path / "scene.usdz"
-    save_scene_usdz(_make_cloud(), out, extras={"misc/data.bin": f})
+    save_scene_usdz(ts, out, extras={"misc/data.bin": f})
     assert "misc/data.bin" in _names(out)
     scene = json.loads(_read(out, "scene.json"))
-    # No known-path mapping, so the scene extras stay null.
     assert scene["extras"]["carla_world"] is None
     assert scene["extras"]["map_lanelet2"] is None
 
 
 def test_extras_reserved_path_is_rejected(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     f = tmp_path / "x"
     f.write_bytes(b"x")
     with pytest.raises(ValueError, match="reserved"):
-        save_scene_usdz(_make_cloud(), tmp_path / "out.usdz", extras={"scene.json": f})
+        save_scene_usdz(ts, tmp_path / "out.usdz", extras={"scene.json": f})
     with pytest.raises(ValueError, match="reserved"):
-        save_scene_usdz(_make_cloud(), tmp_path / "out.usdz", extras={"chunks/foo.spz": f})
+        save_scene_usdz(ts, tmp_path / "out.usdz", extras={"chunks/foo.spz": f})
 
 
 def test_extras_missing_source_raises(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
     with pytest.raises(FileNotFoundError):
-        save_scene_usdz(_make_cloud(), tmp_path / "out.usdz", extras={"x.bin": tmp_path / "nope"})
+        save_scene_usdz(ts, tmp_path / "out.usdz", extras={"x.bin": tmp_path / "nope"})
 
 
 # ---------------------------------------------------------------------------
@@ -218,20 +403,23 @@ def test_extras_missing_source_raises(tmp_path: Path) -> None:
 
 
 def test_chunk_size_controls_number_of_tiles(tmp_path: Path) -> None:
-    small = save_scene_usdz(
-        _make_cloud(), tmp_path / "s.usdz", options=SceneUsdzOptions(chunk_size=5.0)
-    )
-    big = save_scene_usdz(
-        _make_cloud(), tmp_path / "b.usdz", options=SceneUsdzOptions(chunk_size=200.0)
-    )
+    src_a = tmp_path / "a"
+    src_b = tmp_path / "b"
+    src_a.mkdir()
+    src_b.mkdir()
+    ts_a = _make_tileset(src_a)
+    ts_b = _make_tileset(src_b)
+    small = save_scene_usdz(ts_a, tmp_path / "s.usdz", options=SceneUsdzOptions(chunk_size=5.0))
+    big = save_scene_usdz(ts_b, tmp_path / "big.usdz", options=SceneUsdzOptions(chunk_size=200.0))
     assert small.n_chunks > big.n_chunks
 
 
 def test_max_points_per_chunk_splits_dense_cells(tmp_path: Path) -> None:
     gc = _make_cloud(n=200)
     gc.positions = np.zeros_like(gc.positions)
+    ts = _make_tileset(tmp_path, cloud=gc)
     res = save_scene_usdz(
-        gc,
+        ts,
         tmp_path / "out.usdz",
         options=SceneUsdzOptions(chunk_size=1000.0, max_points_per_chunk=50),
     )
@@ -248,17 +436,9 @@ def test_bbox_radius_filters_outliers(tmp_path: Path) -> None:
     pos = np.array(gc.positions, dtype=np.float32).reshape(-1, 3)
     pos[0] = [1000.0, 1000.0, 1000.0]
     gc.positions = pos.reshape(-1)
-    res = save_scene_usdz(gc, tmp_path / "out.usdz", options=SceneUsdzOptions(bbox_radius=100.0))
+    ts = _make_tileset(tmp_path, cloud=gc)
+    res = save_scene_usdz(ts, tmp_path / "out.usdz", options=SceneUsdzOptions(bbox_radius=100.0))
     assert res.n_gaussians == 63
-
-
-def test_opacity_threshold_drops_points(tmp_path: Path) -> None:
-    gc = _make_cloud(n=256)
-    full = save_scene_usdz(gc, tmp_path / "full.usdz")
-    gated = save_scene_usdz(
-        gc, tmp_path / "gated.usdz", options=SceneUsdzOptions(opacity_threshold=0.7)
-    )
-    assert 0 < gated.n_gaussians < full.n_gaussians
 
 
 # ---------------------------------------------------------------------------
@@ -268,16 +448,17 @@ def test_opacity_threshold_drops_points(tmp_path: Path) -> None:
 
 def test_chunks_are_loadable_spz(tmp_path: Path) -> None:
     spz_io = importlib.import_module("3dgs_io.spz_io")
+    ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
-    res = save_scene_usdz(_make_cloud(), out, options=SceneUsdzOptions(chunk_size=8.0))
+    res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
 
-    extracted_dir = tmp_path / "extracted"
-    extracted_dir.mkdir()
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
     with zipfile.ZipFile(out) as zf:
-        zf.extractall(extracted_dir)
+        zf.extractall(extracted)
 
     total = 0
-    chunk_paths = sorted((extracted_dir / "chunks").glob("chunk_*.spz"))
+    chunk_paths = sorted((extracted / "chunks").glob("chunk_*.spz"))
     assert len(chunk_paths) == res.n_chunks
     for p in chunk_paths:
         gc = spz_io.load_spz(p)
@@ -292,55 +473,34 @@ def test_chunks_are_loadable_spz(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cli_with_usdz_input(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_with_tileset_input(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
-    # build a plain USDZ input first
-    src_usdz = tmp_path / "in.usdz"
-    save_usdz(_make_cloud(), src_usdz)
+    ts = _make_tileset(tmp_path, transform=_NONIDENT_TRANSFORM)
     out = tmp_path / "out.usdz"
-    rc = cli.main([str(src_usdz), str(out), "--chunk-size", "8.0"])
+    rc = cli.main([str(ts), str(out), "--chunk-size", "8.0"])
     assert rc == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["out_path"].endswith("out.usdz")
     assert summary["n_gaussians"] > 0
-    assert "scene.json" in _names(out)
+    assert summary["root_transform"] == _NONIDENT_TRANSFORM
 
 
 def test_cli_quiet_suppresses_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
-    src_usdz = tmp_path / "in.usdz"
-    save_usdz(_make_cloud(), src_usdz)
-    rc = cli.main([str(src_usdz), str(tmp_path / "out.usdz"), "--quiet"])
+    ts = _make_tileset(tmp_path)
+    rc = cli.main([str(ts), str(tmp_path / "out.usdz"), "--quiet"])
     assert rc == 0
     assert capsys.readouterr().out == ""
 
 
 def test_cli_extra_flag_embeds_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
-    src_usdz = tmp_path / "in.usdz"
-    save_usdz(_make_cloud(), src_usdz)
+    ts = _make_tileset(tmp_path)
     extra = tmp_path / "tracks.parquet"
     extra.write_bytes(b"PAR1\x00x")
-
     out = tmp_path / "out.usdz"
-    rc = cli.main(
-        [
-            str(src_usdz),
-            str(out),
-            "--extra",
-            f"tracks.parquet={extra}",
-            "--quiet",
-        ]
-    )
+    rc = cli.main([str(ts), str(out), "--extra", f"tracks.parquet={extra}", "--quiet"])
     assert rc == 0
     assert "tracks.parquet" in _names(out)
     scene = json.loads(_read(out, "scene.json"))
     assert scene["extras"]["tracks"] == "tracks.parquet"
-
-
-def test_cli_unsupported_extension_raises(tmp_path: Path) -> None:
-    cli = importlib.import_module("3dgs_io.scene_usdz_cli")
-    bad = tmp_path / "weird.unknown"
-    bad.write_bytes(b"")
-    with pytest.raises(ValueError, match="Unsupported input extension"):
-        cli.main([str(bad), str(tmp_path / "out.usdz")])

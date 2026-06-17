@@ -2,50 +2,30 @@
 
 Invoke with ``python -m 3dgs_io`` (or ``python -m 3dgs_io.scene_usdz_cli``)::
 
-    python -m 3dgs_io input.{usdz,glb,ply,spz}  output.usdz  \\
-        [--extra ARCHIVE_PATH=SOURCE_PATH ...]                \\
+    python -m 3dgs_io  path/to/tileset.json  output.usdz  \\
+        [--extra ARCHIVE_PATH=SOURCE_PATH ...]              \\
         [--chunk-size N]  [--min-scale F]  ...
 
-The input is loaded with the appropriate ``load_*`` helper based on its
-extension. Extras are user-supplied files or directories that get embedded
-verbatim into the output archive at the requested path.
+The input must be a Cesium 3D Tiles ``tileset.json``. Its ``root.transform``
+(the world anchor — typically an ECEF placement) is preserved verbatim into
+the output archive. Extras are user-supplied files or directories that get
+embedded verbatim into the output archive at the requested path.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import logging
 import math
 import sys
 from pathlib import Path
 
-import spz
-
 from .scene_usdz import (
     SceneUsdzOptions,
     _result_summary,
     save_scene_usdz,
 )
-
-
-def _load_cloud(path: Path) -> spz.GaussianCloud:
-    """Dispatch on file extension to the matching ``load_*`` helper."""
-    ext = path.suffix.lower()
-    mod = importlib.import_module("3dgs_io")
-    if ext == ".usdz":
-        return mod.load_usdz(path)
-    if ext == ".glb":
-        return mod.load_gltf(path)
-    if ext == ".ply":
-        return mod.load_ply(path)
-    if ext == ".spz":
-        return mod.load_spz(path)
-    raise ValueError(
-        f"Unsupported input extension {ext!r} for {path}; "
-        "expected one of .usdz / .glb / .ply / .spz"
-    )
 
 
 def _parse_extra(spec: str) -> tuple[str, Path]:
@@ -64,15 +44,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m 3dgs_io",
         description=(
-            "Pack a gaussian-splat asset + optional sidecar files into a "
-            "single self-contained USDZ scene bundle "
-            "(default.usda + scene.json + tileset.json + chunks/*.spz + <extras>)."
+            "Pack a Cesium 3D Tiles tileset.json (+ optional sidecar files) "
+            "into a single self-contained USDZ scene bundle. The source "
+            "tileset's root.transform (world anchor) is preserved into the "
+            "output."
         ),
     )
     p.add_argument(
-        "input",
+        "tileset",
         type=Path,
-        help="Input gaussian cloud: .usdz / .glb / .ply / .spz",
+        help="Input Cesium 3D Tiles tileset.json",
     )
     p.add_argument("out_usdz", type=Path, help="Output single-file USDZ path")
 
@@ -140,10 +121,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
 
-    cloud = _load_cloud(args.input)
     extras = dict(args.extras) if args.extras else None
     result = save_scene_usdz(
-        cloud,
+        args.tileset,
         args.out_usdz,
         extras=extras,
         options=_options_from_args(args),
