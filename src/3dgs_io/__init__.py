@@ -44,6 +44,14 @@ from .tiles_io import (
     load_tileset,
     merge_tileset,
 )
+from .tracks import (
+    Track,
+    TrackFrame,
+    load_tracks_from_usdz,
+    parse_alpasim_sequence_tracks,
+    parse_tracks,
+    serialize_tracks,
+)
 from .usdz_io import load_usdz, save_usdz
 from .viewer import launch_viewer
 
@@ -69,10 +77,16 @@ __all__ = [
     "Placement",
     "SceneUsdzOptions",
     "SceneUsdzResult",
+    "Track",
+    "TrackFrame",
     "TrainingData",
     "load_cameras_from_usdz",
+    "load_tracks_from_usdz",
+    "parse_alpasim_sequence_tracks",
     "parse_cameras",
+    "parse_tracks",
     "serialize_cameras",
+    "serialize_tracks",
     "save_scene_usdz",
     "load_gltf",
     "load_gltf_with_metadata",

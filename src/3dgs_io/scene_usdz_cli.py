@@ -27,6 +27,7 @@ from .scene_usdz import (
     _result_summary,
     save_scene_usdz,
 )
+from .tracks import parse_alpasim_sequence_tracks, parse_tracks
 
 
 def _parse_extra(spec: str) -> tuple[str, Path]:
@@ -81,6 +82,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to a splatsim.cameras/v1 JSON file. Its contents are "
             "validated and embedded as cameras.json in the output USDZ."
+        ),
+    )
+    p.add_argument(
+        "--tracks",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a splatsim.sequence_tracks/v1 JSON file (or an alpasim "
+            "sequence_tracks.json, auto-detected) describing dynamic-object "
+            "trajectories. Embedded as sequence_tracks.json in the output USDZ."
         ),
     )
 
@@ -138,11 +150,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.cameras is not None:
         cameras_doc = json.loads(Path(args.cameras).read_text(encoding="utf-8-sig"))
         cameras = parse_cameras(cameras_doc)
+    tracks = None
+    if args.tracks is not None:
+        tracks_doc = json.loads(Path(args.tracks).read_text(encoding="utf-8-sig"))
+        # Auto-detect: our schema has top-level "schema" key; alpasim's doesn't.
+        if tracks_doc.get("schema") == "splatsim.sequence_tracks/v1":
+            tracks = parse_tracks(tracks_doc)
+        else:
+            tracks = parse_alpasim_sequence_tracks(tracks_doc)
     result = save_scene_usdz(
         args.tileset,
         args.out_usdz,
         extras=extras,
         cameras=cameras,
+        tracks=tracks,
         options=_options_from_args(args),
     )
 

@@ -49,6 +49,7 @@ from .gltf_io import load_gltf
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
+from .tracks import Track, serialize_tracks
 
 __all__ = [
     "SceneUsdzOptions",
@@ -110,6 +111,7 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "tracks.parquet": "tracks",
     "trajectory.parquet": "trajectory",
     "cameras.json": "cameras",
+    "sequence_tracks.json": "sequence_tracks",
 }
 
 
@@ -580,9 +582,10 @@ def save_scene_usdz(
     *,
     extras: Mapping[str, str | Path] | None = None,
     cameras: list[Camera] | None = None,
+    tracks: list[Track] | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
-    """Pack a Cesium ``tileset.json`` (+ extras + cameras) into a single USDZ.
+    """Pack a Cesium ``tileset.json`` (+ extras + cameras + tracks) into a USDZ.
 
     The input tileset's ``root.transform`` (the world anchor — typically an
     ECEF placement for Cesium) is preserved verbatim into the output
@@ -613,6 +616,12 @@ def save_scene_usdz(
         root-local frame — the same coordinate system as the embedded SPZ
         tiles — so applying the output ``root.transform`` after the
         cam-to-world pose lifts the camera into world space.
+    tracks:
+        Optional list of dynamic-object :class:`Track` objects. When given
+        they are serialised into ``sequence_tracks.json`` inside the archive
+        (schema ``splatsim.sequence_tracks/v1``) and recorded under
+        ``scene.json.extras.sequence_tracks``. Track poses live in the same
+        root-local frame as the cameras and the SPZ payload.
     options:
         Filtering, scale clamping, chunk size, and render defaults.
     """
@@ -640,6 +649,16 @@ def save_scene_usdz(
         cameras_payload = json.dumps(serialize_cameras(cameras), indent=2).encode("utf-8")
         archive_paths.add("cameras.json")
 
+    tracks_payload: bytes | None = None
+    if tracks is not None:
+        if "sequence_tracks.json" in archive_paths:
+            raise ValueError(
+                "tracks=... was passed but 'sequence_tracks.json' is also present in "
+                "extras; pick one of the two"
+            )
+        tracks_payload = json.dumps(serialize_tracks(tracks), indent=2).encode("utf-8")
+        archive_paths.add("sequence_tracks.json")
+
     extras_meta = _detect_known_extras(archive_paths)
     scene_doc = _compose_scene_json(
         arrays=arrays,
@@ -665,6 +684,8 @@ def save_scene_usdz(
             _zip_write_str(zf, "tileset.json", json.dumps(tileset_doc, indent=2))
             if cameras_payload is not None:
                 _zip_write_bytes(zf, "cameras.json", cameras_payload)
+            if tracks_payload is not None:
+                _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
             for arc, src in chunk_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
             for arc, src in extras_entries:
