@@ -44,6 +44,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import spz
 
+from .cameras import Camera, serialize_cameras
 from .gltf_io import load_gltf
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
@@ -108,6 +109,7 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "carla_world/manifest.json": "carla_world",
     "tracks.parquet": "tracks",
     "trajectory.parquet": "trajectory",
+    "cameras.json": "cameras",
 }
 
 
@@ -577,9 +579,10 @@ def save_scene_usdz(
     out_path: str | Path,
     *,
     extras: Mapping[str, str | Path] | None = None,
+    cameras: list[Camera] | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
-    """Pack a Cesium ``tileset.json`` (+ extras) into a single self-contained USDZ.
+    """Pack a Cesium ``tileset.json`` (+ extras + cameras) into a single USDZ.
 
     The input tileset's ``root.transform`` (the world anchor — typically an
     ECEF placement for Cesium) is preserved verbatim into the output
@@ -600,6 +603,16 @@ def save_scene_usdz(
         are added verbatim; directories are recursively zipped under the key
         prefix. Reserved paths (``default.usda`` / ``scene.json`` /
         ``tileset.json`` / ``chunks/*``) are rejected with ``ValueError``.
+        Conflicts with explicit ``cameras`` (both targeting ``cameras.json``)
+        are also rejected.
+    cameras:
+        Optional list of :class:`Camera` objects. When given they are
+        serialised into ``cameras.json`` inside the archive (schema
+        ``splatsim.cameras/v1``) and recorded under
+        ``scene.json.extras.cameras``. Camera extrinsics live in the
+        root-local frame — the same coordinate system as the embedded SPZ
+        tiles — so applying the output ``root.transform`` after the
+        cam-to-world pose lifts the camera into world space.
     options:
         Filtering, scale clamping, chunk size, and render defaults.
     """
@@ -616,6 +629,17 @@ def save_scene_usdz(
 
     extras_entries = _collect_extras_entries(extras)
     archive_paths = {arc for arc, _ in extras_entries}
+
+    cameras_payload: bytes | None = None
+    if cameras is not None:
+        if "cameras.json" in archive_paths:
+            raise ValueError(
+                "cameras=... was passed but 'cameras.json' is also present in extras; "
+                "pick one of the two"
+            )
+        cameras_payload = json.dumps(serialize_cameras(cameras), indent=2).encode("utf-8")
+        archive_paths.add("cameras.json")
+
     extras_meta = _detect_known_extras(archive_paths)
     scene_doc = _compose_scene_json(
         arrays=arrays,
@@ -639,6 +663,8 @@ def save_scene_usdz(
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
             _zip_write_str(zf, "tileset.json", json.dumps(tileset_doc, indent=2))
+            if cameras_payload is not None:
+                _zip_write_bytes(zf, "cameras.json", cameras_payload)
             for arc, src in chunk_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
             for arc, src in extras_entries:
@@ -658,6 +684,12 @@ def _zip_write_str(zf: zipfile.ZipFile, name: str, content: str) -> None:
     zi = zipfile.ZipInfo(name)
     zi.compress_type = zipfile.ZIP_STORED
     zf.writestr(zi, content.encode("utf-8"))
+
+
+def _zip_write_bytes(zf: zipfile.ZipFile, name: str, content: bytes) -> None:
+    zi = zipfile.ZipInfo(name)
+    zi.compress_type = zipfile.ZIP_STORED
+    zf.writestr(zi, content)
 
 
 def _result_summary(result: SceneUsdzResult) -> dict[str, Any]:

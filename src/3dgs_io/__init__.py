@@ -1,5 +1,13 @@
 from spz import GaussianCloud
 
+from .cameras import (
+    Camera,
+    CameraExtrinsics,
+    CameraIntrinsics,
+    load_cameras_from_usdz,
+    parse_cameras,
+    serialize_cameras,
+)
 from .gltf_io import GltfSaveOptions, load_gltf, load_gltf_with_metadata, save_gltf
 from .lidar_2dgs import (
     LidarGaussianCloud,
@@ -44,6 +52,9 @@ __all__ = [
     "BoundingVolumeBox",
     "BoundingVolumeRegion",
     "BoundingVolumeSphere",
+    "Camera",
+    "CameraExtrinsics",
+    "CameraIntrinsics",
     "Checkpoint",
     "compute_bounding_volume",
     "DatasetType",
@@ -59,6 +70,9 @@ __all__ = [
     "SceneUsdzOptions",
     "SceneUsdzResult",
     "TrainingData",
+    "load_cameras_from_usdz",
+    "parse_cameras",
+    "serialize_cameras",
     "save_scene_usdz",
     "load_gltf",
     "load_gltf_with_metadata",
