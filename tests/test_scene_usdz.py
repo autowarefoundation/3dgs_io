@@ -163,6 +163,185 @@ def test_root_transform_recorded_in_scene_json(tmp_path: Path) -> None:
     assert scene["world"]["root_transform"] == _NONIDENT_TRANSFORM
 
 
+def _make_nested_tileset(
+    tmp_path: Path,
+    *,
+    child_transform: list[float],
+    cloud: spz.GaussianCloud,
+) -> Path:
+    """Build a tileset whose ROOT has no transform but whose only CHILD does.
+
+    The child's content is a glTF placed under the child tile; this exercises
+    the sub-root transform path that the simple (root-only-transform) cases
+    do not cover.
+    """
+    save_gltf(cloud, tmp_path / "model.glb")
+    doc = {
+        "asset": {"version": "1.1"},
+        "geometricError": 100.0,
+        "root": {
+            "boundingVolume": {
+                "box": [0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0]
+            },
+            "geometricError": 0,
+            "refine": "ADD",
+            "children": [
+                {
+                    "boundingVolume": {
+                        "box": [
+                            0.0,
+                            0.0,
+                            0.0,
+                            100.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            100.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            100.0,
+                        ]
+                    },
+                    "geometricError": 0,
+                    "refine": "ADD",
+                    "transform": child_transform,
+                    "content": {"uri": "model.glb"},
+                }
+            ],
+        },
+    }
+    tp = tmp_path / "tileset.json"
+    tp.write_text(json.dumps(doc))
+    return tp
+
+
+def test_sub_root_translation_applied_to_positions(tmp_path: Path) -> None:
+    """A child tile's translation must be baked into the leaf payload positions."""
+    spz_io = importlib.import_module("3dgs_io.spz_io")
+    n = 16
+    gc = spz.GaussianCloud()
+    gc.antialiased = False
+    gc.positions = np.zeros(n * 3, dtype=np.float32)  # all gaussians at origin
+    quats = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), n)
+    gc.rotations = quats
+    gc.scales = np.full(n * 3, -2.0, dtype=np.float32)
+    gc.alphas = np.zeros(n, dtype=np.float32)
+    gc.colors = np.zeros(n * 3, dtype=np.float32)
+    gc.sh_degree = 0
+    gc.sh = np.zeros(0, dtype=np.float32)
+
+    # Column-major identity rotation + translation (10, 20, 30).
+    child = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        10.0,
+        20.0,
+        30.0,
+        1.0,
+    ]
+    ts = _make_nested_tileset(tmp_path, child_transform=child, cloud=gc)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=1000.0, min_scale=0.0))
+
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with zipfile.ZipFile(out) as zf:
+        zf.extractall(extracted)
+    chunks = sorted((extracted / "chunks").glob("chunk_*.spz"))
+    assert chunks
+    pos = np.concatenate(
+        [np.array(spz_io.load_spz(c).positions, dtype=np.float32).reshape(-1, 3) for c in chunks]
+    )
+    np.testing.assert_allclose(pos.mean(axis=0), [10.0, 20.0, 30.0], atol=1e-4)
+
+
+def test_nested_rotation_composition_order(tmp_path: Path) -> None:
+    """Cumulative transform must be parent @ child (root first), not child @ parent.
+
+    The leaf payload is a single point at the origin. The child tile applies a
+    +Z rotation of 90° composed with a translation of (10, 0, 0). With the
+    transform stored as `M_child` (column-major), the correct world-bound leaf
+    position is ``M_child @ (0,0,0) = (10, 0, 0)``.  An accidental swap of
+    operand order would surface a different value once a grandchild is added,
+    but even at this single-level depth a mis-implementation that double-applies
+    the translation (or rotates the translation) would produce a different
+    point.
+    """
+    spz_io = importlib.import_module("3dgs_io.spz_io")
+    n = 8
+    gc = spz.GaussianCloud()
+    gc.antialiased = False
+    gc.positions = np.zeros(n * 3, dtype=np.float32)
+    gc.rotations = np.tile(np.array([0, 0, 0, 1], dtype=np.float32), n)
+    gc.scales = np.full(n * 3, -2.0, dtype=np.float32)
+    gc.alphas = np.zeros(n, dtype=np.float32)
+    gc.colors = np.zeros(n * 3, dtype=np.float32)
+    gc.sh_degree = 0
+    gc.sh = np.zeros(0, dtype=np.float32)
+
+    # column-major: rotation by 90° about Z, then translation (10, 0, 0).
+    child = [
+        0.0,
+        1.0,
+        0.0,
+        0.0,  # column 0: rotZ90 maps (1,0,0)→(0,1,0)
+        -1.0,
+        0.0,
+        0.0,
+        0.0,  # column 1: (0,1,0)→(-1,0,0)
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        10.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    ts = _make_nested_tileset(tmp_path, child_transform=child, cloud=gc)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=1000.0, min_scale=0.0))
+
+    extracted = tmp_path / "extracted"
+    extracted.mkdir()
+    with zipfile.ZipFile(out) as zf:
+        zf.extractall(extracted)
+    chunks = sorted((extracted / "chunks").glob("chunk_*.spz"))
+    pos = np.concatenate(
+        [np.array(spz_io.load_spz(c).positions, dtype=np.float32).reshape(-1, 3) for c in chunks]
+    )
+    # Point at the origin moves to (10, 0, 0) under child.transform.
+    np.testing.assert_allclose(pos.mean(axis=0), [10.0, 0.0, 0.0], atol=1e-4)
+
+
+def test_tileset_with_utf8_bom_is_accepted(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    raw = ts.read_bytes()
+    ts.write_bytes(b"\xef\xbb\xbf" + raw)  # prepend UTF-8 BOM
+    out = tmp_path / "scene.usdz"
+    res = save_scene_usdz(ts, out)
+    assert res.n_gaussians > 0
+
+
+def test_extras_trailing_slash_still_rejected(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    f = tmp_path / "x"
+    f.write_bytes(b"x")
+    with pytest.raises(ValueError, match="reserved"):
+        save_scene_usdz(ts, tmp_path / "out.usdz", extras={"scene.json/": f})
+
+
 def test_missing_root_transform_defaults_to_identity(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path, transform=None)
     out = tmp_path / "scene.usdz"

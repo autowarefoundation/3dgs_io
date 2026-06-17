@@ -164,8 +164,12 @@ def _walk_leaves(
     local = tile.get("transform")
     if local is not None:
         # 3D Tiles transforms are column-major; reshape and transpose to row-major.
+        # Cesium 3D Tiles: each tile's transform maps tile-local space to its
+        # PARENT's space. For a leaf at depth k the cumulative world-bound
+        # transform is M_root @ M_1 @ ... @ M_k, so walking top-down the new
+        # cumulative is `parent_cumulative @ local` (parent on the LEFT).
         local_mat = np.array(local, dtype=np.float64).reshape(4, 4).T
-        transform = local_mat @ parent_transform
+        transform = parent_transform @ local_mat
     else:
         transform = parent_transform
     children = tile.get("children", [])
@@ -224,7 +228,8 @@ def _concat_clouds(clouds: list[spz.GaussianCloud]) -> spz.GaussianCloud:
 def _load_from_tileset(tileset_path: Path) -> tuple[spz.GaussianCloud, list[float]]:
     """Parse ``tileset.json`` and return ``(cloud_in_root_local_frame, root_transform)``."""
     base = tileset_path.parent
-    doc = json.loads(tileset_path.read_text())
+    # ``utf-8-sig`` tolerates the optional BOM some editors prepend.
+    doc = json.loads(tileset_path.read_text(encoding="utf-8-sig"))
     root = doc.get("root")
     if root is None:
         raise ValueError(f"{tileset_path}: missing 'root' tile")
@@ -470,7 +475,10 @@ def _build_tileset(
 
 
 def _normalise_arc_path(p: str) -> str:
-    return p.lstrip("/").replace("\\", "/")
+    # Strip leading slashes (`/scene.json` → `scene.json`), unify separators,
+    # and trim trailing slashes so reserved-path collision checks aren't
+    # bypassed by spellings like ``scene.json/``.
+    return p.lstrip("/").rstrip("/").replace("\\", "/")
 
 
 def _collect_extras_entries(
