@@ -31,9 +31,17 @@ from .tiles_io import (
     load_tileset,
     merge_tileset,
 )
+from .usdz_io import (
+    AlpasimGaussianCloud,
+    AlpasimSkyCubemap,
+    load_usdz,
+    save_usdz,
+)
 from .viewer import launch_viewer
 
 __all__ = [
+    "AlpasimGaussianCloud",
+    "AlpasimSkyCubemap",
     "BoundingVolume",
     "BoundingVolumeBox",
     "BoundingVolumeRegion",
@@ -55,10 +63,12 @@ __all__ = [
     "load_gltf_with_metadata",
     "load_lidar_gltf",
     "load_lidar_gltf_with_metadata",
+    "load_usdz",
     "parse_metadata",
     "serialize_metadata",
     "save_gltf",
     "save_lidar_gltf",
+    "save_usdz",
     "load_spz",
     "save_spz",
     "load_ply",
