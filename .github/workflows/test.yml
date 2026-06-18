@@ -11,7 +11,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 because lanelet2's FindGeographicLib.cmake relies on the
+    # GeographicLib_LIBRARY_DIRS variable exported by Ubuntu's older
+    # libgeographic-dev package; 24.04 ships libgeographiclib-dev (GeographicLib
+    # 2.x) which uses a modern cmake config and breaks the find script.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -22,12 +26,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libboost-serialization-dev \
-            libboost-filesystem-dev \
-            libboost-program-options-dev \
+            libboost-all-dev \
             libeigen3-dev \
             libpugixml-dev \
-            libgeographiclib-dev
+            libgeographic-dev
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
