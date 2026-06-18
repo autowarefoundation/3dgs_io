@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 from .cameras import parse_cameras
+from .rig_trajectories import parse_alpasim_rig_trajectories, parse_rig_trajectories
 from .scene_usdz import (
     SceneUsdzOptions,
     _result_summary,
@@ -70,7 +71,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Embed SRC (file or directory) at archive path ARC. Repeatable. "
             "Known archive paths get recorded in scene.json's extras block: "
             "map.osm, map.xodr, carla_world/manifest.json, tracks.parquet, "
-            "trajectory.parquet, cameras.json, sequence_tracks.json."
+            "trajectory.parquet, cameras.json, sequence_tracks.json, "
+            "rig_trajectories.json."
         ),
     )
 
@@ -93,6 +95,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Path to a splatsim.sequence_tracks/v1 JSON file (or an alpasim "
             "sequence_tracks.json, auto-detected) describing dynamic-object "
             "trajectories. Embedded as sequence_tracks.json in the output USDZ."
+        ),
+    )
+    p.add_argument(
+        "--rig-trajectories",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a splatsim.rig_trajectories/v1 JSON file (or an alpasim "
+            "rig_trajectories.json, auto-detected) describing ego / sensor-rig "
+            "pose time-series. Embedded as rig_trajectories.json in the output USDZ."
         ),
     )
 
@@ -165,12 +178,26 @@ def main(argv: list[str] | None = None) -> int:
             tracks = parse_tracks(tracks_doc)
         else:
             tracks = parse_alpasim_sequence_tracks(tracks_doc)
+    rig_trajectories = None
+    if args.rig_trajectories is not None:
+        rig_path = Path(args.rig_trajectories).expanduser()
+        rig_doc = json.loads(rig_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(rig_doc, dict):
+            raise ValueError(
+                f"--rig-trajectories: {rig_path} top-level value must be a JSON "
+                f"object, got {type(rig_doc).__name__}"
+            )
+        if rig_doc.get("schema") == "splatsim.rig_trajectories/v1":
+            rig_trajectories = parse_rig_trajectories(rig_doc)
+        else:
+            rig_trajectories = parse_alpasim_rig_trajectories(rig_doc)
     result = save_scene_usdz(
         args.tileset,
         args.out_usdz,
         extras=extras,
         cameras=cameras,
         tracks=tracks,
+        rig_trajectories=rig_trajectories,
         options=_options_from_args(args),
     )
 

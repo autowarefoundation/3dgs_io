@@ -46,6 +46,7 @@ import spz
 
 from .cameras import Camera, serialize_cameras
 from .gltf_io import load_gltf
+from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
@@ -112,6 +113,7 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "trajectory.parquet": "trajectory",
     "cameras.json": "cameras",
     "sequence_tracks.json": "sequence_tracks",
+    "rig_trajectories.json": "rig_trajectories",
 }
 
 
@@ -583,9 +585,10 @@ def save_scene_usdz(
     extras: Mapping[str, str | Path] | None = None,
     cameras: list[Camera] | None = None,
     tracks: list[Track] | None = None,
+    rig_trajectories: list[RigTrajectory] | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
-    """Pack a Cesium ``tileset.json`` (+ extras + cameras + tracks) into a USDZ.
+    """Pack a Cesium ``tileset.json`` (+ extras + cameras + tracks + rigs) into a USDZ.
 
     The input tileset's ``root.transform`` (the world anchor — typically an
     ECEF placement for Cesium) is preserved verbatim into the output
@@ -622,6 +625,13 @@ def save_scene_usdz(
         (schema ``splatsim.sequence_tracks/v1``) and recorded under
         ``scene.json.extras.sequence_tracks``. Track poses live in the same
         root-local frame as the cameras and the SPZ payload.
+    rig_trajectories:
+        Optional list of sensor-rig :class:`RigTrajectory` objects (typically
+        an ego trajectory). When given they are serialised into
+        ``rig_trajectories.json`` inside the archive (schema
+        ``splatsim.rig_trajectories/v1``) and recorded under
+        ``scene.json.extras.rig_trajectories``. Rig poses live in the
+        root-local frame.
     options:
         Filtering, scale clamping, chunk size, and render defaults.
     """
@@ -659,6 +669,18 @@ def save_scene_usdz(
         tracks_payload = json.dumps(serialize_tracks(tracks), indent=2).encode("utf-8")
         archive_paths.add("sequence_tracks.json")
 
+    rig_trajectories_payload: bytes | None = None
+    if rig_trajectories is not None:
+        if "rig_trajectories.json" in archive_paths:
+            raise ValueError(
+                "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
+                "present in extras; pick one of the two"
+            )
+        rig_trajectories_payload = json.dumps(
+            serialize_rig_trajectories(rig_trajectories), indent=2
+        ).encode("utf-8")
+        archive_paths.add("rig_trajectories.json")
+
     extras_meta = _detect_known_extras(archive_paths)
     scene_doc = _compose_scene_json(
         arrays=arrays,
@@ -686,6 +708,8 @@ def save_scene_usdz(
                 _zip_write_bytes(zf, "cameras.json", cameras_payload)
             if tracks_payload is not None:
                 _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
+            if rig_trajectories_payload is not None:
+                _zip_write_bytes(zf, "rig_trajectories.json", rig_trajectories_payload)
             for arc, src in chunk_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
             for arc, src in extras_entries:
