@@ -40,10 +40,7 @@ standalone JSON file accepted by the CLI) is ``splatsim.cameras/v1``::
 
 from __future__ import annotations
 
-import json
-import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -55,7 +52,6 @@ __all__ = [
     "Camera",
     "CameraExtrinsics",
     "CameraIntrinsics",
-    "load_cameras_from_usdz",
     "parse_cameras",
     "serialize_cameras",
 ]
@@ -258,17 +254,3 @@ def parse_cameras(doc: dict[str, Any]) -> list[Camera]:
         seen.add(cam.name)
         out.append(cam)
     return out
-
-
-def load_cameras_from_usdz(path: str | Path) -> list[Camera]:
-    """Read ``cameras.json`` from a USDZ produced by :func:`save_scene_usdz`.
-
-    Raises :class:`FileNotFoundError` if the archive does not include a
-    ``cameras.json`` entry.
-    """
-    path = Path(path)
-    with zipfile.ZipFile(path) as zf:
-        if "cameras.json" not in zf.namelist():
-            raise FileNotFoundError(f"{path}: no cameras.json entry in archive")
-        doc = json.loads(zf.read("cameras.json").decode("utf-8-sig"))
-    return parse_cameras(doc)

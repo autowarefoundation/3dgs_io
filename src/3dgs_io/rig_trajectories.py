@@ -39,11 +39,8 @@ schema: the alpasim ingester composes the global frames and extracts a clean
 
 from __future__ import annotations
 
-import json
 import logging
-import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -54,7 +51,6 @@ __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
     "RigPose",
     "RigTrajectory",
-    "load_rig_trajectories_from_usdz",
     "parse_alpasim_rig_trajectories",
     "parse_rig_trajectories",
     "serialize_rig_trajectories",
@@ -161,16 +157,6 @@ def parse_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
         seen.add(rig.rig_id)
         out.append(rig)
     return out
-
-
-def load_rig_trajectories_from_usdz(path: str | Path) -> list[RigTrajectory]:
-    """Read ``rig_trajectories.json`` from a USDZ produced by :func:`save_scene_usdz`."""
-    path = Path(path)
-    with zipfile.ZipFile(path) as zf:
-        if "rig_trajectories.json" not in zf.namelist():
-            raise FileNotFoundError(f"{path}: no rig_trajectories.json entry in archive")
-        doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
-    return parse_rig_trajectories(doc)
 
 
 # ---------------------------------------------------------------------------

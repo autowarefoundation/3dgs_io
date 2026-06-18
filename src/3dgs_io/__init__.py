@@ -4,7 +4,6 @@ from .cameras import (
     Camera,
     CameraExtrinsics,
     CameraIntrinsics,
-    load_cameras_from_usdz,
     parse_cameras,
     serialize_cameras,
 )
@@ -29,7 +28,6 @@ from .metadata import (
 from .rig_trajectories import (
     RigPose,
     RigTrajectory,
-    load_rig_trajectories_from_usdz,
     parse_alpasim_rig_trajectories,
     parse_rig_trajectories,
     serialize_rig_trajectories,
@@ -55,12 +53,10 @@ from .tiles_io import (
 from .tracks import (
     Track,
     TrackFrame,
-    load_tracks_from_usdz,
     parse_alpasim_sequence_tracks,
     parse_tracks,
     serialize_tracks,
 )
-from .usdz_io import load_usdz, save_usdz
 from .viewer import launch_viewer
 
 __all__ = [
@@ -90,9 +86,6 @@ __all__ = [
     "Track",
     "TrackFrame",
     "TrainingData",
-    "load_cameras_from_usdz",
-    "load_rig_trajectories_from_usdz",
-    "load_tracks_from_usdz",
     "parse_alpasim_rig_trajectories",
     "parse_alpasim_sequence_tracks",
     "parse_cameras",
@@ -106,12 +99,10 @@ __all__ = [
     "load_gltf_with_metadata",
     "load_lidar_gltf",
     "load_lidar_gltf_with_metadata",
-    "load_usdz",
     "parse_metadata",
     "serialize_metadata",
     "save_gltf",
     "save_lidar_gltf",
-    "save_usdz",
     "load_spz",
     "save_spz",
     "load_ply",

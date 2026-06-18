@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -13,9 +14,15 @@ _mod = importlib.import_module("3dgs_io")
 Camera = _mod.Camera
 CameraExtrinsics = _mod.CameraExtrinsics
 CameraIntrinsics = _mod.CameraIntrinsics
-load_cameras_from_usdz = _mod.load_cameras_from_usdz
 parse_cameras = _mod.parse_cameras
 serialize_cameras = _mod.serialize_cameras
+
+
+def _read_cameras_from_usdz(path: Path) -> list[Camera]:
+    """Test helper: pull cameras.json out of a USDZ and parse it."""
+    with zipfile.ZipFile(path) as zf:
+        doc = json.loads(zf.read("cameras.json").decode("utf-8-sig"))
+    return parse_cameras(doc)
 
 
 def _intrinsics(width: int = 1920, height: int = 1080) -> CameraIntrinsics:
@@ -165,7 +172,7 @@ def test_intrinsics_defaults_pinhole_no_distortion() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration with save_scene_usdz / load_cameras_from_usdz
+# Integration with save_scene_usdz
 # ---------------------------------------------------------------------------
 
 
@@ -178,9 +185,6 @@ def test_save_scene_usdz_embeds_cameras_json(tmp_path: Path, make_minimal_tilese
     res = save_scene_usdz(ts, out, cameras=cams)
     assert res.extras["cameras"] == "cameras.json"
 
-    # Archive contents
-    import zipfile
-
     with zipfile.ZipFile(out) as zf:
         assert "cameras.json" in zf.namelist()
         scene = json.loads(zf.read("scene.json"))
@@ -190,7 +194,7 @@ def test_save_scene_usdz_embeds_cameras_json(tmp_path: Path, make_minimal_tilese
     assert {c["name"] for c in cameras_doc["cameras"]} == {"front_left", "front_right"}
 
 
-def test_load_cameras_from_usdz_round_trip(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
+def test_cameras_round_trip_via_usdz(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
     save_scene_usdz = _mod.save_scene_usdz
     ts = make_minimal_tileset_with_glb(tmp_path)
     original = [_camera("c0"), _camera("c1")]
@@ -198,23 +202,11 @@ def test_load_cameras_from_usdz_round_trip(tmp_path: Path, make_minimal_tileset_
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, cameras=original)
 
-    recovered = load_cameras_from_usdz(out)
+    recovered = _read_cameras_from_usdz(out)
     assert len(recovered) == 2
-    assert {c.name for c in recovered} == {"c0", "c1"}
     by_name = {c.name: c for c in recovered}
     assert by_name["c1"].extrinsics.translation == (42.0, 0.0, 1.8)
     assert by_name["c0"].intrinsics.distortion_model == "opencv"
-
-
-def test_load_cameras_from_usdz_missing_raises(
-    tmp_path: Path, make_minimal_tileset_with_glb
-) -> None:
-    save_scene_usdz = _mod.save_scene_usdz
-    ts = make_minimal_tileset_with_glb(tmp_path)
-    out = tmp_path / "scene.usdz"
-    save_scene_usdz(ts, out)  # no cameras=
-    with pytest.raises(FileNotFoundError, match="no cameras.json"):
-        load_cameras_from_usdz(out)
 
 
 def test_cameras_and_extras_collision_rejected(
@@ -238,12 +230,11 @@ def test_cli_cameras_flag(tmp_path: Path, make_minimal_tileset_with_glb) -> None
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
     ts = make_minimal_tileset_with_glb(tmp_path)
     cams = [_camera("front_left"), _camera("front_right")]
-    cams_doc = serialize_cameras(cams)
     cams_path = tmp_path / "cameras.json"
-    cams_path.write_text(json.dumps(cams_doc))
+    cams_path.write_text(json.dumps(serialize_cameras(cams)))
 
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--cameras", str(cams_path), "--quiet"])
     assert rc == 0
-    recovered = load_cameras_from_usdz(out)
+    recovered = _read_cameras_from_usdz(out)
     assert {c.name for c in recovered} == {"front_left", "front_right"}

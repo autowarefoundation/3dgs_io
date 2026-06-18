@@ -14,11 +14,17 @@ import pytest
 _mod = importlib.import_module("3dgs_io")
 Track = _mod.Track
 TrackFrame = _mod.TrackFrame
-load_tracks_from_usdz = _mod.load_tracks_from_usdz
 parse_alpasim_sequence_tracks = _mod.parse_alpasim_sequence_tracks
 parse_tracks = _mod.parse_tracks
 save_scene_usdz = _mod.save_scene_usdz
 serialize_tracks = _mod.serialize_tracks
+
+
+def _read_tracks_from_usdz(path: Path) -> list[Track]:
+    """Test helper: pull sequence_tracks.json out of a USDZ and parse it."""
+    with zipfile.ZipFile(path) as zf:
+        doc = json.loads(zf.read("sequence_tracks.json").decode("utf-8-sig"))
+    return parse_tracks(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +225,7 @@ def test_alpasim_ingestion_against_real_sample() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration with save_scene_usdz / load_tracks_from_usdz
+# Integration with save_scene_usdz
 # ---------------------------------------------------------------------------
 
 
@@ -241,26 +247,16 @@ def test_save_scene_usdz_embeds_sequence_tracks(
     assert {t["track_id"] for t in tracks_doc["tracks"]} == {"a", "b"}
 
 
-def test_load_tracks_from_usdz_round_trip(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
+def test_tracks_round_trip_via_usdz(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
     ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
     original = [_track("a"), _track("b", base_xy=(42.0, -3.0))]
     save_scene_usdz(ts, out, tracks=original)
 
-    recovered = load_tracks_from_usdz(out)
+    recovered = _read_tracks_from_usdz(out)
     by_id = {t.track_id: t for t in recovered}
     assert by_id["b"].frames[0].translation == (42.0, -3.0, 1.9)
     assert by_id["a"].size == (4.5, 1.8, 1.5)
-
-
-def test_load_tracks_from_usdz_missing_raises(
-    tmp_path: Path, make_minimal_tileset_with_glb
-) -> None:
-    ts = make_minimal_tileset_with_glb(tmp_path)
-    out = tmp_path / "scene.usdz"
-    save_scene_usdz(ts, out)
-    with pytest.raises(FileNotFoundError, match="no sequence_tracks.json"):
-        load_tracks_from_usdz(out)
 
 
 def test_tracks_and_extras_collision_rejected(
@@ -287,7 +283,7 @@ def test_cli_tracks_flag_native_schema(tmp_path: Path, make_minimal_tileset_with
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--tracks", str(tracks_path), "--quiet"])
     assert rc == 0
-    recovered = load_tracks_from_usdz(out)
+    recovered = _read_tracks_from_usdz(out)
     assert [t.track_id for t in recovered] == ["c0"]
 
 
@@ -302,5 +298,5 @@ def test_cli_tracks_flag_accepts_alpasim_format(
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--tracks", str(alpasim_path), "--quiet"])
     assert rc == 0
-    recovered = load_tracks_from_usdz(out)
+    recovered = _read_tracks_from_usdz(out)
     assert {t.track_id for t in recovered} == {"100", "104"}

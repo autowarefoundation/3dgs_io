@@ -46,11 +46,8 @@ schema.
 
 from __future__ import annotations
 
-import json
 import logging
-import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -64,7 +61,6 @@ __all__ = [
     "TRACKS_SCHEMA",
     "Track",
     "TrackFrame",
-    "load_tracks_from_usdz",
     "parse_alpasim_sequence_tracks",
     "parse_tracks",
     "serialize_tracks",
@@ -186,16 +182,6 @@ def parse_tracks(doc: dict[str, Any]) -> list[Track]:
         seen.add(track.track_id)
         out.append(track)
     return out
-
-
-def load_tracks_from_usdz(path: str | Path) -> list[Track]:
-    """Read ``sequence_tracks.json`` from a USDZ produced by :func:`save_scene_usdz`."""
-    path = Path(path)
-    with zipfile.ZipFile(path) as zf:
-        if "sequence_tracks.json" not in zf.namelist():
-            raise FileNotFoundError(f"{path}: no sequence_tracks.json entry in archive")
-        doc = json.loads(zf.read("sequence_tracks.json").decode("utf-8-sig"))
-    return parse_tracks(doc)
 
 
 # ---------------------------------------------------------------------------

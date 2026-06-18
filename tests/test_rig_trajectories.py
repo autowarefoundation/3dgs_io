@@ -14,11 +14,17 @@ import pytest
 _mod = importlib.import_module("3dgs_io")
 RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
-load_rig_trajectories_from_usdz = _mod.load_rig_trajectories_from_usdz
 parse_alpasim_rig_trajectories = _mod.parse_alpasim_rig_trajectories
 parse_rig_trajectories = _mod.parse_rig_trajectories
 save_scene_usdz = _mod.save_scene_usdz
 serialize_rig_trajectories = _mod.serialize_rig_trajectories
+
+
+def _read_rig_trajectories_from_usdz(path: Path) -> list[RigTrajectory]:
+    """Test helper: pull rig_trajectories.json out of a USDZ and parse it."""
+    with zipfile.ZipFile(path) as zf:
+        doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
+    return parse_rig_trajectories(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +260,7 @@ def test_alpasim_ingestion_against_real_sample() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration with save_scene_usdz / load_rig_trajectories_from_usdz
+# Integration with save_scene_usdz
 # ---------------------------------------------------------------------------
 
 
@@ -275,27 +281,16 @@ def test_save_scene_usdz_embeds_rig_trajectories(
     assert [r["rig_id"] for r in rig_doc["rigs"]] == ["ego"]
 
 
-def test_load_rig_trajectories_from_usdz_round_trip(
+def test_rig_trajectories_round_trip_via_usdz(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
-    original = [_trajectory("ego", n_frames=10)]
-    save_scene_usdz(ts, out, rig_trajectories=original)
-    recovered = load_rig_trajectories_from_usdz(out)
+    save_scene_usdz(ts, out, rig_trajectories=[_trajectory("ego", n_frames=10)])
+    recovered = _read_rig_trajectories_from_usdz(out)
     assert len(recovered) == 1
     assert len(recovered[0].poses) == 10
     assert recovered[0].poses[5].translation == (5.0, 0.0, 0.0)
-
-
-def test_load_rig_trajectories_from_usdz_missing_raises(
-    tmp_path: Path, make_minimal_tileset_with_glb
-) -> None:
-    ts = make_minimal_tileset_with_glb(tmp_path)
-    out = tmp_path / "scene.usdz"
-    save_scene_usdz(ts, out)
-    with pytest.raises(FileNotFoundError, match="no rig_trajectories.json"):
-        load_rig_trajectories_from_usdz(out)
 
 
 def test_rig_trajectories_and_extras_collision_rejected(
@@ -324,7 +319,7 @@ def test_cli_rig_trajectories_flag_native_schema(
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--rig-trajectories", str(rig_path), "--quiet"])
     assert rc == 0
-    recovered = load_rig_trajectories_from_usdz(out)
+    recovered = _read_rig_trajectories_from_usdz(out)
     assert [r.rig_id for r in recovered] == ["ego"]
 
 
@@ -350,7 +345,7 @@ def test_cli_rig_trajectories_flag_accepts_alpasim_format(
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--rig-trajectories", str(alp_path), "--quiet"])
     assert rc == 0
-    recovered = load_rig_trajectories_from_usdz(out)
+    recovered = _read_rig_trajectories_from_usdz(out)
     assert len(recovered) == 1
     assert recovered[0].rig_id == "ego"
     assert recovered[0].poses[1].translation == (1.0, 2.0, 3.0)
