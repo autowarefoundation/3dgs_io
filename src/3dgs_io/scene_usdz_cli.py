@@ -21,7 +21,6 @@ import math
 import sys
 from pathlib import Path
 
-from .cameras import parse_cameras
 from .rig_trajectories import parse_alpasim_rig_trajectories, parse_rig_trajectories
 from .scene_usdz import (
     SceneUsdzOptions,
@@ -71,21 +70,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "Embed SRC (file or directory) at archive path ARC. Repeatable. "
             "Known archive paths get recorded in scene.json's extras block: "
             "map.osm, map.xodr, carla_world/manifest.json, tracks.parquet, "
-            "trajectory.parquet, cameras.json, sequence_tracks.json, "
-            "rig_trajectories.json."
+            "trajectory.parquet, sequence_tracks.json, rig_trajectories.json."
         ),
     )
 
-    p.add_argument(
-        "--cameras",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help=(
-            "Path to a splatsim.cameras/v1 JSON file. Its contents are "
-            "validated and embedded as cameras.json in the output USDZ."
-        ),
-    )
     p.add_argument(
         "--tracks",
         type=Path,
@@ -159,11 +147,6 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     extras = dict(args.extras) if args.extras else None
-    cameras = None
-    if args.cameras is not None:
-        cameras_path = Path(args.cameras).expanduser()
-        cameras_doc = json.loads(cameras_path.read_text(encoding="utf-8-sig"))
-        cameras = parse_cameras(cameras_doc)
     tracks = None
     if args.tracks is not None:
         tracks_path = Path(args.tracks).expanduser()
@@ -195,7 +178,6 @@ def main(argv: list[str] | None = None) -> int:
         args.tileset,
         args.out_usdz,
         extras=extras,
-        cameras=cameras,
         tracks=tracks,
         rig_trajectories=rig_trajectories,
         options=_options_from_args(args),

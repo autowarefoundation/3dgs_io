@@ -399,7 +399,6 @@ def test_scene_json_schema(tmp_path: Path) -> None:
         "carla_world": None,
         "tracks": None,
         "trajectory": None,
-        "cameras": None,
         "sequence_tracks": None,
         "rig_trajectories": None,
     }
@@ -548,7 +547,6 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
         "carla_world": "carla_world/manifest.json",
         "tracks": None,
         "trajectory": "trajectory.parquet",
-        "cameras": None,
         "sequence_tracks": None,
         "rig_trajectories": None,
     }

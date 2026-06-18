@@ -1,41 +1,26 @@
-"""Camera intrinsic + extrinsic dataclasses and JSON (de)serialisation.
+"""Camera intrinsics + extrinsics dataclasses, nested inside a :class:`RigTrajectory`.
 
-A :class:`Camera` pairs:
+A :class:`Camera` is mounted on a sensor rig and lives under
+:attr:`RigTrajectory.cameras`. Its layout matches alpasim's
+``rig_trajectories.json.camera_calibrations`` schema closely:
 
-* :class:`CameraIntrinsics` — pinhole / OpenCV-style intrinsic parameters
-  (focal length, principal point, image size, optional distortion).
-* :class:`CameraExtrinsics` — the camera-to-scene rigid pose, expressed as a
-  translation plus an xyzw quaternion in the **root-local frame** (the same
-  coordinate system as the SPZ chunks embedded by :func:`save_scene_usdz`).
-  To lift a camera into world space apply the corresponding tileset's
-  ``root.transform`` after the cam-to-world pose.
+* :class:`CameraModel` — type-tagged intrinsics. Supported ``type`` values:
 
-The on-disk schema (used both inside the USDZ as ``cameras.json`` and as a
-standalone JSON file accepted by the CLI) is ``splatsim.cameras/v1``::
+  - ``"pinhole"`` — ``parameters = {resolution, fx, fy, cx, cy}``
+  - ``"opencv"``  — ``parameters = {resolution, fx, fy, cx, cy, distortion_coeffs}``
+  - ``"ftheta"``  — NVIDIA polynomial fisheye (alpasim default). ``parameters``
+    keys: ``resolution``, ``principal_point``,
+    ``pixeldist_to_angle_poly``, ``angle_to_pixeldist_poly``, ``shutter_type``,
+    ``reference_poly``, ``external_distortion_parameters``.
 
-    {
-      "schema": "splatsim.cameras/v1",
-      "frame": "root_local",
-      "cameras": [
-        {
-          "name": "front_left",
-          "intrinsics": {
-            "width": 1920, "height": 1080,
-            "fx": 1234.5, "fy": 1234.5,
-            "cx": 960.0,  "cy": 540.0,
-            "distortion_model": "opencv",
-            "distortion_coeffs": [0.01, -0.002, 0.0, 0.0, 0.0]
-          },
-          "extrinsics": {
-            "translation": [1.5, 0.0, 1.8],
-            "rotation":    [0.0, 0.0, 0.0, 1.0]
-          },
-          "timestamp_us": 1700000000000,
-          "metadata": {}
-        },
-        ...
-      ]
-    }
+* :class:`CameraExtrinsics` — **sensor-to-rig** 4×4 rigid transform
+  (``T_sensor_rig``). Stored in Python as translation + xyzw quaternion,
+  serialised as the alpasim-style flat 4×4 list of lists.
+
+To compute a camera's pose in scene coordinates, compose the camera
+extrinsics with the rig's pose at the relevant timestamp::
+
+    T_sensor_scene = T_rig_scene @ T_sensor_rig
 """
 
 from __future__ import annotations
@@ -48,100 +33,147 @@ import numpy as np
 from ._quat import quat_from_rotation_matrix
 
 __all__ = [
-    "CAMERAS_SCHEMA",
     "Camera",
     "CameraExtrinsics",
-    "CameraIntrinsics",
-    "parse_cameras",
-    "serialize_cameras",
+    "CameraModel",
 ]
 
 
-CAMERAS_SCHEMA = "splatsim.cameras/v1"
-
-# Frame label written into the JSON. Cameras are in the same frame as the
-# embedded SPZ chunks (root-local); apply tileset.json root.transform to
-# place the camera into world space.
-_FRAME = "root_local"
+# ---------------------------------------------------------------------------
+# Intrinsics
+# ---------------------------------------------------------------------------
 
 
 @dataclass
-class CameraIntrinsics:
-    """Pinhole / OpenCV-style intrinsics.
+class CameraModel:
+    """Type-tagged camera intrinsics."""
 
-    ``fx`` / ``fy`` are focal lengths in pixels, ``cx`` / ``cy`` the principal
-    point. ``distortion_model`` documents how ``distortion_coeffs`` should be
-    interpreted; for ``"pinhole"`` the coefficient list is ignored.
-    """
+    type: str
+    parameters: dict[str, Any] = field(default_factory=dict)
 
-    width: int
-    height: int
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    distortion_model: str = "pinhole"  # "pinhole" | "opencv" | "opencv_fisheye"
-    distortion_coeffs: list[float] = field(default_factory=list)
+    # ------------ resolution accessors ------------
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "width": int(self.width),
-            "height": int(self.height),
-            "fx": float(self.fx),
-            "fy": float(self.fy),
-            "cx": float(self.cx),
-            "cy": float(self.cy),
-            "distortion_model": str(self.distortion_model),
-            "distortion_coeffs": [float(c) for c in self.distortion_coeffs],
-        }
+    @property
+    def resolution(self) -> tuple[int, int]:
+        res = self.parameters.get("resolution")
+        if res is None or len(res) != 2:
+            raise ValueError(f"camera_model.parameters.resolution missing or malformed: {res!r}")
+        return int(res[0]), int(res[1])
+
+    @property
+    def width(self) -> int:
+        return self.resolution[0]
+
+    @property
+    def height(self) -> int:
+        return self.resolution[1]
+
+    # ------------ constructors ------------
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> CameraIntrinsics:
+    def pinhole(
+        cls,
+        *,
+        width: int,
+        height: int,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+    ) -> CameraModel:
         return cls(
-            width=int(d["width"]),
-            height=int(d["height"]),
-            fx=float(d["fx"]),
-            fy=float(d["fy"]),
-            cx=float(d["cx"]),
-            cy=float(d["cy"]),
-            distortion_model=str(d.get("distortion_model", "pinhole")),
-            distortion_coeffs=[float(c) for c in d.get("distortion_coeffs", [])],
+            type="pinhole",
+            parameters={
+                "resolution": [int(width), int(height)],
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+            },
         )
+
+    @classmethod
+    def opencv(
+        cls,
+        *,
+        width: int,
+        height: int,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        distortion_coeffs: list[float],
+    ) -> CameraModel:
+        return cls(
+            type="opencv",
+            parameters={
+                "resolution": [int(width), int(height)],
+                "fx": float(fx),
+                "fy": float(fy),
+                "cx": float(cx),
+                "cy": float(cy),
+                "distortion_coeffs": [float(c) for c in distortion_coeffs],
+            },
+        )
+
+    @classmethod
+    def ftheta(
+        cls,
+        *,
+        width: int,
+        height: int,
+        principal_point: tuple[float, float],
+        pixeldist_to_angle_poly: list[float],
+        angle_to_pixeldist_poly: list[float],
+        shutter_type: str = "ROLLING_TOP_TO_BOTTOM",
+        reference_poly: str = "PIXELDIST_TO_ANGLE",
+        external_distortion_parameters: Any = None,
+    ) -> CameraModel:
+        return cls(
+            type="ftheta",
+            parameters={
+                "resolution": [int(width), int(height)],
+                "principal_point": [float(principal_point[0]), float(principal_point[1])],
+                "pixeldist_to_angle_poly": [float(c) for c in pixeldist_to_angle_poly],
+                "angle_to_pixeldist_poly": [float(c) for c in angle_to_pixeldist_poly],
+                "shutter_type": str(shutter_type),
+                "reference_poly": str(reference_poly),
+                "external_distortion_parameters": external_distortion_parameters,
+            },
+        )
+
+    # ------------ (de)serialisation ------------
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"type": str(self.type), "parameters": dict(self.parameters)}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> CameraModel:
+        return cls(type=str(d["type"]), parameters=dict(d.get("parameters") or {}))
+
+
+# ---------------------------------------------------------------------------
+# Extrinsics (sensor-to-rig)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class CameraExtrinsics:
-    """Camera-to-scene rigid pose in root-local frame.
+    """Sensor-to-rig rigid pose.
 
-    Stored as a translation triple plus an xyzw quaternion. Use
-    :meth:`from_matrix` / :meth:`to_matrix` to convert to and from a 4×4
-    row-major homogeneous transform.
+    Stored as a translation triple + xyzw unit quaternion (rig-relative).
+    Serialises as ``{"T_sensor_rig": <4x4 row-major nested list>}`` to match
+    alpasim's ``rig_trajectories.json.camera_calibrations[*].T_sensor_rig``
+    layout.
     """
 
     translation: tuple[float, float, float]
     rotation: tuple[float, float, float, float]  # xyzw, unit-norm
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "translation": [float(v) for v in self.translation],
-            "rotation": [float(v) for v in self.rotation],
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> CameraExtrinsics:
-        tr = d["translation"]
-        ro = d["rotation"]
-        if len(tr) != 3:
-            raise ValueError(f"extrinsics.translation must have 3 elements, got {len(tr)}")
-        if len(ro) != 4:
-            raise ValueError(f"extrinsics.rotation must have 4 elements (xyzw), got {len(ro)}")
-        return cls(
-            translation=(float(tr[0]), float(tr[1]), float(tr[2])),
-            rotation=(float(ro[0]), float(ro[1]), float(ro[2]), float(ro[3])),
-        )
+    # ------------ matrix conversions ------------
 
     def to_matrix(self) -> np.ndarray:
-        """Return a 4×4 row-major cam-to-scene transform."""
+        """Return the 4×4 row-major sensor-to-rig transform."""
         x, y, z, w = self.rotation
         n = float(x * x + y * y + z * z + w * w)
         if n < 1e-12:
@@ -165,92 +197,51 @@ class CameraExtrinsics:
 
     @classmethod
     def from_matrix(cls, m: np.ndarray) -> CameraExtrinsics:
-        """Build an extrinsics from a 4×4 row-major cam-to-scene transform.
-
-        The rotation component must be approximately orthonormal; the
-        translation is taken from the last column.
-        """
+        """Build an extrinsics from a 4×4 row-major sensor-to-rig transform."""
         a = np.asarray(m, dtype=np.float64).reshape(4, 4)
         t = a[:3, 3]
         x, y, z, w = quat_from_rotation_matrix(a[:3, :3])
-        return cls(
-            translation=(float(t[0]), float(t[1]), float(t[2])),
-            rotation=(x, y, z, w),
-        )
+        return cls(translation=(float(t[0]), float(t[1]), float(t[2])), rotation=(x, y, z, w))
+
+    # ------------ (de)serialisation ------------
+
+    def to_t_sensor_rig(self) -> list[list[float]]:
+        """Return the 4×4 as a nested list of Python floats (JSON-safe)."""
+        m = self.to_matrix()
+        return [[float(m[i, j]) for j in range(4)] for i in range(4)]
+
+    @classmethod
+    def from_t_sensor_rig(cls, mat: Any) -> CameraExtrinsics:
+        return cls.from_matrix(np.asarray(mat, dtype=np.float64))
+
+
+# ---------------------------------------------------------------------------
+# Camera (mounted on a rig)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class Camera:
-    """A single camera observation: intrinsics + extrinsics + optional metadata."""
+    """A camera mounted on a sensor rig (peer to :class:`RigPose` under a rig)."""
 
     name: str
-    intrinsics: CameraIntrinsics
+    camera_model: CameraModel
     extrinsics: CameraExtrinsics
-    timestamp_us: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        return {
             "name": str(self.name),
-            "intrinsics": self.intrinsics.to_dict(),
-            "extrinsics": self.extrinsics.to_dict(),
+            "T_sensor_rig": self.extrinsics.to_t_sensor_rig(),
+            "camera_model": self.camera_model.to_dict(),
             "metadata": dict(self.metadata),
         }
-        if self.timestamp_us is not None:
-            d["timestamp_us"] = int(self.timestamp_us)
-        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Camera:
         return cls(
             name=str(d["name"]),
-            intrinsics=CameraIntrinsics.from_dict(d["intrinsics"]),
-            extrinsics=CameraExtrinsics.from_dict(d["extrinsics"]),
-            timestamp_us=int(d["timestamp_us"]) if d.get("timestamp_us") is not None else None,
+            camera_model=CameraModel.from_dict(d["camera_model"]),
+            extrinsics=CameraExtrinsics.from_t_sensor_rig(d["T_sensor_rig"]),
             metadata=dict(d.get("metadata") or {}),
         )
-
-
-# ---------------------------------------------------------------------------
-# Collection-level (de)serialisation
-# ---------------------------------------------------------------------------
-
-
-def serialize_cameras(cameras: list[Camera]) -> dict[str, Any]:
-    """Build the JSON-ready ``splatsim.cameras/v1`` document for ``cameras``."""
-    seen: set[str] = set()
-    out_list: list[dict[str, Any]] = []
-    for cam in cameras:
-        if cam.name in seen:
-            raise ValueError(f"duplicate camera name: {cam.name!r}")
-        seen.add(cam.name)
-        out_list.append(cam.to_dict())
-    return {
-        "schema": CAMERAS_SCHEMA,
-        "frame": _FRAME,
-        "cameras": out_list,
-    }
-
-
-def parse_cameras(doc: dict[str, Any]) -> list[Camera]:
-    """Inverse of :func:`serialize_cameras`. Accepts a parsed JSON object.
-
-    Rejects duplicate camera names so the load path enforces the same
-    invariant as :func:`serialize_cameras` (downstream tooling keys by
-    name and silently dropping a duplicate would be a surprise).
-    """
-    schema = doc.get("schema")
-    if schema != CAMERAS_SCHEMA:
-        raise ValueError(f"unexpected cameras schema {schema!r}; expected {CAMERAS_SCHEMA!r}")
-    raw = doc.get("cameras")
-    if not isinstance(raw, list):
-        raise ValueError("cameras document is missing the 'cameras' list")
-    out: list[Camera] = []
-    seen: set[str] = set()
-    for entry in raw:
-        cam = Camera.from_dict(entry)
-        if cam.name in seen:
-            raise ValueError(f"duplicate camera name: {cam.name!r}")
-        seen.add(cam.name)
-        out.append(cam)
-    return out

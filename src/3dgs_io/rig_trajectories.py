@@ -46,6 +46,7 @@ from typing import Any
 import numpy as np
 
 from ._quat import quat_from_rotation_matrix
+from .cameras import Camera, CameraExtrinsics, CameraModel
 
 __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
@@ -95,16 +96,24 @@ class RigPose:
 
 @dataclass
 class RigTrajectory:
-    """A sensor rig (ego or other) and its sequence of pose samples."""
+    """A sensor rig (ego or other) with its pose time-series and its cameras.
+
+    ``cameras`` lists the cameras physically mounted on this rig. Each
+    camera's :attr:`Camera.extrinsics` is **rig-relative** (``T_sensor_rig``);
+    compose with the rig's pose at a given timestamp to get the camera pose
+    in scene coordinates.
+    """
 
     rig_id: str
     poses: list[RigPose] = field(default_factory=list)
+    cameras: list[Camera] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "rig_id": str(self.rig_id),
             "poses": [p.to_dict() for p in self.poses],
+            "cameras": [c.to_dict() for c in self.cameras],
             "metadata": dict(self.metadata),
         }
 
@@ -113,6 +122,7 @@ class RigTrajectory:
         return cls(
             rig_id=str(d["rig_id"]),
             poses=[RigPose.from_dict(p) for p in d.get("poses") or []],
+            cameras=[Camera.from_dict(c) for c in d.get("cameras") or []],
             metadata=dict(d.get("metadata") or {}),
         )
 
@@ -244,9 +254,14 @@ def parse_alpasim_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
     ``metadata["T_world_base"]`` for callers that want to recover the ECEF
     anchor explicitly.
 
-    Camera / LiDAR calibrations and per-sensor frame timestamps are out of
-    scope of this ingester — use the :mod:`3dgs_io.cameras` module for
-    camera intrinsics + extrinsics.
+    Cameras are pulled out of the top-level ``camera_calibrations`` dict and
+    attached to each rig under :attr:`RigTrajectory.cameras`. Membership is
+    decided per rig from the keys of ``cameras_frame_timestamps_us`` (or
+    ``cameras_frame_T_rig_worlds`` as a fallback): a camera name appearing in
+    a rig's per-frame data belongs to that rig. If neither field is present
+    and only one rig exists, every top-level camera is attached to it.
+
+    LiDAR calibrations and per-sensor frame timestamps are out of scope.
     """
     if not isinstance(doc, dict):
         raise ValueError("alpasim rig_trajectories document must be a dict at the top level")
@@ -275,6 +290,10 @@ def parse_alpasim_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
     rigs_in = doc.get("rig_trajectories") or []
     if not isinstance(rigs_in, list):
         raise ValueError("alpasim rig_trajectories: 'rig_trajectories' must be a list")
+
+    cam_calibs_raw = doc.get("camera_calibrations") or {}
+    if not isinstance(cam_calibs_raw, dict):
+        raise ValueError("alpasim rig_trajectories: 'camera_calibrations' must be a dict")
 
     out: list[RigTrajectory] = []
     auto_ids: set[str] = set()
@@ -321,6 +340,84 @@ def parse_alpasim_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
             # Preserve the ECEF anchor for callers that need to recover
             # absolute world coordinates from the NRE-local rig pose.
             metadata["T_world_base"] = T_world_base_raw
-        out.append(RigTrajectory(rig_id=rig_id, poses=poses, metadata=metadata))
+
+        cameras_for_rig = _attach_alpasim_cameras_to_rig(
+            rig=rig,
+            cam_calibs_raw=cam_calibs_raw,
+            is_single_rig=(len(rigs_in) == 1),
+            rig_log_id=rig_id,
+        )
+        out.append(
+            RigTrajectory(
+                rig_id=rig_id,
+                poses=poses,
+                cameras=cameras_for_rig,
+                metadata=metadata,
+            )
+        )
 
     return out
+
+
+def _attach_alpasim_cameras_to_rig(
+    *,
+    rig: dict[str, Any],
+    cam_calibs_raw: dict[str, Any],
+    is_single_rig: bool,
+    rig_log_id: str,
+) -> list[Camera]:
+    """Pick the cameras belonging to ``rig`` out of alpasim's flat top-level dict.
+
+    Membership comes from the rig's ``cameras_frame_timestamps_us`` /
+    ``cameras_frame_T_rig_worlds`` keys. If neither field is present and the
+    document only has one rig, every top-level camera is assigned to it.
+    """
+    member_names: set[str] = set()
+    for key in ("cameras_frame_timestamps_us", "cameras_frame_T_rig_worlds"):
+        v = rig.get(key)
+        if isinstance(v, dict):
+            member_names.update(v.keys())
+    if not member_names and is_single_rig:
+        member_names = set(cam_calibs_raw.keys())
+
+    cameras: list[Camera] = []
+    for cam_name in sorted(member_names):
+        entry = cam_calibs_raw.get(cam_name)
+        if not isinstance(entry, dict):
+            _log.warning(
+                "alpasim rig %r: camera %r referenced by per-frame data but "
+                "missing from camera_calibrations; skipping",
+                rig_log_id,
+                cam_name,
+            )
+            continue
+        try:
+            extrinsics = CameraExtrinsics.from_t_sensor_rig(entry["T_sensor_rig"])
+        except (KeyError, ValueError) as e:
+            _log.warning(
+                "alpasim camera %r: cannot parse T_sensor_rig (%s); skipping",
+                cam_name,
+                e,
+            )
+            continue
+        cam_model_raw = entry.get("camera_model") or {}
+        if not isinstance(cam_model_raw, dict) or "type" not in cam_model_raw:
+            _log.warning(
+                "alpasim camera %r: missing or malformed camera_model; skipping",
+                cam_name,
+            )
+            continue
+        cam_model = CameraModel.from_dict(cam_model_raw)
+        meta: dict[str, Any] = {}
+        for k in ("sequence_id", "logical_sensor_name", "unique_sensor_idx"):
+            if k in entry:
+                meta[k] = entry[k]
+        cameras.append(
+            Camera(
+                name=str(cam_name),
+                camera_model=cam_model,
+                extrinsics=extrinsics,
+                metadata=meta,
+            )
+        )
+    return cameras

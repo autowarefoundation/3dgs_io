@@ -44,7 +44,6 @@ from typing import Any, NamedTuple
 import numpy as np
 import spz
 
-from .cameras import Camera, serialize_cameras
 from .gltf_io import load_gltf
 from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
 from .spz_io import save_spz
@@ -111,7 +110,6 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "carla_world/manifest.json": "carla_world",
     "tracks.parquet": "tracks",
     "trajectory.parquet": "trajectory",
-    "cameras.json": "cameras",
     "sequence_tracks.json": "sequence_tracks",
     "rig_trajectories.json": "rig_trajectories",
 }
@@ -583,12 +581,11 @@ def save_scene_usdz(
     out_path: str | Path,
     *,
     extras: Mapping[str, str | Path] | None = None,
-    cameras: list[Camera] | None = None,
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
-    """Pack a Cesium ``tileset.json`` (+ extras + cameras + tracks + rigs) into a USDZ.
+    """Pack a Cesium ``tileset.json`` (+ extras + tracks + rigs) into a USDZ.
 
     The input tileset's ``root.transform`` (the world anchor — typically an
     ECEF placement for Cesium) is preserved verbatim into the output
@@ -611,14 +608,6 @@ def save_scene_usdz(
         ``tileset.json`` / ``chunks/*``) are rejected with ``ValueError``.
         Conflicts with explicit ``cameras`` (both targeting ``cameras.json``)
         are also rejected.
-    cameras:
-        Optional list of :class:`Camera` objects. When given they are
-        serialised into ``cameras.json`` inside the archive (schema
-        ``splatsim.cameras/v1``) and recorded under
-        ``scene.json.extras.cameras``. Camera extrinsics live in the
-        root-local frame — the same coordinate system as the embedded SPZ
-        tiles — so applying the output ``root.transform`` after the
-        cam-to-world pose lifts the camera into world space.
     tracks:
         Optional list of dynamic-object :class:`Track` objects. When given
         they are serialised into ``sequence_tracks.json`` inside the archive
@@ -631,7 +620,9 @@ def save_scene_usdz(
         ``rig_trajectories.json`` inside the archive (schema
         ``splatsim.rig_trajectories/v1``) and recorded under
         ``scene.json.extras.rig_trajectories``. Rig poses live in the
-        root-local frame.
+        root-local frame; cameras nested under each rig
+        (:attr:`RigTrajectory.cameras`) carry rig-relative extrinsics
+        (``T_sensor_rig``).
     options:
         Filtering, scale clamping, chunk size, and render defaults.
     """
@@ -648,16 +639,6 @@ def save_scene_usdz(
 
     extras_entries = _collect_extras_entries(extras)
     archive_paths = {arc for arc, _ in extras_entries}
-
-    cameras_payload: bytes | None = None
-    if cameras is not None:
-        if "cameras.json" in archive_paths:
-            raise ValueError(
-                "cameras=... was passed but 'cameras.json' is also present in extras; "
-                "pick one of the two"
-            )
-        cameras_payload = json.dumps(serialize_cameras(cameras), indent=2).encode("utf-8")
-        archive_paths.add("cameras.json")
 
     tracks_payload: bytes | None = None
     if tracks is not None:
@@ -704,8 +685,6 @@ def save_scene_usdz(
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
             _zip_write_str(zf, "tileset.json", json.dumps(tileset_doc, indent=2))
-            if cameras_payload is not None:
-                _zip_write_bytes(zf, "cameras.json", cameras_payload)
             if tracks_payload is not None:
                 _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
             if rig_trajectories_payload is not None:

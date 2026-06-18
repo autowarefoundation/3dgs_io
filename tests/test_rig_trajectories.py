@@ -257,6 +257,15 @@ def test_alpasim_ingestion_against_real_sample() -> None:
         "ego trajectory translations exceed reasonable NRE-local bounds — "
         "world_to_nre application may have failed"
     )
+    # Cameras should be attached to the rig (sample has 6 ftheta cameras).
+    assert len(ego.cameras) == 6
+    cam = ego.cameras[0]
+    assert cam.camera_model.type == "ftheta"
+    res = cam.camera_model.parameters["resolution"]
+    assert res == [1920, 1080]
+    # rig-relative T_sensor_rig should have a sensible offset (sensor on the rig).
+    t_sensor_rig = np.asarray(cam.extrinsics.to_t_sensor_rig())
+    assert np.abs(t_sensor_rig[:3, 3]).max() < 10.0  # camera within a few metres of rig origin
 
 
 # ---------------------------------------------------------------------------

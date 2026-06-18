@@ -3,9 +3,7 @@ from spz import GaussianCloud
 from .cameras import (
     Camera,
     CameraExtrinsics,
-    CameraIntrinsics,
-    parse_cameras,
-    serialize_cameras,
+    CameraModel,
 )
 from .gltf_io import GltfSaveOptions, load_gltf, load_gltf_with_metadata, save_gltf
 from .lidar_2dgs import (
@@ -66,7 +64,7 @@ __all__ = [
     "BoundingVolumeSphere",
     "Camera",
     "CameraExtrinsics",
-    "CameraIntrinsics",
+    "CameraModel",
     "Checkpoint",
     "compute_bounding_volume",
     "DatasetType",
@@ -88,10 +86,8 @@ __all__ = [
     "TrainingData",
     "parse_alpasim_rig_trajectories",
     "parse_alpasim_sequence_tracks",
-    "parse_cameras",
     "parse_rig_trajectories",
     "parse_tracks",
-    "serialize_cameras",
     "serialize_rig_trajectories",
     "serialize_tracks",
     "save_scene_usdz",
