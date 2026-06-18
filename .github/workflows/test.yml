@@ -29,7 +29,9 @@ jobs:
             libboost-all-dev \
             libeigen3-dev \
             libpugixml-dev \
-            libgeographic-dev
+            libgeographic-dev \
+            librange-v3-dev \
+            python3-dev
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
