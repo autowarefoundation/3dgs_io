@@ -11,3 +11,6 @@ wheels/
 
 # Sphinx build output
 docs/_build/
+
+# Hydra run logs (created in CWD when test_converters runs the lanelet2→clipgt tool)
+outputs/

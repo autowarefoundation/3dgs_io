@@ -147,6 +147,10 @@ def test_lanelet2_to_clipgt_end_to_end(tmp_path: Path) -> None:
     auto-derived hydra overrides actually work end-to-end.
     """
     out_dir = tmp_path / "clipgt"
+    # Hydra drops an ``outputs/<date>/<time>/`` directory in CWD on every
+    # run; chdir into tmp_path so it gets cleaned up with the fixture.
+    hydra_cwd = tmp_path / "hydra_cwd"
+    hydra_cwd.mkdir()
     try:
         result = lanelet2_to_clipgt(
             input_osm=TINY_OSM,
@@ -154,6 +158,7 @@ def test_lanelet2_to_clipgt_end_to_end(tmp_path: Path) -> None:
             root_transform=_RAINBOW_BRIDGE_TRANSFORM,
             capture=True,
             check=False,
+            _cwd=hydra_cwd,
         )
     except subprocess.SubprocessError as e:  # pragma: no cover - rare CI failure
         pytest.fail(f"uvx subprocess failed: {e}")

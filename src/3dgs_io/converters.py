@@ -196,6 +196,7 @@ def lanelet2_to_clipgt(
     python: str = "3.10",
     capture: bool = False,
     check: bool = True,
+    _cwd: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Convert a Lanelet2 ``.osm`` file into a ClipGT parquet bundle via ``uvx``.
 
@@ -274,6 +275,7 @@ def lanelet2_to_clipgt(
         package=pkg,
         command=command,
         python=python,
+        cwd=_cwd,
         capture=capture,
         check=check,
     )
