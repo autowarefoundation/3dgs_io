@@ -133,13 +133,23 @@ class RigTrajectory:
 
 
 def serialize_rig_trajectories(rigs: list[RigTrajectory]) -> dict[str, Any]:
-    """Build the JSON-ready ``splatsim.rig_trajectories/v1`` document."""
-    seen: set[str] = set()
+    """Build the JSON-ready ``splatsim.rig_trajectories/v1`` document.
+
+    Enforces unique ``rig_id`` across rigs and unique ``name`` for cameras
+    within each rig — duplicates would silently collapse on round-trip when
+    downstream tooling keys by name.
+    """
+    seen_rigs: set[str] = set()
     out_list: list[dict[str, Any]] = []
     for rig in rigs:
-        if rig.rig_id in seen:
+        if rig.rig_id in seen_rigs:
             raise ValueError(f"duplicate rig_id: {rig.rig_id!r}")
-        seen.add(rig.rig_id)
+        seen_rigs.add(rig.rig_id)
+        seen_cams: set[str] = set()
+        for cam in rig.cameras:
+            if cam.name in seen_cams:
+                raise ValueError(f"duplicate camera name {cam.name!r} in rig {rig.rig_id!r}")
+            seen_cams.add(cam.name)
         out_list.append(rig.to_dict())
     return {
         "schema": RIG_TRAJECTORIES_SCHEMA,
@@ -165,6 +175,11 @@ def parse_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
         if rig.rig_id in seen:
             raise ValueError(f"duplicate rig_id: {rig.rig_id!r}")
         seen.add(rig.rig_id)
+        seen_cams: set[str] = set()
+        for cam in rig.cameras:
+            if cam.name in seen_cams:
+                raise ValueError(f"duplicate camera name {cam.name!r} in rig {rig.rig_id!r}")
+            seen_cams.add(cam.name)
         out.append(rig)
     return out
 

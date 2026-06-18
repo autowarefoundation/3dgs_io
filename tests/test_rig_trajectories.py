@@ -73,6 +73,20 @@ def test_serialize_rejects_duplicate_ids() -> None:
         serialize_rig_trajectories([_trajectory("ego"), _trajectory("ego")])
 
 
+def test_serialize_rejects_duplicate_camera_names_within_rig() -> None:
+    Camera = _mod.Camera
+    CameraExtrinsics = _mod.CameraExtrinsics
+    CameraModel = _mod.CameraModel
+    cam = Camera(
+        name="front",
+        camera_model=CameraModel.pinhole(width=640, height=480, fx=500, fy=500, cx=320, cy=240),
+        extrinsics=CameraExtrinsics(translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0)),
+    )
+    rig = RigTrajectory(rig_id="ego", cameras=[cam, cam])
+    with pytest.raises(ValueError, match="duplicate camera name 'front' in rig 'ego'"):
+        serialize_rig_trajectories([rig])
+
+
 def test_parse_rejects_duplicate_ids() -> None:
     """parse must also enforce uniqueness — symmetric with serialize."""
     rig = _trajectory("ego")

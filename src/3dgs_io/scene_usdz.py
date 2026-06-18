@@ -606,14 +606,12 @@ def save_scene_usdz(
         are added verbatim; directories are recursively zipped under the key
         prefix. Reserved paths (``default.usda`` / ``scene.json`` /
         ``tileset.json`` / ``chunks/*``) are rejected with ``ValueError``.
-        Conflicts with explicit ``cameras`` (both targeting ``cameras.json``)
-        are also rejected.
     tracks:
         Optional list of dynamic-object :class:`Track` objects. When given
         they are serialised into ``sequence_tracks.json`` inside the archive
         (schema ``splatsim.sequence_tracks/v1``) and recorded under
         ``scene.json.extras.sequence_tracks``. Track poses live in the same
-        root-local frame as the cameras and the SPZ payload.
+        root-local frame as the SPZ payload.
     rig_trajectories:
         Optional list of sensor-rig :class:`RigTrajectory` objects (typically
         an ego trajectory). When given they are serialised into

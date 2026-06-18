@@ -78,6 +78,13 @@ def test_resolution_missing_raises() -> None:
         _ = m.width
 
 
+def test_resolution_rejects_string() -> None:
+    """A string value would pass a naive ``len() != 2`` check; reject it explicitly."""
+    m = CameraModel(type="pinhole", parameters={"resolution": "1920x1080"})
+    with pytest.raises(ValueError, match="2-element list/tuple"):
+        _ = m.width
+
+
 # ---------------------------------------------------------------------------
 # CameraExtrinsics — T_sensor_rig form
 # ---------------------------------------------------------------------------
@@ -175,3 +182,10 @@ def test_camera_from_dict_default_metadata() -> None:
     del d["metadata"]
     cam = Camera.from_dict(d)
     assert cam.metadata == {}
+
+
+def test_camera_from_dict_missing_keys_raises_clearly() -> None:
+    d = _camera_dict()
+    del d["T_sensor_rig"]
+    with pytest.raises(ValueError, match=r"missing required key.*T_sensor_rig"):
+        Camera.from_dict(d)

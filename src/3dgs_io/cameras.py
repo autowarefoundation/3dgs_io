@@ -56,8 +56,12 @@ class CameraModel:
     @property
     def resolution(self) -> tuple[int, int]:
         res = self.parameters.get("resolution")
-        if res is None or len(res) != 2:
-            raise ValueError(f"camera_model.parameters.resolution missing or malformed: {res!r}")
+        # Reject scalars / strings explicitly — len() on a string would be
+        # accepted by a naive `len(res) != 2` check.
+        if not isinstance(res, (list, tuple)) or len(res) != 2:
+            raise ValueError(
+                f"camera_model.parameters.resolution must be a 2-element list/tuple; got {res!r}"
+            )
         return int(res[0]), int(res[1])
 
     @property
@@ -239,6 +243,11 @@ class Camera:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Camera:
+        missing = {k for k in ("name", "T_sensor_rig", "camera_model") if k not in d}
+        if missing:
+            raise ValueError(
+                f"camera entry is missing required key(s) {sorted(missing)}; got keys {sorted(d)}"
+            )
         return cls(
             name=str(d["name"]),
             camera_model=CameraModel.from_dict(d["camera_model"]),
