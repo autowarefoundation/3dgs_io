@@ -5,6 +5,12 @@ from .cameras import (
     CameraExtrinsics,
     CameraModel,
 )
+from .converters import (
+    DEFAULT_LANELET2_CONVERTER_PACKAGE,
+    lanelet2_to_clipgt,
+    mgrs_overrides_from_root_transform,
+    run_uvx_tool,
+)
 from .gltf_io import GltfSaveOptions, load_gltf, load_gltf_with_metadata, save_gltf
 from .lidar_2dgs import (
     LidarGaussianCloud,
@@ -66,6 +72,10 @@ __all__ = [
     "CameraExtrinsics",
     "CameraModel",
     "Checkpoint",
+    "DEFAULT_LANELET2_CONVERTER_PACKAGE",
+    "lanelet2_to_clipgt",
+    "mgrs_overrides_from_root_transform",
+    "run_uvx_tool",
     "compute_bounding_volume",
     "DatasetType",
     "Export",

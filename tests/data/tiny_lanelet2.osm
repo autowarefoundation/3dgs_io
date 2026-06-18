@@ -1,0 +1,35 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<osm generator='3dgs_io test fixture' version='0.6'>
+  <node id='1' visible='true' version='1' lat='35.6373100' lon='139.7611310'>
+    <tag k='ele' v='54.0' />
+  </node>
+  <node id='2' visible='true' version='1' lat='35.6373100' lon='139.7611420'>
+    <tag k='ele' v='54.0' />
+  </node>
+  <node id='3' visible='true' version='1' lat='35.6373200' lon='139.7611310'>
+    <tag k='ele' v='54.0' />
+  </node>
+  <node id='4' visible='true' version='1' lat='35.6373200' lon='139.7611420'>
+    <tag k='ele' v='54.0' />
+  </node>
+  <way id='10' visible='true' version='1'>
+    <nd ref='1' />
+    <nd ref='2' />
+    <tag k='type' v='line_thin' />
+    <tag k='subtype' v='solid' />
+  </way>
+  <way id='11' visible='true' version='1'>
+    <nd ref='3' />
+    <nd ref='4' />
+    <tag k='type' v='line_thin' />
+    <tag k='subtype' v='solid' />
+  </way>
+  <relation id='100' visible='true' version='1'>
+    <member type='way' ref='10' role='left' />
+    <member type='way' ref='11' role='right' />
+    <tag k='type' v='lanelet' />
+    <tag k='subtype' v='road' />
+    <tag k='location' v='urban' />
+    <tag k='one_way' v='yes' />
+  </relation>
+</osm>

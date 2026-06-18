@@ -1,0 +1,9 @@
+[2026-06-18 11:42:16,541][__main__][INFO] - map config:
+mgrs_grid: 54SUE
+offset:
+  x: 87831.0
+  'y': 44428.0
+  z: 54.26787551678717
+
+[2026-06-18 11:42:16,541][__main__][INFO] - origin: lat=35.63730380 lon=139.76112190 alt=54.268
+[2026-06-18 11:42:16,542][__main__][INFO] - output format: clipgt

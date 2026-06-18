@@ -1,0 +1,11 @@
+input_map_path: /home/masaya/workspace/3dgs_io/tests/data/tiny_lanelet2.osm
+output_dir: /tmp/pytest-of-masaya/pytest-204/test_lanelet2_to_clipgt_end_to0/clipgt
+clip_id: null
+map:
+  mgrs_grid: 54SUE
+  offset:
+    x: 87831.0
+    'y': 44428.0
+    z: 54.26787551678717
+target:
+  format: clipgt
