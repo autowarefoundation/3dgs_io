@@ -15,6 +15,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # lanelet2_to_clipgt's end-to-end test builds lanelet2_python_api_for_autoware
+      # from source via uvx; its CMake step needs Boost serialization/filesystem/program_options.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libboost-serialization-dev \
+            libboost-filesystem-dev \
+            libboost-program-options-dev
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
