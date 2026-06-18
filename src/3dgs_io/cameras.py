@@ -48,6 +48,8 @@ from typing import Any
 
 import numpy as np
 
+from ._quat import quat_from_rotation_matrix
+
 __all__ = [
     "CAMERAS_SCHEMA",
     "Camera",
@@ -173,37 +175,11 @@ class CameraExtrinsics:
         translation is taken from the last column.
         """
         a = np.asarray(m, dtype=np.float64).reshape(4, 4)
-        r = a[:3, :3]
         t = a[:3, 3]
-        # Quaternion extraction (Shepperd's method).
-        trace = float(r[0, 0] + r[1, 1] + r[2, 2])
-        if trace > 0.0:
-            s = 2.0 * np.sqrt(1.0 + trace)
-            w = 0.25 * s
-            x = (r[2, 1] - r[1, 2]) / s
-            y = (r[0, 2] - r[2, 0]) / s
-            z = (r[1, 0] - r[0, 1]) / s
-        elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2])
-            w = (r[2, 1] - r[1, 2]) / s
-            x = 0.25 * s
-            y = (r[0, 1] + r[1, 0]) / s
-            z = (r[0, 2] + r[2, 0]) / s
-        elif r[1, 1] > r[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2])
-            w = (r[0, 2] - r[2, 0]) / s
-            x = (r[0, 1] + r[1, 0]) / s
-            y = 0.25 * s
-            z = (r[1, 2] + r[2, 1]) / s
-        else:
-            s = 2.0 * np.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1])
-            w = (r[1, 0] - r[0, 1]) / s
-            x = (r[0, 2] + r[2, 0]) / s
-            y = (r[1, 2] + r[2, 1]) / s
-            z = 0.25 * s
+        x, y, z, w = quat_from_rotation_matrix(a[:3, :3])
         return cls(
             translation=(float(t[0]), float(t[1]), float(t[2])),
-            rotation=(float(x), float(y), float(z), float(w)),
+            rotation=(x, y, z, w),
         )
 
 

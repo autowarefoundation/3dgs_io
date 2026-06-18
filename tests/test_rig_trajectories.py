@@ -150,7 +150,9 @@ def test_alpasim_applies_world_to_nre_translation() -> None:
         ],
     }
     rigs = parse_alpasim_rig_trajectories(doc)
-    # M_root_local = world_to_nre @ T_world_base @ T_rig_world = (-100+50, 20+0, 0+0)
+    # M_root_local = world_to_nre @ T_rig_world = (-100+50, 20+0, 0+0).
+    # T_world_base is the ECEF anchor and is NOT composed into per-frame poses;
+    # see ``test_alpasim_T_world_base_is_informational_not_composed`` below.
     assert rigs[0].poses[0].translation == (-50.0, 20.0, 0.0)
 
 
@@ -172,6 +174,23 @@ def test_alpasim_T_world_base_is_informational_not_composed() -> None:
     assert rigs[0].poses[0].translation == (5.0, 0.0, 0.0)
     # ECEF anchor is preserved in metadata for callers that need it.
     assert rigs[0].metadata["T_world_base"][0][3] == 1_000_000.0
+
+
+def test_alpasim_world_to_nre_dict_without_matrix_key_raises_clearly() -> None:
+    """A world_to_nre dict missing the 'matrix' key should raise a clear ValueError."""
+    doc = {
+        "T_world_base": _eye_4x4(),
+        "world_to_nre": {"not_matrix": _eye_4x4()},
+        "rig_trajectories": [
+            {
+                "sequence_id": "ego",
+                "T_rig_worlds": [_eye_4x4()],
+                "T_rig_world_timestamps_us": [1],
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match="missing the 'matrix' key"):
+        parse_alpasim_rig_trajectories(doc)
 
 
 def test_alpasim_length_mismatch_raises() -> None:

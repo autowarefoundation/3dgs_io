@@ -48,6 +48,8 @@ from typing import Any
 
 import numpy as np
 
+from ._quat import quat_from_rotation_matrix
+
 __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
     "RigPose",
@@ -213,35 +215,11 @@ _Quaternion = tuple[float, float, float, float]
 
 def _pose_from_matrix(m: np.ndarray) -> tuple[_Translation, _Quaternion]:
     """Extract translation + xyzw quaternion from a 4×4 row-major rigid transform."""
-    r = m[:3, :3]
     t = m[:3, 3]
-    # Shepperd's method (same algorithm as CameraExtrinsics.from_matrix).
-    trace = float(r[0, 0] + r[1, 1] + r[2, 2])
-    if trace > 0.0:
-        s = 2.0 * np.sqrt(1.0 + trace)
-        w = 0.25 * s
-        x = (r[2, 1] - r[1, 2]) / s
-        y = (r[0, 2] - r[2, 0]) / s
-        z = (r[1, 0] - r[0, 1]) / s
-    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
-        s = 2.0 * np.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2])
-        w = (r[2, 1] - r[1, 2]) / s
-        x = 0.25 * s
-        y = (r[0, 1] + r[1, 0]) / s
-        z = (r[0, 2] + r[2, 0]) / s
-    elif r[1, 1] > r[2, 2]:
-        s = 2.0 * np.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2])
-        w = (r[0, 2] - r[2, 0]) / s
-        x = (r[0, 1] + r[1, 0]) / s
-        y = 0.25 * s
-        z = (r[1, 2] + r[2, 1]) / s
-    else:
-        s = 2.0 * np.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1])
-        w = (r[1, 0] - r[0, 1]) / s
-        x = (r[0, 2] + r[2, 0]) / s
-        y = (r[1, 2] + r[2, 1]) / s
-        z = 0.25 * s
-    return (float(t[0]), float(t[1]), float(t[2])), (float(x), float(y), float(z), float(w))
+    return (
+        (float(t[0]), float(t[1]), float(t[2])),
+        quat_from_rotation_matrix(m[:3, :3]),
+    )
 
 
 def parse_alpasim_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
@@ -296,10 +274,15 @@ def parse_alpasim_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
 
     T_world_base_raw = doc.get("T_world_base")
     w2n_raw = doc.get("world_to_nre")
-    if isinstance(w2n_raw, dict) and "matrix" in w2n_raw:
-        world_to_nre = _as_4x4(w2n_raw["matrix"])
-    elif w2n_raw is None:
+    if w2n_raw is None:
         world_to_nre = np.eye(4)
+    elif isinstance(w2n_raw, dict):
+        if "matrix" not in w2n_raw:
+            raise ValueError(
+                "alpasim world_to_nre is a dict but is missing the 'matrix' key; "
+                f"got keys {sorted(w2n_raw)}"
+            )
+        world_to_nre = _as_4x4(w2n_raw["matrix"])
     else:
         world_to_nre = _as_4x4(w2n_raw)
 
