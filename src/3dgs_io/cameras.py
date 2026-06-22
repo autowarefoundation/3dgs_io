@@ -44,12 +44,50 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+# Required intrinsic-parameter keys per camera-model ``type``. Construction of
+# a :class:`CameraModel` raises ``ValueError`` if any of these keys are missing
+# so that intrinsics can never be silently dropped on the way in/out of disk.
+# Unknown ``type`` strings still require ``resolution`` — the bare minimum any
+# downstream consumer needs to interpret the image data.
+_REQUIRED_INTRINSIC_KEYS: dict[str, tuple[str, ...]] = {
+    "pinhole": ("resolution", "fx", "fy", "cx", "cy"),
+    "opencv": ("resolution", "fx", "fy", "cx", "cy", "distortion_coeffs"),
+    "ftheta": (
+        "resolution",
+        "principal_point",
+        "pixeldist_to_angle_poly",
+        "angle_to_pixeldist_poly",
+    ),
+}
+
+
 @dataclass
 class CameraModel:
-    """Type-tagged camera intrinsics."""
+    """Type-tagged camera intrinsics.
+
+    ``parameters`` is required and must contain the intrinsic keys listed in
+    the module docstring for the given ``type``; missing keys raise
+    :class:`ValueError` at construction time.
+    """
 
     type: str
-    parameters: dict[str, Any] = field(default_factory=dict)
+    parameters: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parameters, dict):
+            raise ValueError(
+                f"camera_model.parameters must be a dict; got {type(self.parameters).__name__}"
+            )
+        required = _REQUIRED_INTRINSIC_KEYS.get(self.type, ("resolution",))
+        missing = [k for k in required if k not in self.parameters]
+        if missing:
+            raise ValueError(
+                f"camera_model(type={self.type!r}) is missing required intrinsic "
+                f"key(s) {missing}; got keys {sorted(self.parameters)}"
+            )
+        # Eagerly validate the resolution shape so a malformed value can't
+        # slip past construction and surface later as a confusing error.
+        _ = self.resolution
 
     # ------------ resolution accessors ------------
 
@@ -153,7 +191,12 @@ class CameraModel:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CameraModel:
-        return cls(type=str(d["type"]), parameters=dict(d.get("parameters") or {}))
+        missing = [k for k in ("type", "parameters") if k not in d]
+        if missing:
+            raise ValueError(
+                f"camera_model dict is missing required key(s) {missing}; got keys {sorted(d)}"
+            )
+        return cls(type=str(d["type"]), parameters=dict(d["parameters"]))
 
 
 # ---------------------------------------------------------------------------

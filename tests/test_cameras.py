@@ -72,17 +72,56 @@ def test_model_dict_roundtrip() -> None:
     assert again.parameters == m.parameters
 
 
-def test_resolution_missing_raises() -> None:
-    m = CameraModel(type="pinhole", parameters={})
+def test_construction_missing_intrinsics_raises() -> None:
+    with pytest.raises(ValueError, match="missing required intrinsic key"):
+        CameraModel(type="pinhole", parameters={})
+
+
+def test_pinhole_partial_intrinsics_raises() -> None:
+    with pytest.raises(ValueError, match=r"missing required intrinsic key.*'fy'"):
+        CameraModel(
+            type="pinhole",
+            parameters={"resolution": [1920, 1080], "fx": 1000, "cx": 960, "cy": 540},
+        )
+
+
+def test_opencv_missing_distortion_raises() -> None:
+    with pytest.raises(ValueError, match="distortion_coeffs"):
+        CameraModel(
+            type="opencv",
+            parameters={
+                "resolution": [1920, 1080],
+                "fx": 1000,
+                "fy": 1000,
+                "cx": 960,
+                "cy": 540,
+            },
+        )
+
+
+def test_unknown_type_still_requires_resolution() -> None:
     with pytest.raises(ValueError, match="resolution"):
-        _ = m.width
+        CameraModel(type="custom_fisheye", parameters={"foo": 1})
 
 
 def test_resolution_rejects_string() -> None:
     """A string value would pass a naive ``len() != 2`` check; reject it explicitly."""
-    m = CameraModel(type="pinhole", parameters={"resolution": "1920x1080"})
     with pytest.raises(ValueError, match="2-element list/tuple"):
-        _ = m.width
+        CameraModel(
+            type="pinhole",
+            parameters={
+                "resolution": "1920x1080",
+                "fx": 1000,
+                "fy": 1000,
+                "cx": 960,
+                "cy": 540,
+            },
+        )
+
+
+def test_from_dict_missing_parameters_raises() -> None:
+    with pytest.raises(ValueError, match=r"missing required key.*'parameters'"):
+        CameraModel.from_dict({"type": "pinhole"})
 
 
 # ---------------------------------------------------------------------------

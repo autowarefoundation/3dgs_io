@@ -422,7 +422,15 @@ def _attach_alpasim_cameras_to_rig(
                 cam_name,
             )
             continue
-        cam_model = CameraModel.from_dict(cam_model_raw)
+        try:
+            cam_model = CameraModel.from_dict(cam_model_raw)
+        except ValueError as e:
+            _log.warning(
+                "alpasim camera %r: invalid camera_model intrinsics (%s); skipping",
+                cam_name,
+                e,
+            )
+            continue
         meta: dict[str, Any] = {}
         for k in ("sequence_id", "logical_sensor_name", "unique_sensor_idx"):
             if k in entry:
