@@ -1,16 +1,11 @@
 """3D Tiles (OGC) reader for tilesets containing Gaussian-splatting content.
 
 Traverses a ``tileset.json`` (local file or HTTP/HTTPS URL), fetches each tile's
-glTF/GLB content, and returns one or more cloud objects.
+glTF/GLB content, and returns :class:`Tile3DContent` objects.
 
-Supports:
-
-* **Single content** -- ``content.uri`` (legacy / simple tilesets).
-* **Multiple contents** -- ``contents`` array with ``group`` indices
-  (3D Tiles 1.1) for mixed Camera 3DGS + LiDAR 2DGS tilesets.
-
-Only explicit (non-implicit) tiling and cumulative ``transform`` matrices are
-implemented.
+Supports both ``content.uri`` (single content) and ``contents`` (3D Tiles 1.1
+multi-content). Only explicit (non-implicit) tiling and cumulative
+``transform`` matrices are implemented.
 """
 
 from __future__ import annotations
@@ -21,22 +16,14 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import TypeVar
 
 import numpy as np
 import spz
+from scipy.spatial.transform import Rotation
 
 from .gltf_io import load_gltf
-from .lidar_2dgs import LidarGaussianCloud, load_lidar_gltf
-
-
-class LayerType(str, Enum):
-    """Content layer types for multi-content tilesets."""
-
-    CAMERA_3DGS = "camera_3dgs"
-    LIDAR_2DGS = "lidar_2dgs"
 
 
 @dataclass
@@ -164,46 +151,18 @@ class Tile3DContent:
     """Parsed bounding volume from the tileset (box, region, or sphere)."""
 
 
-@dataclass
-class LidarTile3DContent:
-    """A single loaded LiDAR 2DGS tile from a 3D Tileset."""
-
-    cloud: LidarGaussianCloud
-    """LiDAR Gaussian cloud decoded from the tile's glTF content (tile-local coords)."""
-
-    transform: np.ndarray
-    """Cumulative 4x4 world transform (column-major, as stored in 3D Tiles)."""
-
-    content_uri: str
-    """Resolved URI/path of the tile content that was loaded."""
-
-    geometric_error: float = 0.0
-    """Tile ``geometricError`` (screen-space error threshold)."""
-
-    refine: str = "REPLACE"
-    """Refinement strategy inherited from the nearest ancestor (``ADD``/``REPLACE``)."""
-
-    bounding_volume: BoundingVolume | None = None
-    """Parsed bounding volume from the tileset (box, region, or sphere)."""
-
-
 def load_tileset(
     source: str | Path,
     *,
-    layer: str | LayerType = LayerType.CAMERA_3DGS,
     max_tiles: int | None = None,
     leaves_only: bool = True,
-) -> list[Tile3DContent] | list[LidarTile3DContent]:
-    """Load a 3D Tileset and return tiles filtered by layer.
+) -> list[Tile3DContent]:
+    """Load a 3D Tileset and return its tiles.
 
     Parameters
     ----------
     source:
         Local path or HTTP(S) URL to a ``tileset.json`` file.
-    layer:
-        Which content layer to return.  Defaults to ``"camera_3dgs"``
-        (backward-compatible with previous behaviour).  Use ``"lidar_2dgs"``
-        for LiDAR content.
     max_tiles:
         Optional cap on the number of tiles loaded (useful for large tilesets).
     leaves_only:
@@ -212,20 +171,16 @@ def load_tileset(
 
     Returns
     -------
-    A list of :class:`Tile3DContent` or :class:`LidarTile3DContent` depending
-    on the *layer* parameter.
+    A list of :class:`Tile3DContent`.
     """
-    layer = LayerType(layer)
-
     base_url, tileset = _fetch_json(source)
 
     root = tileset.get("root")
     if root is None:
         raise ValueError("Tileset missing 'root' tile")
 
-    results: list[Tile3DContent | LidarTile3DContent] = []
+    results: list[Tile3DContent] = []
     identity = np.eye(4, dtype=np.float64)
-    group_types = _parse_group_types(tileset)
     _traverse(
         root,
         base_url=base_url,
@@ -234,8 +189,6 @@ def load_tileset(
         results=results,
         max_tiles=max_tiles,
         leaves_only=leaves_only,
-        group_types=group_types,
-        target_layer=layer,
     )
     return results
 
@@ -341,31 +294,15 @@ def _parse_bounding_volume(raw: dict | None) -> BoundingVolume | None:
     return None
 
 
-def _parse_group_types(tileset: dict) -> dict[int, LayerType]:
-    """Extract group index -> content type mapping from tileset metadata."""
-    groups = tileset.get("groups", [])
-    result: dict[int, LayerType] = {}
-    for i, group in enumerate(groups):
-        props = group.get("properties", {})
-        raw_type = props.get("type", LayerType.CAMERA_3DGS.value)
-        try:
-            result[i] = LayerType(raw_type)
-        except ValueError:
-            result[i] = LayerType.CAMERA_3DGS
-    return result
-
-
 def _traverse(
     tile: dict,
     *,
     base_url: str,
     parent_transform: np.ndarray,
     parent_refine: str,
-    results: list[Tile3DContent | LidarTile3DContent],
+    results: list[Tile3DContent],
     max_tiles: int | None,
     leaves_only: bool,
-    group_types: dict[int, LayerType],
-    target_layer: LayerType,
     _visited: frozenset[str] = frozenset(),
 ) -> None:
     transform = parent_transform
@@ -408,8 +345,7 @@ def _traverse(
 
             resolved = _resolve_uri(base_url, uri)
 
-            # Must be checked before the content-type filter because an
-            # external tileset may hold content for any layer.
+            # External tileset (nested .json) — recurse into it.
             parsed_uri = urllib.parse.urlparse(resolved)
             if Path(parsed_uri.path).suffix.lower() == ".json":
                 if resolved in _visited:
@@ -417,7 +353,6 @@ def _traverse(
                 ext_base, ext_data = _fetch_json(resolved)
                 ext_root = ext_data.get("root")
                 if ext_root is not None:
-                    ext_groups = _parse_group_types(ext_data)
                     _traverse(
                         ext_root,
                         base_url=ext_base,
@@ -426,47 +361,21 @@ def _traverse(
                         results=results,
                         max_tiles=max_tiles,
                         leaves_only=leaves_only,
-                        group_types=ext_groups,
-                        target_layer=target_layer,
                         _visited=_visited | {resolved},
                     )
                 continue
 
-            group_idx = entry.get("group")
-            content_type = (
-                group_types.get(group_idx, LayerType.CAMERA_3DGS)
-                if group_idx is not None
-                else LayerType.CAMERA_3DGS
+            cloud = _load_tile_content(resolved, load_gltf)
+            results.append(
+                Tile3DContent(
+                    cloud=cloud,
+                    transform=transform,
+                    content_uri=resolved,
+                    geometric_error=geo_error,
+                    refine=refine,
+                    bounding_volume=bv,
+                )
             )
-
-            # Skip content that does not match the requested layer.
-            if content_type != target_layer:
-                continue
-
-            if content_type == LayerType.LIDAR_2DGS:
-                cloud = _load_tile_content(resolved, load_lidar_gltf)
-                results.append(
-                    LidarTile3DContent(
-                        cloud=cloud,
-                        transform=transform,
-                        content_uri=resolved,
-                        geometric_error=geo_error,
-                        refine=refine,
-                        bounding_volume=bv,
-                    )
-                )
-            else:
-                cloud = _load_tile_content(resolved, load_gltf)
-                results.append(
-                    Tile3DContent(
-                        cloud=cloud,
-                        transform=transform,
-                        content_uri=resolved,
-                        geometric_error=geo_error,
-                        refine=refine,
-                        bounding_volume=bv,
-                    )
-                )
 
     for child in children:
         if max_tiles is not None and len(results) >= max_tiles:
@@ -479,8 +388,6 @@ def _traverse(
             results=results,
             max_tiles=max_tiles,
             leaves_only=leaves_only,
-            group_types=group_types,
-            target_layer=target_layer,
             _visited=_visited,
         )
 
@@ -557,49 +464,6 @@ def _apply_rotation_to_quats(r: np.ndarray, quats: np.ndarray) -> np.ndarray:
         u[:, -1] *= -1
         rot = u @ vt
 
-    rq = _matrix_to_quat(rot)
-    return _quat_multiply(rq, quats)
-
-
-def _matrix_to_quat(m: np.ndarray) -> np.ndarray:
-    """Convert a 3x3 rotation matrix to a quaternion (x, y, z, w)."""
-    t = np.trace(m)
-    if t > 0:
-        s = np.sqrt(t + 1.0) * 2
-        w = 0.25 * s
-        x = (m[2, 1] - m[1, 2]) / s
-        y = (m[0, 2] - m[2, 0]) / s
-        z = (m[1, 0] - m[0, 1]) / s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2
-        w = (m[2, 1] - m[1, 2]) / s
-        x = 0.25 * s
-        y = (m[0, 1] + m[1, 0]) / s
-        z = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2
-        w = (m[0, 2] - m[2, 0]) / s
-        x = (m[0, 1] + m[1, 0]) / s
-        y = 0.25 * s
-        z = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2
-        w = (m[1, 0] - m[0, 1]) / s
-        x = (m[0, 2] + m[2, 0]) / s
-        y = (m[1, 2] + m[2, 1]) / s
-        z = 0.25 * s
-    return np.array([x, y, z, w], dtype=np.float64)
-
-
-def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    """Multiply quaternion ``q1`` (shape (4,)) with each quaternion in ``q2``
-    (shape (N, 4)). Both use (x, y, z, w) order. Returns (N, 4)."""
-    if q2.ndim == 1:
-        q2 = q2.reshape(1, 4)
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
-    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
-    return np.stack([x, y, z, w], axis=1)
+    quats_2d = np.atleast_2d(quats)
+    combined = Rotation.from_matrix(rot) * Rotation.from_quat(quats_2d)
+    return combined.as_quat()

@@ -20,7 +20,8 @@ from typing import Any
 import numpy as np
 import spz
 
-from .gltf_io import GltfSaveOptions, save_gltf
+from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME
+from .gltf_io import GltfSaveOptions, load_gltf_with_metadata, save_gltf
 from .tiles_io import (
     BoundingVolume,
     BoundingVolumeBox,
@@ -32,7 +33,6 @@ from .tiles_io import (
     _fetch_json,
     _load_tile_content,
     _resolve_uri,
-    load_gltf,
 )
 
 
@@ -111,6 +111,7 @@ def save_tileset(
     options: TilesetSaveOptions | None = None,
     *,
     root_transform: np.ndarray | None = None,
+    ext_attributes: dict[str, np.ndarray] | None = None,
 ) -> Path:
     """Write a 3D Tiles tileset from one of several source types.
 
@@ -143,6 +144,11 @@ def save_tileset(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if isinstance(source, list):
+        if ext_attributes is not None:
+            raise ValueError(
+                "ext_attributes is only supported for GaussianCloud sources; "
+                "pre-built Tile3DContent lists carry their own GLBs."
+            )
         return _save_from_tiles(source, output_dir, options, root_transform)
 
     cs = float(options.chunk_size)
@@ -150,7 +156,12 @@ def save_tileset(
         raise ValueError(f"chunk_size must be positive, got {cs}")
 
     if isinstance(source, spz.GaussianCloud):
-        return _save_from_cloud(source, output_dir, cs, options)
+        return _save_from_cloud(source, output_dir, cs, options, ext_attributes)
+    if ext_attributes is not None:
+        raise ValueError(
+            "ext_attributes is only supported for GaussianCloud sources; "
+            "tileset sources should keep ext on their input GLBs."
+        )
     return _save_from_tileset(source, output_dir, cs, options)
 
 
@@ -171,11 +182,11 @@ def _save_from_tiles(
     children: list[dict[str, Any]] = []
     bbox_min: np.ndarray | None = None
     bbox_max: np.ndarray | None = None
-    save_tasks: list[tuple[spz.GaussianCloud, Path]] = []
+    save_tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]] = []
 
     for i, tile in enumerate(tiles):
         filename = f"tile_{i}.glb"
-        save_tasks.append((tile.cloud, output_dir / filename))
+        save_tasks.append((tile.cloud, output_dir / filename, None))
 
         child: dict[str, Any] = {
             "geometricError": tile.geometric_error,
@@ -217,10 +228,19 @@ def _save_from_cloud(
     output_dir: Path,
     cs: float,
     options: TilesetSaveOptions,
+    ext_attributes: dict[str, np.ndarray] | None = None,
 ) -> Path:
     n = gc.num_points
     if n == 0:
         raise ValueError("Cannot export an empty GaussianCloud")
+
+    ext_attrs: dict[str, np.ndarray] = {}
+    if ext_attributes is not None:
+        for name, arr in ext_attributes.items():
+            arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+            if arr.shape[0] != n:
+                raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
+            ext_attrs[name] = arr
 
     positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
     rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
@@ -238,7 +258,7 @@ def _save_from_cloud(
     unique_keys, inverse = np.unique(cell_keys, return_inverse=True)
 
     children: list[dict[str, Any]] = []
-    save_tasks: list[tuple[spz.GaussianCloud, Path]] = []
+    save_tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]] = []
 
     for chunk_idx, _key in enumerate(unique_keys):
         mask = inverse == chunk_idx
@@ -256,8 +276,10 @@ def _save_from_cloud(
             sh_reshaped = sh.reshape(n, sh_per_point, 3)
             chunk_gc.sh = sh_reshaped[mask].reshape(-1).astype(np.float32)
 
+        chunk_ext = {name: arr[mask] for name, arr in ext_attrs.items()}
+
         filename = f"chunk_{chunk_idx}.glb"
-        save_tasks.append((chunk_gc, output_dir / filename))
+        save_tasks.append((chunk_gc, output_dir / filename, chunk_ext))
 
         chunk_positions = positions[mask]
         bounding_box = _aabb_to_3dtiles_box(
@@ -274,7 +296,14 @@ def _save_from_cloud(
 
     _save_gltf_parallel(save_tasks, options)
 
-    return _write_tileset_json(output_dir, bbox_min, bbox_max, children, options)
+    return _write_tileset_json(
+        output_dir,
+        bbox_min,
+        bbox_max,
+        children,
+        options,
+        has_ext_attributes=bool(ext_attrs),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +328,17 @@ def _save_from_tileset(
     sh_degree_seen: int | None = None
 
     for uri, transform in _walk_tile_uris(root, base_url):
-        gc = _load_tile_content(uri, load_gltf)
+
+        def _loader(p):
+            cloud, _meta, ext = load_gltf_with_metadata(p)
+            if ext:
+                raise NotImplementedError(
+                    "loading EXT_gaussian_lidar attributes from a tileset source is "
+                    "not yet supported; pass a tile list instead"
+                )
+            return cloud
+
+        gc = _load_tile_content(uri, _loader)
         n = gc.num_points
         if n == 0:
             del gc
@@ -401,12 +440,19 @@ def _save_from_tileset(
 
 
 def _save_gltf_parallel(
-    tasks: list[tuple[spz.GaussianCloud, Path]],
+    tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]],
     options: TilesetSaveOptions,
 ) -> None:
-    """Save multiple GaussianClouds to GLB files in parallel."""
+    """Save multiple GaussianClouds to GLB files in parallel.
+
+    Each task is ``(gc, path, ext_attributes)``; pass ``None`` for
+    ``ext_attributes`` when the tile has no extension arrays.
+    """
     with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
-        futures = [executor.submit(save_gltf, gc, path, options.save_options) for gc, path in tasks]
+        futures = [
+            executor.submit(save_gltf, gc, path, options.save_options, ext_attributes=ext)
+            for gc, path, ext in tasks
+        ]
         for future in futures:
             future.result()
 
@@ -440,6 +486,8 @@ def _write_tileset_json(
     children: list[dict[str, Any]],
     options: TilesetSaveOptions,
     root_transform: np.ndarray | None = None,
+    *,
+    has_ext_attributes: bool = False,
 ) -> Path:
     root_box = _aabb_to_3dtiles_box(bbox_min, bbox_max)
 
@@ -452,6 +500,8 @@ def _write_tileset_json(
         spz_ext = "KHR_gaussian_splatting_compression_spz_2"
         gltf_exts_used.append(spz_ext)
         gltf_exts_required.append(spz_ext)
+    if has_ext_attributes:
+        gltf_exts_used.append(EXT_GAUSSIAN_LIDAR_NAME)
 
     root: dict[str, Any] = {
         "boundingVolume": {"box": root_box},

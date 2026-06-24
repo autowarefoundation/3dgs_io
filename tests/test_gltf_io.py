@@ -291,7 +291,7 @@ def test_metadata_roundtrip(ext: str, tmp_path: Path) -> None:
     gc = _make_gc()
     path = tmp_path / f"meta{ext}"
     save_gltf(gc, path, GltfSaveOptions(metadata=_SAMPLE_METADATA))
-    _, metadata = load_gltf_with_metadata(path)
+    _, metadata, _ = load_gltf_with_metadata(path)
     assert metadata == _SAMPLE_METADATA
 
 
@@ -300,7 +300,7 @@ def test_metadata_roundtrip_spz(ext: str, tmp_path: Path) -> None:
     gc = _make_gc()
     path = tmp_path / f"meta_spz{ext}"
     save_gltf(gc, path, GltfSaveOptions(spz_compression=True, metadata=_SAMPLE_METADATA))
-    _, metadata = load_gltf_with_metadata(path)
+    _, metadata, _ = load_gltf_with_metadata(path)
     assert metadata == _SAMPLE_METADATA
 
 
@@ -309,7 +309,7 @@ def test_no_metadata_returns_none(ext: str, tmp_path: Path) -> None:
     gc = _make_gc()
     path = tmp_path / f"no_meta{ext}"
     save_gltf(gc, path)
-    _, metadata = load_gltf_with_metadata(path)
+    _, metadata, _ = load_gltf_with_metadata(path)
     assert metadata is None
 
 

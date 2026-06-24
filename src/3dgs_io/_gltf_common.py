@@ -1,7 +1,4 @@
-"""Shared glTF/GLB read/write infrastructure.
-
-Used by both ``gltf_io`` (camera 3DGS) and ``lidar_2dgs`` (LiDAR 2DGS).
-"""
+"""Shared glTF/GLB read/write infrastructure."""
 
 from __future__ import annotations
 

@@ -20,13 +20,10 @@ _mod = importlib.import_module("3dgs_io")
 load_tileset = _mod.load_tileset
 merge_tileset = _mod.merge_tileset
 Tile3DContent = _mod.Tile3DContent
-LidarTile3DContent = _mod.LidarTile3DContent
-LidarGaussianCloud = _mod.LidarGaussianCloud
 BoundingVolumeBox = _mod.BoundingVolumeBox
 BoundingVolumeRegion = _mod.BoundingVolumeRegion
 BoundingVolumeSphere = _mod.BoundingVolumeSphere
 save_gltf = _mod.save_gltf
-save_lidar_gltf = _mod.save_lidar_gltf
 GltfSaveOptions = _mod.GltfSaveOptions
 GaussianCloud = spz.GaussianCloud
 
@@ -254,133 +251,7 @@ def test_cesium_tile_content_is_valid_glb() -> None:
     assert "KHR_gaussian_splatting" in gltf["extensionsUsed"]
 
 
-# ── multi-content tileset (camera + lidar) ─────────────────────────────────
-
-
-def _make_lidar_cloud(rng: np.random.Generator, n: int) -> LidarGaussianCloud:
-    """Create a small LidarGaussianCloud for testing."""
-    positions = rng.uniform(-5.0, 5.0, (n, 3)).astype(np.float32)
-    normals = rng.standard_normal((n, 3)).astype(np.float32)
-    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
-    scales_2d = rng.uniform(0.01, 1.0, (n, 2)).astype(np.float32)
-    rotations = rng.standard_normal((n, 4)).astype(np.float32)
-    rotations /= np.linalg.norm(rotations, axis=1, keepdims=True)
-    reflectance = rng.uniform(0.0, 1.0, (n,)).astype(np.float32)
-    opacity = rng.uniform(0.0, 1.0, (n,)).astype(np.float32)
-
-    return LidarGaussianCloud(
-        num_points=n,
-        positions=positions.reshape(-1),
-        normals=normals.reshape(-1),
-        scales_2d=scales_2d.reshape(-1),
-        rotations=rotations.reshape(-1),
-        reflectance=reflectance,
-        opacity=opacity,
-    )
-
-
-def _build_multi_content_tileset(tmp_path: Path, n_camera: int = 15, n_lidar: int = 10) -> Path:
-    """Write a 3D Tiles 1.1 tileset with both camera 3DGS and LiDAR 2DGS content."""
-    rng = np.random.default_rng(42)
-
-    # Camera 3DGS
-    gc = _make_camera_cloud(rng, n_camera)
-
-    # LiDAR 2DGS
-    lidar = _make_lidar_cloud(rng, n_lidar)
-
-    tiles_dir = tmp_path / "0"
-    tiles_dir.mkdir()
-    save_gltf(gc, tiles_dir / "camera.glb", GltfSaveOptions(spz_compression=True))
-    save_lidar_gltf(lidar, tiles_dir / "lidar.glb")
-
-    tileset = {
-        "asset": {"version": "1.1"},
-        "schema": {
-            "classes": {
-                "ContentType": {
-                    "properties": {
-                        "type": {"type": "STRING"},
-                    }
-                }
-            }
-        },
-        "groups": [
-            {"class": "ContentType", "properties": {"type": "camera_3dgs"}},
-            {"class": "ContentType", "properties": {"type": "lidar_2dgs"}},
-        ],
-        "geometricError": 10.0,
-        "root": {
-            "boundingVolume": {
-                "box": [0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0, 5],
-            },
-            "geometricError": 0.0,
-            "refine": "REPLACE",
-            "contents": [
-                {"uri": "0/camera.glb", "group": 0},
-                {"uri": "0/lidar.glb", "group": 1},
-            ],
-        },
-    }
-    tileset_path = tmp_path / "tileset.json"
-    tileset_path.write_text(json.dumps(tileset))
-    return tileset_path
-
-
-def test_load_multi_content_camera(tmp_path: Path) -> None:
-    """Default layer returns only camera tiles from a multi-content tileset."""
-    tileset_path = _build_multi_content_tileset(tmp_path, n_camera=15, n_lidar=10)
-
-    tiles = load_tileset(tileset_path)
-    assert len(tiles) == 1
-    assert isinstance(tiles[0], Tile3DContent)
-    assert tiles[0].cloud.num_points == 15
-
-
-def test_load_multi_content_lidar(tmp_path: Path) -> None:
-    """layer='lidar_2dgs' returns only LiDAR tiles."""
-    tileset_path = _build_multi_content_tileset(tmp_path, n_camera=15, n_lidar=10)
-
-    tiles = load_tileset(tileset_path, layer="lidar_2dgs")
-    assert len(tiles) == 1
-    assert isinstance(tiles[0], LidarTile3DContent)
-    assert tiles[0].cloud.num_points == 10
-
-
-def test_multi_content_tileset_structure(tmp_path: Path) -> None:
-    """Verify the tileset.json structure is valid 3D Tiles 1.1."""
-    tileset_path = _build_multi_content_tileset(tmp_path)
-    tileset = json.loads(tileset_path.read_text())
-
-    assert tileset["asset"]["version"] == "1.1"
-    assert "schema" in tileset
-    assert "groups" in tileset
-    assert len(tileset["groups"]) == 2
-    assert tileset["groups"][0]["properties"]["type"] == "camera_3dgs"
-    assert tileset["groups"][1]["properties"]["type"] == "lidar_2dgs"
-
-    root = tileset["root"]
-    assert "contents" in root
-    assert len(root["contents"]) == 2
-    assert root["contents"][0]["group"] == 0
-    assert root["contents"][1]["group"] == 1
-
-
-def test_multi_content_lidar_data_integrity(tmp_path: Path) -> None:
-    """Verify LiDAR data can be loaded correctly from a multi-content tileset."""
-    tileset_path = _build_multi_content_tileset(tmp_path, n_lidar=20)
-
-    tiles = load_tileset(tileset_path, layer="lidar_2dgs")
-    assert len(tiles) == 1
-
-    cloud = tiles[0].cloud
-    assert cloud.num_points == 20
-    assert len(cloud.positions) == 20 * 3
-    assert len(cloud.normals) == 20 * 3
-    assert len(cloud.scales_2d) == 20 * 2
-    assert len(cloud.rotations) == 20 * 4
-    assert len(cloud.reflectance) == 20
-    assert len(cloud.opacity) == 20
+# ── bounding volume parsing ─────────────────────────────────────────────────
 
 
 def test_bounding_volume_box_populated(tmp_path: Path) -> None:
@@ -440,15 +311,6 @@ def test_bounding_volume_none_when_absent(tmp_path: Path) -> None:
     tiles = load_tileset(tileset_path)
     assert len(tiles) == 1
     assert tiles[0].bounding_volume is None
-
-
-def test_bounding_volume_lidar(tmp_path: Path) -> None:
-    """LidarTile3DContent also exposes bounding_volume."""
-    tileset_path = _build_multi_content_tileset(tmp_path, n_lidar=10)
-    tiles = load_tileset(tileset_path, layer="lidar_2dgs")
-    assert len(tiles) == 1
-    assert tiles[0].bounding_volume is not None
-    assert isinstance(tiles[0].bounding_volume, BoundingVolumeBox)
 
 
 # ── external tileset (nested tileset.json references) ─────────────────────
@@ -580,78 +442,3 @@ def test_external_tileset_max_tiles(tmp_path: Path) -> None:
 
     tiles = load_tileset(tileset_path, max_tiles=3)
     assert len(tiles) == 3
-
-
-def test_external_tileset_with_groups(tmp_path: Path) -> None:
-    """External tileset with its own groups definition is handled correctly."""
-    rng = np.random.default_rng(77)
-
-    seg_dir = tmp_path / "seg_00"
-    seg_dir.mkdir()
-
-    # Camera GLB
-    gc = _make_camera_cloud(rng, 8)
-    save_gltf(gc, seg_dir / "camera.glb", GltfSaveOptions(spz_compression=True))
-
-    # LiDAR GLB
-    lidar = _make_lidar_cloud(rng, 12)
-    save_lidar_gltf(lidar, seg_dir / "lidar.glb")
-
-    # External tileset with groups
-    ext_tileset = {
-        "asset": {"version": "1.1"},
-        "groups": [
-            {"class": "ContentType", "properties": {"type": "camera_3dgs"}},
-            {"class": "ContentType", "properties": {"type": "lidar_2dgs"}},
-        ],
-        "geometricError": 100.0,
-        "root": {
-            "boundingVolume": {"box": [0, 0, 0, 5, 0, 0, 0, 5, 0, 0, 0, 5]},
-            "geometricError": 0.0,
-            "refine": "REPLACE",
-            "contents": [
-                {"uri": "camera.glb", "group": 0},
-                {"uri": "lidar.glb", "group": 1},
-            ],
-        },
-    }
-    (seg_dir / "tileset.json").write_text(json.dumps(ext_tileset))
-
-    # Root tileset
-    root_tileset = {
-        "asset": {"version": "1.1"},
-        "geometricError": 1000.0,
-        "root": {
-            "boundingVolume": {"box": [0, 0, 0, 50, 0, 0, 0, 50, 0, 0, 0, 50]},
-            "geometricError": 500.0,
-            "refine": "REPLACE",
-            "content": {"uri": "seg_00/tileset.json"},
-        },
-    }
-    tileset_path = tmp_path / "tileset.json"
-    tileset_path.write_text(json.dumps(root_tileset))
-
-    # Camera layer
-    camera_tiles = load_tileset(tileset_path, layer="camera_3dgs")
-    assert len(camera_tiles) == 1
-    assert isinstance(camera_tiles[0], Tile3DContent)
-    assert camera_tiles[0].cloud.num_points == 8
-
-    # LiDAR layer
-    lidar_tiles = load_tileset(tileset_path, layer="lidar_2dgs")
-    assert len(lidar_tiles) == 1
-    assert isinstance(lidar_tiles[0], LidarTile3DContent)
-    assert lidar_tiles[0].cloud.num_points == 12
-
-
-def test_legacy_single_content_backward_compat(tmp_path: Path) -> None:
-    """Legacy single-content tileset works with default layer."""
-    tileset_path = _build_local_tileset(tmp_path, n=20)
-
-    tiles = load_tileset(tileset_path)
-    assert len(tiles) == 1
-    assert tiles[0].cloud.num_points == 20
-
-    # No LiDAR in a legacy tileset
-    lidar = load_tileset(tileset_path, layer="lidar_2dgs")
-    assert len(lidar) == 0

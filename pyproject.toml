@@ -9,8 +9,23 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=2.1,<2.3",
+    "scipy>=1.11",
     "spz",
 ]
+
+[project.optional-dependencies]
+# Origin auto-derivation for the lanelet2→clipgt converter (ECEF → MGRS).
+# Install with: pip install 3dgs-io[converters]
+converters = [
+    "pyproj>=3.6",
+    "mgrs>=1.4",
+]
+
+# Note: the package directory is named ``3dgs_io`` (starts with a digit), so a
+# ``[project.scripts]`` console-script entry is not possible — the generated
+# wrapper would emit ``from 3dgs_io.* import ...`` which is a SyntaxError, and
+# uv_build refuses ``module-name`` entries that aren't valid Python identifiers.
+# Run the CLI with ``python -m 3dgs_io`` or ``python -m 3dgs_io.scene_bundle_cli``.
 
 
 [build-system]
