@@ -105,20 +105,20 @@ def encode_lidar_sidecar(
     """Encode the default 2-channel LiDAR sidecar for ``count`` points.
 
     Channels are written in fixed order: ``lidar_intensity_raw`` then
-    ``lidar_raydrop_logit``. Missing channels are treated as zeros
-    (``sigmoid(0) = 0.5`` ⇒ ``128`` after quantization), so that the
-    sidecar can still be written if only one of the two attributes is
-    available — downstream readers can detect this via the all-128
-    pattern, but for v1 we require both.
+    ``lidar_raydrop_logit``. Both channels are required — passing a dict
+    that is missing one of the keys raises ``KeyError``.
     """
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
 
     body = np.zeros((count, 2), dtype=np.uint8)
     for ch_idx, spec in enumerate(DEFAULT_LIDAR_SPECS):
-        arr = ext_attributes.get(spec.name)
-        if arr is None:
-            continue
+        try:
+            arr = ext_attributes[spec.name]
+        except KeyError:
+            raise KeyError(
+                f"ext attribute {spec.name!r} is required for the LiDAR sidecar"
+            ) from None
         arr = np.asarray(arr, dtype=np.float32).reshape(-1)
         if arr.shape[0] != count:
             raise ValueError(

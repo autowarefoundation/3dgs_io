@@ -61,7 +61,7 @@ class GltfSaveOptions:
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
-    return 1.0 / (1.0 + np.exp(-x.astype(np.float64))).astype(np.float32)
+    return (1.0 / (1.0 + np.exp(-x.astype(np.float64)))).astype(np.float32)
 
 
 def _inverse_sigmoid(x: np.ndarray) -> np.ndarray:
@@ -77,7 +77,12 @@ _EXT_SPEC_BY_NAME: dict[str, ExtAttributeSpec] = {s.name: s for s in DEFAULT_LID
 
 
 def _spec_for(name: str) -> ExtAttributeSpec:
-    return _EXT_SPEC_BY_NAME.get(name, ExtAttributeSpec(name=name, quantization="u8_sigmoid"))
+    try:
+        return _EXT_SPEC_BY_NAME[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown EXT_gaussian_lidar attribute {name!r}; known: {sorted(_EXT_SPEC_BY_NAME)}"
+        ) from None
 
 
 def _quantize_ext(arr: np.ndarray, spec: ExtAttributeSpec) -> bytes:

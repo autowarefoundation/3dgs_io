@@ -386,10 +386,12 @@ def _filter_and_clamp(
         opacity = _sigmoid(alphas)
         keep = keep & (opacity >= options.opacity_threshold)
 
-    ext_in: dict[str, np.ndarray] = ext_attrs or {}
-    for name, arr in ext_in.items():
+    ext_in: dict[str, np.ndarray] = {}
+    for name, arr in (ext_attrs or {}).items():
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
         if arr.shape[0] != n:
             raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
+        ext_in[name] = arr
 
     if not keep.all():
         positions = positions[keep]

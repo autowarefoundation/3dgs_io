@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import spz
 
-from .gltf_io import GltfSaveOptions, save_gltf
+from .gltf_io import GltfSaveOptions, load_gltf_with_metadata, save_gltf
 from .tiles_io import (
     BoundingVolume,
     BoundingVolumeBox,
@@ -32,7 +32,6 @@ from .tiles_io import (
     _fetch_json,
     _load_tile_content,
     _resolve_uri,
-    load_gltf,
 )
 
 
@@ -328,7 +327,17 @@ def _save_from_tileset(
     sh_degree_seen: int | None = None
 
     for uri, transform in _walk_tile_uris(root, base_url):
-        gc = _load_tile_content(uri, load_gltf)
+
+        def _loader(p):
+            cloud, _meta, ext = load_gltf_with_metadata(p)
+            if ext:
+                raise NotImplementedError(
+                    "loading EXT_gaussian_lidar attributes from a tileset source is "
+                    "not yet supported; pass a tile list instead"
+                )
+            return cloud
+
+        gc = _load_tile_content(uri, _loader)
         n = gc.num_points
         if n == 0:
             del gc
