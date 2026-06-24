@@ -196,7 +196,15 @@ class CameraModel:
             raise ValueError(
                 f"camera_model dict is missing required key(s) {missing}; got keys {sorted(d)}"
             )
-        return cls(type=str(d["type"]), parameters=dict(d["parameters"]))
+        raw_params = d["parameters"]
+        # Reject non-dict (incl. JSON ``null``) here so the error surfaces as
+        # a ValueError matching __post_init__, not the bare TypeError from
+        # ``dict(None)``.
+        if not isinstance(raw_params, dict):
+            raise ValueError(
+                f"camera_model.parameters must be a dict; got {type(raw_params).__name__}"
+            )
+        return cls(type=str(d["type"]), parameters=dict(raw_params))
 
 
 # ---------------------------------------------------------------------------

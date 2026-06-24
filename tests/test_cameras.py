@@ -124,6 +124,13 @@ def test_from_dict_missing_parameters_raises() -> None:
         CameraModel.from_dict({"type": "pinhole"})
 
 
+def test_from_dict_null_parameters_raises_valueerror() -> None:
+    # JSON ``null`` decodes to None; this used to crash with TypeError from
+    # ``dict(None)`` instead of the documented ValueError.
+    with pytest.raises(ValueError, match="parameters must be a dict"):
+        CameraModel.from_dict({"type": "pinhole", "parameters": None})
+
+
 # ---------------------------------------------------------------------------
 # CameraExtrinsics — T_sensor_rig form
 # ---------------------------------------------------------------------------
