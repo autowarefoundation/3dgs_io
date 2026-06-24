@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import spz
 
+from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME
 from .gltf_io import GltfSaveOptions, load_gltf_with_metadata, save_gltf
 from .tiles_io import (
     BoundingVolume,
@@ -181,11 +182,11 @@ def _save_from_tiles(
     children: list[dict[str, Any]] = []
     bbox_min: np.ndarray | None = None
     bbox_max: np.ndarray | None = None
-    save_tasks: list[tuple[spz.GaussianCloud, Path]] = []
+    save_tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]] = []
 
     for i, tile in enumerate(tiles):
         filename = f"tile_{i}.glb"
-        save_tasks.append((tile.cloud, output_dir / filename))
+        save_tasks.append((tile.cloud, output_dir / filename, None))
 
         child: dict[str, Any] = {
             "geometricError": tile.geometric_error,
@@ -257,7 +258,7 @@ def _save_from_cloud(
     unique_keys, inverse = np.unique(cell_keys, return_inverse=True)
 
     children: list[dict[str, Any]] = []
-    save_tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray]]] = []
+    save_tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]] = []
 
     for chunk_idx, _key in enumerate(unique_keys):
         mask = inverse == chunk_idx
@@ -439,26 +440,19 @@ def _save_from_tileset(
 
 
 def _save_gltf_parallel(
-    tasks: list[tuple[spz.GaussianCloud, Path]]
-    | list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray]]],
+    tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]],
     options: TilesetSaveOptions,
 ) -> None:
     """Save multiple GaussianClouds to GLB files in parallel.
 
-    Tasks may be ``(gc, path)`` or ``(gc, path, ext_attributes)`` tuples; the
-    latter passes per-tile ext arrays through to :func:`save_gltf`.
+    Each task is ``(gc, path, ext_attributes)``; pass ``None`` for
+    ``ext_attributes`` when the tile has no extension arrays.
     """
     with ThreadPoolExecutor(max_workers=options.max_workers) as executor:
-        futures = []
-        for task in tasks:
-            if len(task) == 3:
-                gc, path, ext = task
-                futures.append(
-                    executor.submit(save_gltf, gc, path, options.save_options, ext_attributes=ext)
-                )
-            else:
-                gc, path = task
-                futures.append(executor.submit(save_gltf, gc, path, options.save_options))
+        futures = [
+            executor.submit(save_gltf, gc, path, options.save_options, ext_attributes=ext)
+            for gc, path, ext in tasks
+        ]
         for future in futures:
             future.result()
 
@@ -507,8 +501,6 @@ def _write_tileset_json(
         gltf_exts_used.append(spz_ext)
         gltf_exts_required.append(spz_ext)
     if has_ext_attributes:
-        from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME
-
         gltf_exts_used.append(EXT_GAUSSIAN_LIDAR_NAME)
 
     root: dict[str, Any] = {

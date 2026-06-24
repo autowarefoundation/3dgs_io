@@ -401,9 +401,7 @@ def _filter_and_clamp(
         colors = colors[keep]
         if sh is not None:
             sh = sh[keep]
-        ext_out: dict[str, np.ndarray] = {k: v[keep] for k, v in ext_in.items()}
-    else:
-        ext_out = dict(ext_in)
+        ext_in = {k: v[keep] for k, v in ext_in.items()}
     if positions.shape[0] == 0:
         raise ValueError("All gaussians were filtered out — try relaxing options")
 
@@ -431,7 +429,7 @@ def _filter_and_clamp(
         sh=sh,
         sh_degree=int(gc.sh_degree) if sh is not None else 0,
         antialiased=bool(gc.antialiased),
-        ext_attrs=ext_out,
+        ext_attrs=ext_in,
     )
 
 
