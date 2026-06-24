@@ -27,6 +27,11 @@ from ._gltf_common import (
 from ._gltf_common import (
     write_file as _write_file,
 )
+from .ext_attributes import (
+    DEFAULT_LIDAR_SPECS,
+    EXT_GAUSSIAN_LIDAR_NAME,
+    ExtAttributeSpec,
+)
 from .metadata import DatasetType as DatasetType  # noqa: F401 – re-export for backward compat
 from .metadata import GlbMetadata, parse_metadata, serialize_metadata
 
@@ -65,6 +70,59 @@ def _inverse_sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# EXT_gaussian_lidar quantization helpers
+# ---------------------------------------------------------------------------
+
+_EXT_SPEC_BY_NAME: dict[str, ExtAttributeSpec] = {s.name: s for s in DEFAULT_LIDAR_SPECS}
+
+
+def _spec_for(name: str) -> ExtAttributeSpec:
+    return _EXT_SPEC_BY_NAME.get(name, ExtAttributeSpec(name=name, quantization="u8_sigmoid"))
+
+
+def _quantize_ext(arr: np.ndarray, spec: ExtAttributeSpec) -> bytes:
+    """Quantize a (N,) float array per ``spec`` for storage in a glTF accessor."""
+    arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+    if spec.quantization == "u8_sigmoid":
+        sig = 1.0 / (1.0 + np.exp(-arr.astype(np.float64)))
+        q = np.clip(np.round(sig * 255.0), 0.0, 255.0).astype(np.uint8)
+        return q.tobytes()
+    if spec.quantization == "u8_linear":
+        scaled = (arr.astype(np.float64) - spec.vmin) / max(spec.vmax - spec.vmin, 1e-12)
+        q = np.clip(np.round(scaled * 255.0), 0.0, 255.0).astype(np.uint8)
+        return q.tobytes()
+    raise ValueError(f"unsupported ext quantization {spec.quantization!r}")
+
+
+def _dequantize_ext(raw: np.ndarray, spec: ExtAttributeSpec) -> np.ndarray:
+    """Inverse of :func:`_quantize_ext` — returns float32 in the original (logit/raw) space."""
+    if spec.quantization == "u8_sigmoid":
+        q = raw.astype(np.float64) / 255.0
+        q = np.clip(q, 1e-9, 1.0 - 1e-9)
+        return np.log(q / (1.0 - q)).astype(np.float32)
+    if spec.quantization == "u8_linear":
+        q = raw.astype(np.float64) / 255.0
+        return (q * (spec.vmax - spec.vmin) + spec.vmin).astype(np.float32)
+    raise ValueError(f"unsupported ext quantization {spec.quantization!r}")
+
+
+def _validate_ext_attributes(
+    ext_attributes: dict[str, np.ndarray] | None,
+    n: int,
+) -> dict[str, np.ndarray]:
+    """Normalize ``ext_attributes`` to ``{name: (N,) float32}`` and validate shapes."""
+    if ext_attributes is None:
+        return {}
+    out: dict[str, np.ndarray] = {}
+    for name, arr in ext_attributes.items():
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+        if arr.shape[0] != n:
+            raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
+        out[name] = arr
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -73,41 +131,55 @@ def save_gltf(
     gc: spz.GaussianCloud,
     path: str | Path,
     options: GltfSaveOptions | None = None,
+    *,
+    ext_attributes: dict[str, np.ndarray] | None = None,
 ) -> None:
-    """Save a GaussianCloud to a KHR_gaussian_splatting compliant glTF/GLB file."""
+    """Save a GaussianCloud to a KHR_gaussian_splatting compliant glTF/GLB file.
+
+    ``ext_attributes`` is an optional ``{name: (N,) float32}`` mapping of
+    per-Gaussian scalars (e.g. ``lidar_intensity_raw``, ``lidar_raydrop_logit``).
+    Each is stored as a quantized accessor under the ``EXT_gaussian_lidar``
+    extension on the primitive, kept out of the ``attributes`` dict to avoid
+    GLSL-attribute-name issues in generic viewers.
+    """
     path = Path(path)
     if options is None:
         options = GltfSaveOptions()
 
+    ext_attrs = _validate_ext_attributes(ext_attributes, gc.num_points)
+
     if options.spz_compression:
-        _save_gltf_spz(gc, path, options)
+        _save_gltf_spz(gc, path, options, ext_attrs)
     else:
-        _save_gltf_standard(gc, path, options)
+        _save_gltf_standard(gc, path, options, ext_attrs)
 
 
 def load_gltf(path: str | Path) -> spz.GaussianCloud:
     """Load a GaussianCloud from a KHR_gaussian_splatting compliant glTF/GLB file."""
-    gc, _ = load_gltf_with_metadata(path)
+    gc, _, _ = load_gltf_with_metadata(path)
     return gc
 
 
 def load_gltf_with_metadata(
     path: str | Path,
-) -> tuple[spz.GaussianCloud, GlbMetadata | dict[str, Any] | None]:
-    """Load a GaussianCloud and its ``asset.extras`` metadata from a glTF/GLB file.
+) -> tuple[spz.GaussianCloud, GlbMetadata | dict[str, Any] | None, dict[str, np.ndarray]]:
+    """Load a GaussianCloud, ``asset.extras`` metadata, and ``EXT_gaussian_lidar`` arrays.
 
     Returns:
-        A tuple of ``(GaussianCloud, metadata)``.  *metadata* is a
-        :class:`GlbMetadata` when the extras match the schema, the raw dict
-        for legacy files, or ``None`` if no extras were present.
+        A 3-tuple ``(GaussianCloud, metadata, ext_attributes)``.
+
+        * *metadata* is a :class:`GlbMetadata` when the extras match the
+          schema, the raw dict for legacy files, or ``None`` if none.
+        * *ext_attributes* is a ``{name: (N,) float32}`` dict — empty if
+          the file carries no ``EXT_gaussian_lidar`` block.
     """
     path = Path(path)
 
     gltf_dict, buffer_data = _read_file(path)
 
-    gc = _parse_gaussian_cloud(gltf_dict, buffer_data)
+    gc, ext_attrs = _parse_gaussian_cloud(gltf_dict, buffer_data)
     raw_metadata = gltf_dict.get("asset", {}).get("extras")
-    return gc, parse_metadata(raw_metadata)
+    return gc, parse_metadata(raw_metadata), ext_attrs
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +187,12 @@ def load_gltf_with_metadata(
 # ---------------------------------------------------------------------------
 
 
-def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) -> None:
+def _save_gltf_standard(
+    gc: spz.GaussianCloud,
+    path: Path,
+    options: GltfSaveOptions,
+    ext_attributes: dict[str, np.ndarray],
+) -> None:
     n = gc.num_points
 
     positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
@@ -169,6 +246,14 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
                 data_list.append((data, _FLOAT, "VEC3", {}))
                 coef_idx += 1
 
+    # EXT_gaussian_lidar accessors (one SCALAR uint8 normalized accessor per attribute)
+    ext_name_to_accessor: dict[str, int] = {}
+    for name, arr in ext_attributes.items():
+        spec = _spec_for(name)
+        data = _quantize_ext(arr, spec)
+        ext_name_to_accessor[name] = len(data_list)
+        data_list.append((data, _UNSIGNED_BYTE, "SCALAR", {"normalized": True}))
+
     # Pack buffer
     buffer_data, offsets, lengths = _pack_buffer([d for d, _, _, _ in data_list])
     num_data = len(data_list)
@@ -190,9 +275,25 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
     if extras is not None:
         asset["extras"] = extras
 
+    extensions_used = [_EXTENSION_NAME]
+    primitive_extensions: dict[str, Any] = {
+        _EXTENSION_NAME: {
+            "kernel": "ellipse",
+            "colorSpace": "srgb_rec709_display",
+            "rotation": 2,
+            "scale": 3,
+            "opacity": 4,
+            # 5..(5+sh_count-1) are SH; ext attrs come after.
+            "sh": list(range(5, 5 + max(0, num_data - 5 - len(ext_name_to_accessor)))),
+        }
+    }
+    if ext_name_to_accessor:
+        primitive_extensions[EXT_GAUSSIAN_LIDAR_NAME] = dict(ext_name_to_accessor)
+        extensions_used.append(EXT_GAUSSIAN_LIDAR_NAME)
+
     gltf_dict: dict = {
         "asset": asset,
-        "extensionsUsed": [_EXTENSION_NAME],
+        "extensionsUsed": extensions_used,
         "scene": 0,
         "scenes": [{"nodes": [0]}],
         "nodes": [{"mesh": 0}],
@@ -205,16 +306,7 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
                             "POSITION": 0,
                             "COLOR_0": 1,
                         },
-                        "extensions": {
-                            _EXTENSION_NAME: {
-                                "kernel": "ellipse",
-                                "colorSpace": "srgb_rec709_display",
-                                "rotation": 2,
-                                "scale": 3,
-                                "opacity": 4,
-                                "sh": list(range(5, num_data)),
-                            }
-                        },
+                        "extensions": primitive_extensions,
                     }
                 ]
             }
@@ -235,7 +327,12 @@ def _save_gltf_standard(gc: spz.GaussianCloud, path: Path, options: GltfSaveOpti
 # ---------------------------------------------------------------------------
 
 
-def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) -> None:
+def _save_gltf_spz(
+    gc: spz.GaussianCloud,
+    path: Path,
+    options: GltfSaveOptions,
+    ext_attributes: dict[str, np.ndarray],
+) -> None:
     n = gc.num_points
 
     positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
@@ -247,11 +344,24 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
 
     spz_bytes = _compress_to_spz_bytes(gc)
 
-    # Buffer contains only the SPZ blob.  CesiumJS requires that accessors do
-    # NOT carry a ``bufferView`` when SPZ compression is active – the decoded
-    # SPZ data supplies every attribute.  Accessors are "virtual": they declare
-    # types / counts so that loaders know what to expect from the decoded blob.
-    buffer_data = spz_bytes
+    # The buffer is the SPZ blob optionally followed by EXT_gaussian_lidar
+    # accessor payloads (4-byte aligned per bufferView).
+    ext_chunks: list[tuple[str, bytes]] = []
+    for name, arr in ext_attributes.items():
+        ext_chunks.append((name, _quantize_ext(arr, _spec_for(name))))
+
+    ext_bytes_packed, ext_offsets, ext_lengths = _pack_buffer([b for _, b in ext_chunks])
+
+    # The SPZ blob lives at offset 0; ext payloads come after (also at
+    # 4-byte alignment, since len(spz_bytes) may not be a multiple of 4).
+    spz_padding = (4 - len(spz_bytes) % 4) % 4
+    buffer_data = spz_bytes + b"\x00" * spz_padding + ext_bytes_packed
+    ext_buffer_offset = len(spz_bytes) + spz_padding
+
+    buffer_views: list[dict] = [
+        {"buffer": 0, "byteLength": len(spz_bytes)},
+    ]
+    ext_name_to_accessor: dict[str, int] = {}
 
     # Virtual accessors (no bufferView – data comes from SPZ decompression)
     accessors: list[dict] = [
@@ -296,6 +406,30 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
             sh_accessor_indices.append(acc_idx)
             acc_idx += 1
 
+    # EXT_gaussian_lidar accessors: each backed by a real bufferView pointing
+    # into the packed ext block. These are concrete (non-virtual) because
+    # SPZ decompression does not produce them.
+    for idx, (name, _) in enumerate(ext_chunks):
+        bv_idx = len(buffer_views)
+        buffer_views.append(
+            {
+                "buffer": 0,
+                "byteOffset": ext_buffer_offset + ext_offsets[idx],
+                "byteLength": ext_lengths[idx],
+            }
+        )
+        accessors.append(
+            {
+                "bufferView": bv_idx,
+                "componentType": _UNSIGNED_BYTE,
+                "count": n,
+                "type": "SCALAR",
+                "normalized": True,
+            }
+        )
+        ext_name_to_accessor[name] = acc_idx
+        acc_idx += 1
+
     # CesiumJS's loadPrimitive() only iterates gltfPrimitive.attributes to
     # create vertex buffer loaders.  For SPZ GLBs every Gaussian attribute
     # must appear in the attributes dict with underscore-prefixed semantics
@@ -339,10 +473,17 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
     if extras is not None:
         asset["extras"] = extras
 
+    extensions_used = [_EXTENSION_NAME, _SPZ_EXTENSION_NAME]
+    extensions_required = [_EXTENSION_NAME, _SPZ_EXTENSION_NAME]
+    primitive_extensions: dict[str, Any] = {_EXTENSION_NAME: gs_ext}
+    if ext_name_to_accessor:
+        primitive_extensions[EXT_GAUSSIAN_LIDAR_NAME] = dict(ext_name_to_accessor)
+        extensions_used.append(EXT_GAUSSIAN_LIDAR_NAME)
+
     gltf_dict: dict = {
         "asset": asset,
-        "extensionsUsed": [_EXTENSION_NAME, _SPZ_EXTENSION_NAME],
-        "extensionsRequired": [_EXTENSION_NAME, _SPZ_EXTENSION_NAME],
+        "extensionsUsed": extensions_used,
+        "extensionsRequired": extensions_required,
         "scene": 0,
         "scenes": [{"nodes": [0]}],
         "nodes": [{"mesh": 0}],
@@ -352,18 +493,14 @@ def _save_gltf_spz(gc: spz.GaussianCloud, path: Path, options: GltfSaveOptions) 
                     {
                         "mode": 0,
                         "attributes": attributes,
-                        "extensions": {
-                            _EXTENSION_NAME: gs_ext,
-                        },
+                        "extensions": primitive_extensions,
                     }
                 ]
             }
         ],
         "accessors": accessors,
-        "bufferViews": [
-            {"buffer": 0, "byteLength": len(spz_bytes)},
-        ],
-        "buffers": [{"byteLength": len(spz_bytes)}],
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(buffer_data)}],
     }
 
     _write_file(path, gltf_dict, buffer_data)
@@ -421,10 +558,33 @@ def _sh_degree_from_array(num_points: int, sh: np.ndarray) -> int:
     return 0
 
 
-def _parse_gaussian_cloud(gltf_dict: dict, buffer_data: bytes) -> spz.GaussianCloud:
+def _parse_ext_attributes(
+    primitive: dict,
+    gltf_dict: dict,
+    buffer_data: bytes,
+) -> dict[str, np.ndarray]:
+    """Parse the ``EXT_gaussian_lidar`` block, returning ``{name: float32 (N,)}``."""
+    ext_block = primitive.get("extensions", {}).get(EXT_GAUSSIAN_LIDAR_NAME)
+    if not ext_block:
+        return {}
+
+    accessors = gltf_dict["accessors"]
+    buffer_views = gltf_dict["bufferViews"]
+    out: dict[str, np.ndarray] = {}
+    for name, acc_idx in ext_block.items():
+        raw = _read_accessor(accessors[acc_idx], buffer_views, buffer_data)
+        out[name] = _dequantize_ext(raw, _spec_for(name))
+    return out
+
+
+def _parse_gaussian_cloud(
+    gltf_dict: dict, buffer_data: bytes
+) -> tuple[spz.GaussianCloud, dict[str, np.ndarray]]:
     primitive = _find_gaussian_primitive(gltf_dict)
     if primitive is None:
         raise ValueError("No KHR_gaussian_splatting primitive found in glTF")
+
+    ext_attrs = _parse_ext_attributes(primitive, gltf_dict, buffer_data)
 
     # Check for SPZ compression sub-extension
     ext = primitive.get("extensions", {}).get(_EXTENSION_NAME, {})
@@ -436,9 +596,9 @@ def _parse_gaussian_cloud(gltf_dict: dict, buffer_data: bytes) -> spz.GaussianCl
         offset = bv.get("byteOffset", 0)
         length = bv["byteLength"]
         spz_data = buffer_data[offset : offset + length]
-        return _decompress_from_spz_bytes(spz_data)
+        return _decompress_from_spz_bytes(spz_data), ext_attrs
 
-    return _parse_standard(primitive, gltf_dict, buffer_data)
+    return _parse_standard(primitive, gltf_dict, buffer_data), ext_attrs
 
 
 def _parse_standard(

@@ -44,7 +44,8 @@ from typing import Any, NamedTuple
 import numpy as np
 import spz
 
-from .gltf_io import load_gltf
+from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
+from .gltf_io import load_gltf_with_metadata
 from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
@@ -229,8 +230,49 @@ def _concat_clouds(clouds: list[spz.GaussianCloud]) -> spz.GaussianCloud:
     return out
 
 
-def _load_from_tileset(tileset_path: Path) -> tuple[spz.GaussianCloud, list[float]]:
-    """Parse ``tileset.json`` and return ``(cloud_in_root_local_frame, root_transform)``."""
+def _concat_ext_attrs(
+    ext_per_leaf: list[dict[str, np.ndarray]],
+    counts: list[int],
+) -> dict[str, np.ndarray]:
+    """Concatenate per-leaf ext_attribute dicts in leaf-walk order.
+
+    Leaves missing a key contribute zeros for the matching count, so the
+    output arrays always align positionally with the concatenated cloud.
+    Returns an empty dict if no leaf carries any ext attribute.
+    """
+    keys: set[str] = set()
+    for ext in ext_per_leaf:
+        keys.update(ext.keys())
+    if not keys:
+        return {}
+    out: dict[str, np.ndarray] = {}
+    for key in keys:
+        parts: list[np.ndarray] = []
+        for ext, count in zip(ext_per_leaf, counts, strict=True):
+            arr = ext.get(key)
+            if arr is None:
+                parts.append(np.zeros(count, dtype=np.float32))
+            else:
+                arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+                if arr.shape[0] != count:
+                    raise ValueError(
+                        f"ext attribute {key!r} has {arr.shape[0]} entries, expected {count}"
+                    )
+                parts.append(arr)
+        out[key] = np.concatenate(parts).astype(np.float32)
+    return out
+
+
+def _load_from_tileset(
+    tileset_path: Path,
+) -> tuple[spz.GaussianCloud, list[float], dict[str, np.ndarray]]:
+    """Parse ``tileset.json`` and return ``(cloud, root_transform, ext_attrs)``.
+
+    ``ext_attrs`` aggregates per-Gaussian ``EXT_gaussian_lidar`` arrays from
+    every input GLB, threaded through concatenation in the same leaf-walk
+    order as the gaussians (so ``attr[i] ↔ gaussian[i]`` after concat).
+    Empty dict if no input GLB carries any ext attribute.
+    """
     base = tileset_path.parent
     # ``utf-8-sig`` tolerates the optional BOM some editors prepend.
     doc = json.loads(tileset_path.read_text(encoding="utf-8-sig"))
@@ -257,20 +299,25 @@ def _load_from_tileset(tileset_path: Path) -> tuple[spz.GaussianCloud, list[floa
         raise ValueError(f"{tileset_path}: no tile content found")
 
     clouds: list[spz.GaussianCloud] = []
+    ext_per_leaf: list[dict[str, np.ndarray]] = []
+    counts: list[int] = []
     for uri, transform in leaves:
         if "://" in uri:
             raise ValueError(f"Remote tile content not supported: {uri!r}")
         content_path = (base / uri).resolve()
-        ext = content_path.suffix.lower()
-        if ext not in (".glb", ".gltf"):
+        suffix = content_path.suffix.lower()
+        if suffix not in (".glb", ".gltf"):
             raise ValueError(f"Only glTF tile content is supported; got {content_path}")
-        gc = load_gltf(content_path)
+        gc, _, leaf_ext = load_gltf_with_metadata(content_path)
         if not np.allclose(transform, np.eye(4)):
             gc = _apply_transform_to_cloud(gc, transform)
         clouds.append(gc)
+        ext_per_leaf.append(leaf_ext)
+        counts.append(gc.num_points)
 
     cloud = clouds[0] if len(clouds) == 1 else _concat_clouds(clouds)
-    return cloud, root_transform_list
+    ext_attrs = _concat_ext_attrs(ext_per_leaf, counts)
+    return cloud, root_transform_list, ext_attrs
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +336,7 @@ class _CloudArrays(NamedTuple):
     sh: np.ndarray | None  # (n, per_ch, 3) float32 or None
     sh_degree: int
     antialiased: bool
+    ext_attrs: dict[str, np.ndarray]  # {name: (n,) float32} — parallel to positions
 
     @property
     def n(self) -> int:
@@ -299,8 +347,16 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneUsdzOptions) -> _CloudArrays:
-    """Drop non-finite / out-of-bbox / low-opacity gaussians and clamp scales."""
+def _filter_and_clamp(
+    gc: spz.GaussianCloud,
+    options: SceneUsdzOptions,
+    ext_attrs: dict[str, np.ndarray] | None = None,
+) -> _CloudArrays:
+    """Drop non-finite / out-of-bbox / low-opacity gaussians and clamp scales.
+
+    ``ext_attrs`` (if given) is sliced by the same ``keep`` mask so that
+    ``attr[i] ↔ gaussian[i]`` continues to hold after filtering.
+    """
     n = gc.num_points
     if n == 0:
         raise ValueError("Input GaussianCloud is empty")
@@ -330,6 +386,11 @@ def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneUsdzOptions) -> _Clou
         opacity = _sigmoid(alphas)
         keep = keep & (opacity >= options.opacity_threshold)
 
+    ext_in: dict[str, np.ndarray] = ext_attrs or {}
+    for name, arr in ext_in.items():
+        if arr.shape[0] != n:
+            raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
+
     if not keep.all():
         positions = positions[keep]
         rotations = rotations[keep]
@@ -338,6 +399,9 @@ def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneUsdzOptions) -> _Clou
         colors = colors[keep]
         if sh is not None:
             sh = sh[keep]
+        ext_out: dict[str, np.ndarray] = {k: v[keep] for k, v in ext_in.items()}
+    else:
+        ext_out = dict(ext_in)
     if positions.shape[0] == 0:
         raise ValueError("All gaussians were filtered out — try relaxing options")
 
@@ -365,6 +429,7 @@ def _filter_and_clamp(gc: spz.GaussianCloud, options: SceneUsdzOptions) -> _Clou
         sh=sh,
         sh_degree=int(gc.sh_degree) if sh is not None else 0,
         antialiased=bool(gc.antialiased),
+        ext_attrs=ext_out,
     )
 
 
@@ -397,7 +462,11 @@ def _aabb_to_3dtiles_box(bbox_min: np.ndarray, bbox_max: np.ndarray) -> list[flo
 
 def _split_cloud_into_chunks(
     arrays: _CloudArrays, options: SceneUsdzOptions
-) -> tuple[list[spz.GaussianCloud], list[tuple[np.ndarray, np.ndarray]]]:
+) -> tuple[
+    list[spz.GaussianCloud],
+    list[tuple[np.ndarray, np.ndarray]],
+    list[dict[str, np.ndarray]],
+]:
     positions = arrays.positions
     bbox_min = positions.min(axis=0)
     bbox_max = positions.max(axis=0)
@@ -412,6 +481,7 @@ def _split_cloud_into_chunks(
     has_sh = arrays.sh is not None and arrays.sh.shape[1] > 0
     chunks: list[spz.GaussianCloud] = []
     bounds: list[tuple[np.ndarray, np.ndarray]] = []
+    chunk_ext: list[dict[str, np.ndarray]] = []
     for group in groups:
         for sub_idx in _split_oversized_chunk(group, options.max_points_per_chunk):
             c = spz.GaussianCloud()
@@ -430,7 +500,10 @@ def _split_cloud_into_chunks(
             chunks.append(c)
             p = positions[sub_idx]
             bounds.append((p.min(axis=0), p.max(axis=0)))
-    return chunks, bounds
+            chunk_ext.append(
+                {name: arr[sub_idx].astype(np.float32) for name, arr in arrays.ext_attrs.items()}
+            )
+    return chunks, bounds, chunk_ext
 
 
 def _build_tileset(
@@ -438,22 +511,33 @@ def _build_tileset(
     bounds: list[tuple[np.ndarray, np.ndarray]],
     options: SceneUsdzOptions,
     root_transform: list[float],
+    chunk_ext: list[dict[str, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
+    chunk_ext = chunk_ext or [{} for _ in sub_clouds]
+    has_any_ext = any(bool(e) for e in chunk_ext)
+
     children: list[dict[str, Any]] = []
     bbox_min_all = bounds[0][0].copy()
     bbox_max_all = bounds[0][1].copy()
-    for i, (sub, (bmin, bmax)) in enumerate(zip(sub_clouds, bounds, strict=True)):
+    for i, (sub, (bmin, bmax), ext) in enumerate(zip(sub_clouds, bounds, chunk_ext, strict=True)):
         bbox_min_all = np.minimum(bbox_min_all, bmin)
         bbox_max_all = np.maximum(bbox_max_all, bmax)
+        content_extensions: dict[str, Any] = {
+            _EXT_3DGS_SPZ: {"format": "spz/1", "n_points": int(sub.num_points)},
+        }
+        if ext:
+            content_extensions[EXT_GAUSSIAN_LIDAR_NAME] = {
+                "uri": f"chunks/chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}",
+                "count": int(sub.num_points),
+                "attributes": sorted(ext.keys()),
+            }
         children.append(
             {
                 "boundingVolume": {"box": _aabb_to_3dtiles_box(bmin, bmax)},
                 "geometricError": 0.0,
                 "content": {
                     "uri": f"chunks/chunk_{i:06d}.spz",
-                    "extensions": {
-                        _EXT_3DGS_SPZ: {"format": "spz/1", "n_points": int(sub.num_points)},
-                    },
+                    "extensions": content_extensions,
                 },
             }
         )
@@ -464,10 +548,14 @@ def _build_tileset(
         "transform": root_transform,
         "children": children,
     }
+    extensions_required = [_EXT_3DGS_SPZ]
+    extensions_used = [_EXT_3DGS_SPZ]
+    if has_any_ext:
+        extensions_used.append(EXT_GAUSSIAN_LIDAR_NAME)
     return {
         "asset": {"version": "1.0", "tilesetVersion": "splatsim-spz/1.0"},
-        "extensionsRequired": [_EXT_3DGS_SPZ],
-        "extensionsUsed": [_EXT_3DGS_SPZ],
+        "extensionsRequired": extensions_required,
+        "extensionsUsed": extensions_used,
         "geometricError": float(options.geometric_error),
         "root": root,
     }
@@ -535,6 +623,26 @@ def _compose_scene_json(
     source_tileset: str,
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    gaussians: dict[str, Any] = {
+        "tileset": "tileset.json",
+        "tile_content_format": "spz/1",
+        "n_gaussians": arrays.n,
+        "sh_degree": arrays.sh_degree,
+        "filter": {
+            "min_scale": float(options.min_scale),
+            "max_aspect_ratio": float(options.max_aspect_ratio),
+            "opacity_threshold": float(options.opacity_threshold),
+            "bbox_radius": (
+                None if math.isinf(options.bbox_radius) else float(options.bbox_radius)
+            ),
+        },
+    }
+    if arrays.ext_attrs:
+        gaussians["ext_attributes"] = {
+            "extension": EXT_GAUSSIAN_LIDAR_NAME,
+            "sidecar_suffix": LIDAR_SIDECAR_SUFFIX,
+            "attributes": sorted(arrays.ext_attrs.keys()),
+        }
     return {
         "schema": _SCENE_SCHEMA,
         "producer": {
@@ -548,20 +656,7 @@ def _compose_scene_json(
             "units": "meters",
             "root_transform": root_transform,
         },
-        "gaussians": {
-            "tileset": "tileset.json",
-            "tile_content_format": "spz/1",
-            "n_gaussians": arrays.n,
-            "sh_degree": arrays.sh_degree,
-            "filter": {
-                "min_scale": float(options.min_scale),
-                "max_aspect_ratio": float(options.max_aspect_ratio),
-                "opacity_threshold": float(options.opacity_threshold),
-                "bbox_radius": (
-                    None if math.isinf(options.bbox_radius) else float(options.bbox_radius)
-                ),
-            },
-        },
+        "gaussians": gaussians,
         "extras": extras,
         "render_defaults": {
             "exposure": float(options.exposure),
@@ -630,10 +725,10 @@ def save_scene_usdz(
     if options is None:
         options = SceneUsdzOptions()
 
-    cloud, root_transform = _load_from_tileset(tileset_path)
-    arrays = _filter_and_clamp(cloud, options)
-    sub_clouds, bounds = _split_cloud_into_chunks(arrays, options)
-    tileset_doc = _build_tileset(sub_clouds, bounds, options, root_transform)
+    cloud, root_transform, source_ext_attrs = _load_from_tileset(tileset_path)
+    arrays = _filter_and_clamp(cloud, options, source_ext_attrs)
+    sub_clouds, bounds, chunk_ext = _split_cloud_into_chunks(arrays, options)
+    tileset_doc = _build_tileset(sub_clouds, bounds, options, root_transform, chunk_ext)
 
     extras_entries = _collect_extras_entries(extras)
     archive_paths = {arc for arc, _ in extras_entries}
@@ -679,6 +774,14 @@ def save_scene_usdz(
             save_spz(sub, cp)
             chunk_entries.append((f"chunks/chunk_{i:06d}.spz", cp))
 
+        ext_chunk_entries: list[tuple[str, Path]] = []
+        for i, ext in enumerate(chunk_ext):
+            if not ext:
+                continue
+            sidecar = td_path / f"chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}"
+            sidecar.write_bytes(encode_lidar_sidecar(ext, count=int(sub_clouds[i].num_points)))
+            ext_chunk_entries.append((f"chunks/chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}", sidecar))
+
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
@@ -688,6 +791,8 @@ def save_scene_usdz(
             if rig_trajectories_payload is not None:
                 _zip_write_bytes(zf, "rig_trajectories.json", rig_trajectories_payload)
             for arc, src in chunk_entries:
+                zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
+            for arc, src in ext_chunk_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
             for arc, src in extras_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
