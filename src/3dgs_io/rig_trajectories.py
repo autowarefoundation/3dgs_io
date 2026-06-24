@@ -44,8 +44,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
-from ._quat import quat_from_rotation_matrix
 from .cameras import Camera, CameraExtrinsics, CameraModel
 
 __all__ = [
@@ -227,9 +227,10 @@ _Quaternion = tuple[float, float, float, float]
 def _pose_from_matrix(m: np.ndarray) -> tuple[_Translation, _Quaternion]:
     """Extract translation + xyzw quaternion from a 4×4 row-major rigid transform."""
     t = m[:3, 3]
+    x, y, z, w = Rotation.from_matrix(m[:3, :3]).as_quat()
     return (
         (float(t[0]), float(t[1]), float(t[2])),
-        quat_from_rotation_matrix(m[:3, :3]),
+        (float(x), float(y), float(z), float(w)),
     )
 
 

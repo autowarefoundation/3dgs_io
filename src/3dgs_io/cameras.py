@@ -29,8 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-
-from ._quat import quat_from_rotation_matrix
+from scipy.spatial.transform import Rotation
 
 __all__ = [
     "Camera",
@@ -255,8 +254,11 @@ class CameraExtrinsics:
         """Build an extrinsics from a 4×4 row-major sensor-to-rig transform."""
         a = np.asarray(m, dtype=np.float64).reshape(4, 4)
         t = a[:3, 3]
-        x, y, z, w = quat_from_rotation_matrix(a[:3, :3])
-        return cls(translation=(float(t[0]), float(t[1]), float(t[2])), rotation=(x, y, z, w))
+        x, y, z, w = Rotation.from_matrix(a[:3, :3]).as_quat()
+        return cls(
+            translation=(float(t[0]), float(t[1]), float(t[2])),
+            rotation=(float(x), float(y), float(z), float(w)),
+        )
 
     # ------------ (de)serialisation ------------
 
