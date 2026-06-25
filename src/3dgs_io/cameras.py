@@ -25,6 +25,7 @@ extrinsics with the rig's pose at the relevant timestamp::
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -57,6 +58,35 @@ _REQUIRED_INTRINSIC_KEYS: dict[str, tuple[str, ...]] = {
         "pixeldist_to_angle_poly",
         "angle_to_pixeldist_poly",
     ),
+}
+
+# Optional (non-required) intrinsic-parameter keys per camera-model ``type``.
+# Together with :data:`_REQUIRED_INTRINSIC_KEYS` these define the full set of
+# keys :meth:`CameraModel.with_intrinsics` will accept.
+_OPTIONAL_INTRINSIC_KEYS: dict[str, tuple[str, ...]] = {
+    "ftheta": ("shutter_type", "reference_poly", "external_distortion_parameters"),
+}
+
+
+def _coerce_xy_pair(value: Any) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"principal_point must be a 2-element list/tuple; got {value!r}")
+    return [float(value[0]), float(value[1])]
+
+
+# Per-key coercion for :meth:`CameraModel.with_intrinsics`. Keys not listed
+# here are stored verbatim (e.g. ``external_distortion_parameters``).
+_INTRINSIC_COERCERS: dict[str, Any] = {
+    "fx": float,
+    "fy": float,
+    "cx": float,
+    "cy": float,
+    "distortion_coeffs": lambda v: [float(c) for c in v],
+    "pixeldist_to_angle_poly": lambda v: [float(c) for c in v],
+    "angle_to_pixeldist_poly": lambda v: [float(c) for c in v],
+    "principal_point": _coerce_xy_pair,
+    "shutter_type": str,
+    "reference_poly": str,
 }
 
 
@@ -182,6 +212,45 @@ class CameraModel:
                 "external_distortion_parameters": external_distortion_parameters,
             },
         )
+
+    # ------------ intrinsic edits ------------
+
+    def with_intrinsics(self, **updates: Any) -> CameraModel:
+        """Return a copy of this model with the given intrinsic fields replaced.
+
+        Accepts ``width`` / ``height`` (mapped jointly to ``resolution``) plus
+        any parameter key valid for the model's ``type``. Coercion mirrors the
+        per-type constructors (``pinhole`` / ``opencv`` / ``ftheta``) so a value
+        coming in as ``int`` lands as ``float`` for ``fx``/``fy`` etc. Unknown
+        keys for the model's ``type`` raise ``ValueError`` rather than silently
+        attaching to ``parameters``. The returned model fully owns its
+        ``parameters`` (nested lists/dicts are deep-copied) so mutating it
+        cannot affect the original.
+        """
+        new_params: dict[str, Any] = copy.deepcopy(self.parameters)
+        width = updates.pop("width", None)
+        height = updates.pop("height", None)
+        if width is not None or height is not None:
+            cur_w, cur_h = self.resolution
+            new_params["resolution"] = [
+                int(width if width is not None else cur_w),
+                int(height if height is not None else cur_h),
+            ]
+
+        allowed = set(_REQUIRED_INTRINSIC_KEYS.get(self.type, ("resolution",)))
+        allowed |= set(_OPTIONAL_INTRINSIC_KEYS.get(self.type, ()))
+        unknown = sorted(set(updates) - allowed)
+        if unknown:
+            raise ValueError(
+                f"camera_model(type={self.type!r}) does not accept intrinsic key(s) "
+                f"{unknown}; allowed keys (excluding width/height): {sorted(allowed)}"
+            )
+
+        for key, value in updates.items():
+            coercer = _INTRINSIC_COERCERS.get(key)
+            new_params[key] = coercer(value) if coercer is not None else value
+
+        return CameraModel(type=self.type, parameters=new_params)
 
     # ------------ (de)serialisation ------------
 

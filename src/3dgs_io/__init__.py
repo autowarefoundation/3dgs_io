@@ -32,9 +32,11 @@ from .metadata import (
 from .rig_trajectories import (
     RigPose,
     RigTrajectory,
+    load_rig_trajectories_doc,
     parse_alpasim_rig_trajectories,
     parse_rig_trajectories,
     serialize_rig_trajectories,
+    update_camera_intrinsics,
 )
 from .scene_usdz import (
     SceneUsdzOptions,
@@ -93,12 +95,14 @@ __all__ = [
     "TrainingData",
     "decode_lidar_sidecar",
     "encode_lidar_sidecar",
+    "load_rig_trajectories_doc",
     "parse_alpasim_rig_trajectories",
     "parse_alpasim_sequence_tracks",
     "parse_rig_trajectories",
     "parse_tracks",
     "serialize_rig_trajectories",
     "serialize_tracks",
+    "update_camera_intrinsics",
     "save_scene_usdz",
     "load_gltf",
     "load_gltf_with_metadata",

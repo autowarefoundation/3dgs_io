@@ -21,7 +21,7 @@ import math
 import sys
 from pathlib import Path
 
-from .rig_trajectories import parse_alpasim_rig_trajectories, parse_rig_trajectories
+from .rig_trajectories import load_rig_trajectories_doc
 from .scene_usdz import (
     SceneUsdzOptions,
     _result_summary,
@@ -165,15 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.rig_trajectories is not None:
         rig_path = Path(args.rig_trajectories).expanduser()
         rig_doc = json.loads(rig_path.read_text(encoding="utf-8-sig"))
-        if not isinstance(rig_doc, dict):
-            raise ValueError(
-                f"--rig-trajectories: {rig_path} top-level value must be a JSON "
-                f"object, got {type(rig_doc).__name__}"
-            )
-        if rig_doc.get("schema") == "splatsim.rig_trajectories/v1":
-            rig_trajectories = parse_rig_trajectories(rig_doc)
-        else:
-            rig_trajectories = parse_alpasim_rig_trajectories(rig_doc)
+        rig_trajectories = load_rig_trajectories_doc(rig_doc)
     result = save_scene_usdz(
         args.tileset,
         args.out_usdz,

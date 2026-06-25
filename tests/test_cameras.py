@@ -235,3 +235,112 @@ def test_camera_from_dict_missing_keys_raises_clearly() -> None:
     del d["T_sensor_rig"]
     with pytest.raises(ValueError, match=r"missing required key.*T_sensor_rig"):
         Camera.from_dict(d)
+
+
+# ---------------------------------------------------------------------------
+# CameraModel.with_intrinsics
+# ---------------------------------------------------------------------------
+
+
+def test_with_intrinsics_pinhole_updates_focal_and_principal() -> None:
+    m = CameraModel.pinhole(width=1920, height=1080, fx=500, fy=500, cx=960, cy=540)
+    out = m.with_intrinsics(fx=1234.5, cx=961.0)
+    # Original is untouched.
+    assert m.parameters["fx"] == 500.0
+    assert m.parameters["cx"] == 960.0
+    # New instance carries the updates with float coercion.
+    assert out.type == "pinhole"
+    assert out.parameters["fx"] == 1234.5
+    assert out.parameters["fy"] == 500.0
+    assert out.parameters["cx"] == 961.0
+    assert out.parameters["cy"] == 540.0
+    assert out.resolution == (1920, 1080)
+
+
+def test_with_intrinsics_width_height_remap_resolution() -> None:
+    m = CameraModel.pinhole(width=1920, height=1080, fx=500, fy=500, cx=960, cy=540)
+    out_w = m.with_intrinsics(width=3840)
+    assert out_w.resolution == (3840, 1080)
+    out_both = m.with_intrinsics(width=640, height=480)
+    assert out_both.resolution == (640, 480)
+
+
+def test_with_intrinsics_opencv_replaces_distortion() -> None:
+    m = CameraModel.opencv(
+        width=1920,
+        height=1080,
+        fx=1234.5,
+        fy=1234.5,
+        cx=960,
+        cy=540,
+        distortion_coeffs=[0.01, -0.002, 0.0, 0.0, 0.0],
+    )
+    out = m.with_intrinsics(distortion_coeffs=[0.05, -0.01, 0.0, 0.0])
+    assert out.parameters["distortion_coeffs"] == [0.05, -0.01, 0.0, 0.0]
+
+
+def test_with_intrinsics_rejects_keys_outside_model_type() -> None:
+    m = CameraModel.pinhole(width=1920, height=1080, fx=500, fy=500, cx=960, cy=540)
+    with pytest.raises(ValueError, match="does not accept intrinsic key"):
+        m.with_intrinsics(distortion_coeffs=[0.0])
+    with pytest.raises(ValueError, match="does not accept intrinsic key"):
+        m.with_intrinsics(principal_point=(1.0, 2.0))
+
+
+def test_with_intrinsics_ftheta_updates_principal_point_and_polys() -> None:
+    m = CameraModel.ftheta(
+        width=1920,
+        height=1080,
+        principal_point=(961.3, 744.8),
+        pixeldist_to_angle_poly=[0.0, 1e-3, 4e-9],
+        angle_to_pixeldist_poly=[0.0, 938.5, -1.3],
+    )
+    out = m.with_intrinsics(
+        principal_point=(960.0, 740.0),
+        pixeldist_to_angle_poly=[0.0, 1.5e-3],
+        shutter_type="GLOBAL",
+    )
+    assert out.parameters["principal_point"] == [960.0, 740.0]
+    assert out.parameters["pixeldist_to_angle_poly"] == [0.0, 1.5e-3]
+    assert out.parameters["shutter_type"] == "GLOBAL"
+
+
+def test_with_intrinsics_principal_point_must_be_length_2() -> None:
+    m = CameraModel.ftheta(
+        width=1920,
+        height=1080,
+        principal_point=(961.3, 744.8),
+        pixeldist_to_angle_poly=[0.0, 1e-3],
+        angle_to_pixeldist_poly=[0.0, 938.5],
+    )
+    with pytest.raises(ValueError, match="principal_point must be a 2-element"):
+        m.with_intrinsics(principal_point=(1.0, 2.0, 3.0))
+
+
+def test_with_intrinsics_principal_point_rejects_non_sequence() -> None:
+    m = CameraModel.ftheta(
+        width=1920,
+        height=1080,
+        principal_point=(961.3, 744.8),
+        pixeldist_to_angle_poly=[0.0, 1e-3],
+        angle_to_pixeldist_poly=[0.0, 938.5],
+    )
+    with pytest.raises(ValueError, match="principal_point must be a 2-element"):
+        m.with_intrinsics(principal_point=42)
+
+
+def test_with_intrinsics_returns_deep_copy_of_distortion_coeffs() -> None:
+    m = CameraModel.opencv(
+        width=1920,
+        height=1080,
+        fx=1234.5,
+        fy=1234.5,
+        cx=960,
+        cy=540,
+        distortion_coeffs=[0.01, -0.002, 0.0, 0.0, 0.0],
+    )
+    # Update only fx; distortion_coeffs are unchanged but must NOT alias the
+    # original list (mutating one mustn't mutate the other).
+    out = m.with_intrinsics(fx=1500.0)
+    out.parameters["distortion_coeffs"].append(0.999)
+    assert m.parameters["distortion_coeffs"] == [0.01, -0.002, 0.0, 0.0, 0.0]
