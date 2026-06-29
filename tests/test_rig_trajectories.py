@@ -12,12 +12,16 @@ import numpy as np
 import pytest
 
 _mod = importlib.import_module("3dgs_io")
+Camera = _mod.Camera
+CameraExtrinsics = _mod.CameraExtrinsics
+CameraModel = _mod.CameraModel
 RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
 parse_alpasim_rig_trajectories = _mod.parse_alpasim_rig_trajectories
 parse_rig_trajectories = _mod.parse_rig_trajectories
 save_scene_usdz = _mod.save_scene_usdz
 serialize_rig_trajectories = _mod.serialize_rig_trajectories
+update_camera_intrinsics = _mod.update_camera_intrinsics
 
 
 def _read_rig_trajectories_from_usdz(path: Path) -> list[RigTrajectory]:
@@ -372,3 +376,78 @@ def test_cli_rig_trajectories_flag_accepts_alpasim_format(
     assert len(recovered) == 1
     assert recovered[0].rig_id == "ego"
     assert recovered[0].poses[1].translation == (1.0, 2.0, 3.0)
+
+
+# ---------------------------------------------------------------------------
+# update_camera_intrinsics
+# ---------------------------------------------------------------------------
+
+
+def _rig_with_camera(rig_id: str, camera_name: str, **model_kwargs: float) -> RigTrajectory:
+    defaults = dict(width=1920, height=1080, fx=500.0, fy=500.0, cx=960.0, cy=540.0)
+    defaults.update(model_kwargs)
+    return RigTrajectory(
+        rig_id=rig_id,
+        poses=[_pose(0)],
+        cameras=[
+            Camera(
+                name=camera_name,
+                camera_model=CameraModel.pinhole(**defaults),
+                extrinsics=CameraExtrinsics(
+                    translation=(0.0, 0.0, 0.0),
+                    rotation=(0.0, 0.0, 0.0, 1.0),
+                ),
+            )
+        ],
+    )
+
+
+def test_update_camera_intrinsics_replaces_focal_length() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    cam = update_camera_intrinsics(rigs, camera_name="front", fx=1234.5, fy=1234.5)
+    assert cam.camera_model.parameters["fx"] == 1234.5
+    assert cam.camera_model.parameters["fy"] == 1234.5
+    # Round-trip through the schema preserves the edit.
+    doc = serialize_rig_trajectories(rigs)
+    again = parse_rig_trajectories(doc)
+    assert again[0].cameras[0].camera_model.parameters["fx"] == 1234.5
+
+
+def test_update_camera_intrinsics_resolves_rig_id_when_ambiguous() -> None:
+    rigs = [_rig_with_camera("ego", "front"), _rig_with_camera("trailer", "front")]
+    with pytest.raises(ValueError, match="multiple rigs"):
+        update_camera_intrinsics(rigs, camera_name="front", fx=1000.0)
+    cam = update_camera_intrinsics(rigs, camera_name="front", rig_id="trailer", fx=1000.0)
+    assert cam.camera_model.parameters["fx"] == 1000.0
+    # Only the trailer rig is touched.
+    assert rigs[0].cameras[0].camera_model.parameters["fx"] == 500.0
+
+
+def test_update_camera_intrinsics_unknown_camera_raises() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    with pytest.raises(ValueError, match="camera 'rear' not found"):
+        update_camera_intrinsics(rigs, camera_name="rear", fx=1.0)
+
+
+def test_update_camera_intrinsics_unknown_rig_id_raises_distinct_error() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    with pytest.raises(ValueError, match="rig 'trailer' not found"):
+        update_camera_intrinsics(rigs, camera_name="front", rig_id="trailer", fx=1.0)
+
+
+def test_update_camera_intrinsics_requires_at_least_one_update() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    with pytest.raises(ValueError, match="at least one intrinsic update"):
+        update_camera_intrinsics(rigs, camera_name="front")
+
+
+def test_update_camera_intrinsics_preserves_extra_camera_fields() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    rigs[0].cameras[0] = Camera(
+        name="front",
+        camera_model=rigs[0].cameras[0].camera_model,
+        extrinsics=rigs[0].cameras[0].extrinsics,
+        metadata={"sensor_id": "C1"},
+    )
+    cam = update_camera_intrinsics(rigs, camera_name="front", fx=1234.5)
+    assert cam.metadata == {"sensor_id": "C1"}

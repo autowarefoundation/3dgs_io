@@ -40,7 +40,7 @@ schema: the alpasim ingester composes the global frames and extracts a clean
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -52,9 +52,11 @@ __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
     "RigPose",
     "RigTrajectory",
+    "load_rig_trajectories_doc",
     "parse_alpasim_rig_trajectories",
     "parse_rig_trajectories",
     "serialize_rig_trajectories",
+    "update_camera_intrinsics",
 ]
 
 
@@ -156,6 +158,82 @@ def serialize_rig_trajectories(rigs: list[RigTrajectory]) -> dict[str, Any]:
         "frame": _FRAME,
         "rigs": out_list,
     }
+
+
+def update_camera_intrinsics(
+    rigs: list[RigTrajectory],
+    *,
+    camera_name: str,
+    rig_id: str | None = None,
+    **updates: Any,
+) -> Camera:
+    """Replace the intrinsics of a camera mounted on one of ``rigs`` in place.
+
+    Looks up the camera by ``camera_name`` (optionally scoped to ``rig_id``)
+    and rebuilds its :attr:`Camera.camera_model` via
+    :meth:`CameraModel.with_intrinsics`. The matched :class:`Camera` is returned
+    for callers that want to inspect the result.
+
+    Raises ``ValueError`` if no camera matches, if ``rig_id`` is given but does
+    not name any rig, or if the camera name is ambiguous (multiple rigs, or
+    multiple entries on the same rig, an in-memory state the parser/serializer
+    would otherwise reject).
+    """
+    if not updates:
+        raise ValueError("update_camera_intrinsics requires at least one intrinsic update")
+
+    if rig_id is not None and not any(r.rig_id == rig_id for r in rigs):
+        raise ValueError(f"rig {rig_id!r} not found")
+
+    matches: list[tuple[RigTrajectory, int]] = []
+    for rig in rigs:
+        if rig_id is not None and rig.rig_id != rig_id:
+            continue
+        for i, cam in enumerate(rig.cameras):
+            if cam.name == camera_name:
+                matches.append((rig, i))
+
+    if not matches:
+        scope = f" on rig {rig_id!r}" if rig_id is not None else ""
+        raise ValueError(f"camera {camera_name!r} not found{scope}")
+    if len(matches) > 1:
+        match_rig_ids = sorted({rig.rig_id for rig, _ in matches})
+        if len(match_rig_ids) == 1:
+            raise ValueError(
+                f"camera {camera_name!r} appears multiple times on rig "
+                f"{match_rig_ids[0]!r}; camera names must be unique within a rig"
+            )
+        raise ValueError(
+            f"camera {camera_name!r} is mounted on multiple rigs {match_rig_ids}; "
+            f"pass rig_id= to disambiguate"
+        )
+
+    rig, idx = matches[0]
+    cam = rig.cameras[idx]
+    rig.cameras[idx] = replace(
+        cam,
+        camera_model=cam.camera_model.with_intrinsics(**updates),
+    )
+    return rig.cameras[idx]
+
+
+def load_rig_trajectories_doc(doc: dict[str, Any]) -> list[RigTrajectory]:
+    """Parse either a ``splatsim.rig_trajectories/v1`` doc or an alpasim one.
+
+    Single dispatcher used by CLIs and library callers that accept both
+    schemas. Dispatch is by the top-level ``schema`` key: matches the
+    splatsim constant → :func:`parse_rig_trajectories`; otherwise falls
+    through to :func:`parse_alpasim_rig_trajectories` (which raises with an
+    alpasim-shaped error if the document is neither).
+    """
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"rig_trajectories document must be a JSON object at top level, "
+            f"got {type(doc).__name__}"
+        )
+    if doc.get("schema") == RIG_TRAJECTORIES_SCHEMA:
+        return parse_rig_trajectories(doc)
+    return parse_alpasim_rig_trajectories(doc)
 
 
 def parse_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
