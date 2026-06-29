@@ -1,8 +1,8 @@
 """CLI for editing camera intrinsics inside a ``rig_trajectories.json``.
 
-Invoke with ``python -m 3dgs_io.cameras_cli``::
+Invoke with ``python -m 3dgs_io.edit_cli``::
 
-    python -m 3dgs_io.cameras_cli                              \\
+    python -m 3dgs_io.edit_cli                              \\
         --input  path/to/rig_trajectories.json                  \\
         --output path/to/rig_trajectories.edited.json           \\
         --camera CAM_NAME                                       \\
@@ -56,7 +56,7 @@ def _parse_xy(spec: str) -> tuple[float, float]:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m 3dgs_io.cameras_cli",
+        prog="python -m 3dgs_io.edit_cli",
         description=(
             "Edit camera intrinsics inside a rig_trajectories.json. "
             "Reads the input (our schema or alpasim), updates the addressed "

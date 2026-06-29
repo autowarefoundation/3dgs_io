@@ -410,7 +410,12 @@ def _fetch_json(source: str | Path) -> tuple[str, dict]:
         base = path.resolve().parent.as_uri() + "/"
         return base, data
 
-    with urllib.request.urlopen(src) as resp:  # noqa: S310 - intentional HTTP fetch
+    # with urllib.request.urlopen(src) as resp:  # noqa: S310 - intentional HTTP fetch
+    #     data = json.loads(resp.read().decode("utf-8"))
+    req = urllib.request.Request(
+        src, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 3dgs_io/1.0"}
+    )
+    with urllib.request.urlopen(req) as resp:  # noqa: S310 - intentional HTTP fetch
         data = json.loads(resp.read().decode("utf-8"))
     parsed = urllib.parse.urlparse(src)
     dir_path = parsed.path.rsplit("/", 1)[0] + "/"

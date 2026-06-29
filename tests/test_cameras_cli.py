@@ -1,4 +1,4 @@
-"""Tests for ``python -m 3dgs_io.cameras_cli``."""
+"""Tests for ``python -m 3dgs_io.edit_cli``."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
 serialize_rig_trajectories = _mod.serialize_rig_trajectories
 
-_cli = importlib.import_module("3dgs_io.cameras_cli")
+_cli = importlib.import_module("3dgs_io.edit_cli")
 
 
 def _rig_doc(tmp_path: Path, *, model: CameraModel | None = None) -> Path:
