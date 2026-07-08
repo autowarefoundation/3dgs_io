@@ -11,7 +11,12 @@ from .converters import (
     mgrs_overrides_from_root_transform,
     run_uvx_tool,
 )
-from .edit_usdz import EditUsdzResult, add_lanelet2_to_usdz
+from .edit_usdz import (
+    EditUsdzResult,
+    IntrinsicsEditResult,
+    add_lanelet2_to_usdz,
+    update_camera_intrinsics_in_usdz,
+)
 from .ext_attributes import (
     EXT_GAUSSIAN_LIDAR_NAME,
     ExtAttributeSpec,
@@ -80,6 +85,7 @@ __all__ = [
     "compute_bounding_volume",
     "DatasetType",
     "EditUsdzResult",
+    "IntrinsicsEditResult",
     "Export",
     "EXT_GAUSSIAN_LIDAR_NAME",
     "ExtAttributeSpec",
@@ -96,6 +102,7 @@ __all__ = [
     "TrackFrame",
     "TrainingData",
     "add_lanelet2_to_usdz",
+    "update_camera_intrinsics_in_usdz",
     "decode_lidar_sidecar",
     "encode_lidar_sidecar",
     "load_rig_trajectories_doc",

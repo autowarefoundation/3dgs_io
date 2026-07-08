@@ -6,14 +6,21 @@ import importlib
 import json
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 import spz
 
 _mod = importlib.import_module("3dgs_io")
+Camera = _mod.Camera
+CameraExtrinsics = _mod.CameraExtrinsics
+CameraModel = _mod.CameraModel
+RigPose = _mod.RigPose
+RigTrajectory = _mod.RigTrajectory
 save_gltf = _mod.save_gltf
 save_scene_usdz = _mod.save_scene_usdz
+serialize_rig_trajectories = _mod.serialize_rig_trajectories
 
 _edit = importlib.import_module("3dgs_io.edit_usdz")
 _cli = importlib.import_module("3dgs_io.edit_usdz_cli")
@@ -75,8 +82,48 @@ def _make_osm(tmp_path: Path, *, name: str = "map.osm", data: bytes = _SAMPLE_OS
     return p
 
 
+def _make_rig_trajectories_json(
+    tmp_path: Path,
+    *,
+    name: str = "rig_trajectories.json",
+    model: CameraModel | None = None,
+    camera_name: str = "front",
+    rig_id: str = "ego",
+) -> Path:
+    if model is None:
+        model = CameraModel.pinhole(width=1920, height=1080, fx=500, fy=500, cx=960, cy=540)
+    rig = RigTrajectory(
+        rig_id=rig_id,
+        poses=[RigPose(timestamp_us=0, translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0))],
+        cameras=[
+            Camera(
+                name=camera_name,
+                camera_model=model,
+                extrinsics=CameraExtrinsics(
+                    translation=(0.0, 0.0, 0.0),
+                    rotation=(0.0, 0.0, 0.0, 1.0),
+                ),
+            )
+        ],
+    )
+    p = tmp_path / name
+    p.write_text(json.dumps(serialize_rig_trajectories([rig]), indent=2), encoding="utf-8")
+    return p
+
+
+def _make_usdz_with_rig(tmp_path: Path, **rig_kwargs: Any) -> Path:
+    rig_path = _make_rig_trajectories_json(tmp_path, **rig_kwargs)
+    return _make_usdz(tmp_path, extras={"rig_trajectories.json": rig_path})
+
+
+def _read_rig_camera_params(usdz_path: Path) -> dict[str, Any]:
+    with zipfile.ZipFile(usdz_path) as zf:
+        doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
+    return doc["rigs"][0]["cameras"][0]["camera_model"]["parameters"]
+
+
 # ----------------------------------------------------------------------------
-# Library-level behaviour
+# add_lanelet2_to_usdz — library API
 # ----------------------------------------------------------------------------
 
 
@@ -188,17 +235,92 @@ def test_add_lanelet2_missing_lanelet2_raises(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------------
-# CLI
+# update_camera_intrinsics_in_usdz — library API
 # ----------------------------------------------------------------------------
 
 
-def test_cli_writes_output_and_summary(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+def test_intrinsics_updates_pinhole_focal_and_resolution(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "edited.usdz"
+    result = _edit.update_camera_intrinsics_in_usdz(
+        src,
+        out,
+        camera_name="front",
+        width=3840,
+        height=2160,
+        fx=1234.5,
+        fy=1200.0,
+    )
+    assert result.out_path == out
+    assert result.camera_name == "front"
+    assert result.replaced == ["rig_trajectories.json"]
+    assert result.updated_fields == ["fx", "fy", "height", "width"]
+
+    params = _read_rig_camera_params(out)
+    assert params["resolution"] == [3840, 2160]
+    assert params["fx"] == pytest.approx(1234.5)
+    assert params["fy"] == pytest.approx(1200.0)
+
+
+def test_intrinsics_output_can_equal_input(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    result = _edit.update_camera_intrinsics_in_usdz(src, src, camera_name="front", fx=999.0)
+    assert result.out_path == src
+    params = _read_rig_camera_params(src)
+    assert params["fx"] == pytest.approx(999.0)
+
+
+def test_intrinsics_preserves_original_entry_order(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "edited.usdz"
+    _edit.update_camera_intrinsics_in_usdz(src, out, camera_name="front", fx=800.0)
+    with zipfile.ZipFile(src) as zin:
+        src_names = zin.namelist()
+    with zipfile.ZipFile(out) as zout:
+        out_names = zout.namelist()
+    assert out_names == src_names
+    assert out_names[0] == "default.usda"
+
+
+def test_intrinsics_requires_at_least_one_update(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    with pytest.raises(ValueError, match="at least one intrinsic update"):
+        _edit.update_camera_intrinsics_in_usdz(src, tmp_path / "out.usdz", camera_name="front")
+
+
+def test_intrinsics_missing_rig_trajectories_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)  # no rig_trajectories embedded
+    with pytest.raises(ValueError, match="rig_trajectories.json"):
+        _edit.update_camera_intrinsics_in_usdz(
+            src, tmp_path / "out.usdz", camera_name="front", fx=800.0
+        )
+
+
+def test_intrinsics_missing_input_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        _edit.update_camera_intrinsics_in_usdz(
+            tmp_path / "missing.usdz",
+            tmp_path / "out.usdz",
+            camera_name="front",
+            fx=1.0,
+        )
+
+
+# ----------------------------------------------------------------------------
+# CLI — lanelet2 subcommand
+# ----------------------------------------------------------------------------
+
+
+def test_cli_lanelet2_writes_output_and_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
     src = _make_usdz(tmp_path)
     osm = _make_osm(tmp_path)
     out = tmp_path / "cli.usdz"
 
     rc = _cli.main(
         [
+            "lanelet2",
             "--input",
             str(src),
             "--output",
@@ -219,11 +341,14 @@ def test_cli_writes_output_and_summary(tmp_path: Path, capsys: pytest.CaptureFix
     assert scene["extras"]["map_lanelet2"] == "map.osm"
 
 
-def test_cli_quiet_suppresses_summary(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+def test_cli_lanelet2_quiet_suppresses_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
     src = _make_usdz(tmp_path)
     out = tmp_path / "cli.usdz"
     rc = _cli.main(
         [
+            "lanelet2",
             "--input",
             str(src),
             "--output",
@@ -237,12 +362,13 @@ def test_cli_quiet_suppresses_summary(tmp_path: Path, capsys: pytest.CaptureFixt
     assert capsys.readouterr().out == ""
 
 
-def test_cli_no_overwrite_errors_when_map_osm_present(tmp_path: Path) -> None:
+def test_cli_lanelet2_no_overwrite_errors_when_map_osm_present(tmp_path: Path) -> None:
     existing_osm = _make_osm(tmp_path, name="existing.osm", data=b"<osm/>")
     src = _make_usdz(tmp_path, extras={"map.osm": existing_osm})
     with pytest.raises(ValueError, match="already contains"):
         _cli.main(
             [
+                "lanelet2",
                 "--input",
                 str(src),
                 "--output",
@@ -252,3 +378,94 @@ def test_cli_no_overwrite_errors_when_map_osm_present(tmp_path: Path) -> None:
                 "--no-overwrite",
             ]
         )
+
+
+# ----------------------------------------------------------------------------
+# CLI — intrinsics subcommand
+# ----------------------------------------------------------------------------
+
+
+def test_cli_intrinsics_updates_and_prints_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "intrinsics",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--camera",
+            "front",
+            "--width",
+            "3840",
+            "--height",
+            "2160",
+            "--fx",
+            "1000",
+            "--fy",
+            "1010",
+        ]
+    )
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["out_path"] == str(out)
+    assert summary["camera_name"] == "front"
+    assert summary["updated_fields"] == ["fx", "fy", "height", "width"]
+    assert summary["replaced"] == ["rig_trajectories.json"]
+
+    params = _read_rig_camera_params(out)
+    assert params["resolution"] == [3840, 2160]
+    assert params["fx"] == pytest.approx(1000.0)
+    assert params["fy"] == pytest.approx(1010.0)
+
+
+def test_cli_intrinsics_no_updates_returns_2(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    rc = _cli.main(
+        [
+            "intrinsics",
+            "--input",
+            str(src),
+            "--output",
+            str(tmp_path / "out.usdz"),
+            "--camera",
+            "front",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no intrinsic updates" in err
+
+
+def test_cli_intrinsics_distortion_coeffs_on_opencv(tmp_path: Path) -> None:
+    opencv_model = CameraModel.opencv(
+        width=1920,
+        height=1080,
+        fx=500,
+        fy=500,
+        cx=960,
+        cy=540,
+        distortion_coeffs=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    src = _make_usdz_with_rig(tmp_path, model=opencv_model)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "intrinsics",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--camera",
+            "front",
+            "--distortion-coeffs",
+            "0.1,-0.05,0.001,0.002,0.0",
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    params = _read_rig_camera_params(out)
+    assert params["distortion_coeffs"] == pytest.approx([0.1, -0.05, 0.001, 0.002, 0.0])
