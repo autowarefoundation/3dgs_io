@@ -125,8 +125,8 @@ def add_lanelet2_to_usdz(
             _LANELET2_ARCHIVE_PATH: lanelet2_bytes,
         },
     )
-    # scene.json is always a replacement — don't surface it as a user-facing edit.
-    added = [n for n in added if n != "scene.json"]
+    # scene.json is always a replacement (validated to exist above), don't
+    # surface it as a user-facing edit.
     replaced = [n for n in replaced if n != "scene.json"]
     return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
 
@@ -269,11 +269,11 @@ def _repack_usdz(
                         _write_stored(zout, name, zin.read(name))
                 for name in added:
                     _write_stored(zout, name, entries_to_write[name])
+            os.replace(tmp_path, output_usdz)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
 
-    os.replace(tmp_path, output_usdz)
     return added, replaced
 
 
