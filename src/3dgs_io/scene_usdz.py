@@ -9,6 +9,7 @@ root-local frame; the world offset lives in ``tileset.json``'s
 Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
 
     default.usda                 # USDZ root stage (asset reference to tileset.json)
+    metadata.yaml                # identity card (uuid / scene_id / version_string)
     scene.json                   # splatsim.scene/v1 bundle index
     tileset.json                 # Cesium 3D Tiles v1.0 + EXT_3dgs_spz, root.transform preserved
     chunks/chunk_NNNNNN.spz      # Niantic SPZ tiles (spatially split)
@@ -51,6 +52,12 @@ from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
 from .tracks import Track, serialize_tracks
+from .usdz_metadata import (
+    USDZ_METADATA_ARCHIVE_PATH,
+    UsdzMetadata,
+    encode_usdz_metadata,
+    make_default_metadata,
+)
 
 __all__ = [
     "SceneUsdzOptions",
@@ -68,7 +75,9 @@ _SCENE_SCHEMA = "splatsim.scene/v1"
 _EXT_3DGS_SPZ = "EXT_3dgs_spz"
 
 # Archive entries owned by the writer; user extras must not collide.
-_RESERVED_PATHS = frozenset({"default.usda", "scene.json", "tileset.json"})
+_RESERVED_PATHS = frozenset(
+    {"default.usda", "scene.json", "tileset.json", USDZ_METADATA_ARCHIVE_PATH}
+)
 _RESERVED_PREFIXES: tuple[str, ...] = ("chunks/",)
 
 _IDENTITY_16: tuple[float, ...] = (
@@ -149,6 +158,7 @@ class SceneUsdzResult:
     n_chunks: int = 0
     extras: dict[str, str | None] = field(default_factory=dict)
     root_transform: list[float] = field(default_factory=lambda: list(_IDENTITY_16))
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -678,6 +688,7 @@ def save_scene_usdz(
     extras: Mapping[str, str | Path] | None = None,
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
+    metadata: UsdzMetadata | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
     """Pack a Cesium ``tileset.json`` (+ extras + tracks + rigs) into a USDZ.
@@ -716,6 +727,12 @@ def save_scene_usdz(
         root-local frame; cameras nested under each rig
         (:attr:`RigTrajectory.cameras`) carry rig-relative extrinsics
         (``T_sensor_rig``).
+    metadata:
+        Identity card written to ``metadata.yaml`` at the archive root
+        (``uuid`` / ``scene_id`` / ``version_string``). When ``None`` a
+        default :class:`~3dgs_io.UsdzMetadata` is generated with a random
+        UUID4, ``scene_id`` set to ``out_path.stem`` and ``version_string``
+        set to ``"3dgs_io/<installed-package-version>"``.
     options:
         Filtering, scale clamping, chunk size, and render defaults.
     """
@@ -724,6 +741,9 @@ def save_scene_usdz(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if options is None:
         options = SceneUsdzOptions()
+    if metadata is None:
+        metadata = make_default_metadata(out_path=out_path)
+    metadata_payload = encode_usdz_metadata(metadata)
 
     cloud, root_transform, source_ext_attrs = _load_from_tileset(tileset_path)
     arrays = _filter_and_clamp(cloud, options, source_ext_attrs)
@@ -784,6 +804,7 @@ def save_scene_usdz(
 
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
+            _zip_write_bytes(zf, USDZ_METADATA_ARCHIVE_PATH, metadata_payload)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
             _zip_write_str(zf, "tileset.json", json.dumps(tileset_doc, indent=2))
             if tracks_payload is not None:
@@ -804,6 +825,7 @@ def save_scene_usdz(
         n_chunks=len(sub_clouds),
         extras=extras_meta,
         root_transform=root_transform,
+        metadata=metadata.to_dict(),
     )
 
 

@@ -14,7 +14,9 @@ from .converters import (
 from .edit_usdz import (
     EditUsdzResult,
     IntrinsicsEditResult,
+    MetadataEditResult,
     add_lanelet2_to_usdz,
+    set_usdz_metadata,
     update_camera_intrinsics_in_usdz,
 )
 from .ext_attributes import (
@@ -67,6 +69,15 @@ from .tracks import (
     parse_tracks,
     serialize_tracks,
 )
+from .usdz_metadata import (
+    USDZ_METADATA_ARCHIVE_PATH,
+    USDZ_METADATA_REQUIRED_KEYS,
+    UsdzMetadata,
+    default_uuid,
+    encode_usdz_metadata,
+    load_usdz_metadata,
+    make_default_metadata,
+)
 from .viewer import launch_viewer
 
 __all__ = [
@@ -86,6 +97,7 @@ __all__ = [
     "DatasetType",
     "EditUsdzResult",
     "IntrinsicsEditResult",
+    "MetadataEditResult",
     "Export",
     "EXT_GAUSSIAN_LIDAR_NAME",
     "ExtAttributeSpec",
@@ -101,7 +113,15 @@ __all__ = [
     "Track",
     "TrackFrame",
     "TrainingData",
+    "USDZ_METADATA_ARCHIVE_PATH",
+    "USDZ_METADATA_REQUIRED_KEYS",
+    "UsdzMetadata",
     "add_lanelet2_to_usdz",
+    "default_uuid",
+    "encode_usdz_metadata",
+    "load_usdz_metadata",
+    "make_default_metadata",
+    "set_usdz_metadata",
     "update_camera_intrinsics_in_usdz",
     "decode_lidar_sidecar",
     "encode_lidar_sidecar",

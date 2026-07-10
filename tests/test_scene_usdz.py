@@ -20,6 +20,7 @@ import spz
 
 _mod = importlib.import_module("3dgs_io")
 SceneUsdzOptions = _mod.SceneUsdzOptions
+UsdzMetadata = _mod.UsdzMetadata
 save_gltf = _mod.save_gltf
 save_scene_usdz = _mod.save_scene_usdz
 
@@ -687,3 +688,104 @@ def test_cli_extra_flag_embeds_file(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert "tracks.parquet" in _names(out)
     scene = json.loads(_read(out, "scene.json"))
     assert scene["extras"]["tracks"] == "tracks.parquet"
+
+
+# ---------------------------------------------------------------------------
+# metadata.yaml (identity card)
+# ---------------------------------------------------------------------------
+
+
+def _read_metadata(usdz_path: Path) -> dict:
+    return json.loads(_read(usdz_path, "metadata.yaml"))
+
+
+def test_save_scene_usdz_writes_default_metadata_yaml(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    out = tmp_path / "odaibatest5.usdz"
+
+    result = save_scene_usdz(ts, out)
+
+    assert "metadata.yaml" in _names(out)
+    doc = _read_metadata(out)
+    for key in ("uuid", "scene_id", "version_string"):
+        assert isinstance(doc[key], str) and doc[key], key
+    assert doc["scene_id"] == "odaibatest5", "default scene_id follows the output filename stem"
+    assert doc["version_string"].startswith("3dgs_io/")
+    assert result.metadata == doc
+
+
+def test_save_scene_usdz_honours_explicit_metadata(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    out = tmp_path / "scene.usdz"
+
+    metadata = UsdzMetadata(
+        uuid="odaibatest5",
+        scene_id="odaibatest5",
+        version_string="local-e2e",
+        extras={"pipeline": "unit-test"},
+    )
+    result = save_scene_usdz(ts, out, metadata=metadata)
+    doc = _read_metadata(out)
+    assert doc["uuid"] == "odaibatest5"
+    assert doc["scene_id"] == "odaibatest5"
+    assert doc["version_string"] == "local-e2e"
+    assert doc["pipeline"] == "unit-test"
+    assert result.metadata["pipeline"] == "unit-test"
+
+
+def test_save_scene_usdz_metadata_yaml_is_yaml_parseable(tmp_path: Path) -> None:
+    # JSON is a subset of YAML 1.2 so consumers that pull metadata.yaml through
+    # yaml.safe_load must round-trip the required keys.
+    yaml = pytest.importorskip("yaml")
+    ts = _make_tileset(tmp_path)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out)
+    with zipfile.ZipFile(out) as zf, zf.open("metadata.yaml") as fh:
+        doc = yaml.safe_load(fh)
+    assert set(("uuid", "scene_id", "version_string")).issubset(doc)
+
+
+def test_save_scene_usdz_metadata_yaml_is_uncompressed(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out)
+    with zipfile.ZipFile(out) as zf:
+        info = zf.getinfo("metadata.yaml")
+    assert info.compress_type == zipfile.ZIP_STORED
+
+
+def test_save_scene_usdz_metadata_yaml_reserved_from_extras(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    (tmp_path / "conflict.yaml").write_text("uuid: hijacked\n")
+    with pytest.raises(ValueError, match="reserved"):
+        save_scene_usdz(
+            ts,
+            tmp_path / "out.usdz",
+            extras={"metadata.yaml": tmp_path / "conflict.yaml"},
+        )
+
+
+def test_cli_metadata_flags_override_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = importlib.import_module("3dgs_io.scene_usdz_cli")
+    ts = _make_tileset(tmp_path)
+    out = tmp_path / "out.usdz"
+    rc = cli.main(
+        [
+            str(ts),
+            str(out),
+            "--uuid",
+            "odaibatest5",
+            "--scene-id",
+            "odaibatest5",
+            "--version-string",
+            "local-e2e",
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    doc = _read_metadata(out)
+    assert doc["uuid"] == "odaibatest5"
+    assert doc["scene_id"] == "odaibatest5"
+    assert doc["version_string"] == "local-e2e"
