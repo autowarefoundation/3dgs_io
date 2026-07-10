@@ -28,6 +28,20 @@ Subcommands
             [--distortion-coeffs c0,c1,...]                            \\
             [--principal-point px,py]                                  \\
             [--shutter-type STR] [--reference-poly STR]
+
+``metadata``
+    Write (or overwrite) ``metadata.yaml`` at the archive root without
+    touching the Gaussian chunks. Fields not passed on the command line are
+    inherited from the input's existing manifest (if any); otherwise they
+    fall back to the same defaults as :func:`3dgs_io.save_scene_usdz`::
+
+        python -m 3dgs_io.edit_usdz_cli metadata                       \\
+            --input  path/to/scene.usdz                                \\
+            --output path/to/scene.edited.usdz                         \\
+            [--uuid UUID]                                              \\
+            [--scene-id SCENE_ID]                                      \\
+            [--version-string VERSION]                                 \\
+            [--extra KEY=VALUE]...
 """
 
 from __future__ import annotations
@@ -42,6 +56,7 @@ from typing import Any
 from .edit_usdz import (
     _result_summary,
     add_lanelet2_to_usdz,
+    set_usdz_metadata,
     update_camera_intrinsics_in_usdz,
 )
 
@@ -74,6 +89,26 @@ def _parse_xy(spec: str) -> tuple[float, float]:
     if len(vals) != 2:
         raise argparse.ArgumentTypeError(f"expected exactly 2 comma-separated floats, got {spec!r}")
     return vals[0], vals[1]
+
+
+def _parse_metadata_extra(spec: str) -> tuple[str, Any]:
+    """``KEY=VALUE`` → ``(key, parsed_value)``.
+
+    ``VALUE`` is parsed as JSON when possible (so ``foo=42``, ``foo=true``,
+    ``foo=[1,2]`` behave naturally); if JSON parsing fails, ``VALUE`` is
+    stored verbatim as a string.
+    """
+    if "=" not in spec:
+        raise argparse.ArgumentTypeError(f"--extra value {spec!r} must be KEY=VALUE")
+    key, raw = spec.split("=", 1)
+    key = key.strip()
+    if not key:
+        raise argparse.ArgumentTypeError(f"--extra {spec!r}: key is empty")
+    try:
+        value: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        value = raw
+    return key, value
 
 
 def _add_common_io_args(p: argparse.ArgumentParser) -> None:
@@ -161,6 +196,45 @@ def _build_parser() -> argparse.ArgumentParser:
     intr.add_argument("--shutter-type", default=None, help="ftheta shutter_type")
     intr.add_argument("--reference-poly", default=None, help="ftheta reference_poly")
 
+    meta = sub.add_parser(
+        "metadata",
+        help="Write (or overwrite) metadata.yaml at the USDZ archive root",
+        description=(
+            "Write (or overwrite) metadata.yaml at the archive root of an "
+            "existing USDZ scene bundle. Fields not passed are inherited from "
+            "the input's existing manifest (when parseable) or filled in with "
+            "the same defaults as save_scene_usdz."
+        ),
+    )
+    _add_common_io_args(meta)
+    meta.add_argument("--uuid", default=None, help="metadata.yaml uuid (non-empty string)")
+    meta.add_argument(
+        "--scene-id",
+        dest="scene_id",
+        default=None,
+        help="metadata.yaml scene_id (defaults to the output filename stem)",
+    )
+    meta.add_argument(
+        "--version-string",
+        dest="version_string",
+        default=None,
+        help="metadata.yaml version_string (defaults to '3dgs_io/<installed-version>')",
+    )
+    meta.add_argument(
+        "--extra",
+        action="append",
+        dest="metadata_extras",
+        default=[],
+        metavar="KEY=VALUE",
+        type=_parse_metadata_extra,
+        help=(
+            "Extra manifest key. Repeatable. VALUE is JSON-parsed when it "
+            "looks like JSON (numbers, booleans, null, arrays, objects); "
+            "otherwise stored as a string. Cannot shadow uuid / scene_id / "
+            "version_string."
+        ),
+    )
+
     return p
 
 
@@ -207,6 +281,28 @@ def main(argv: list[str] | None = None) -> int:
             rig_id=args.rig_id,
             **updates,
         )
+    elif args.command == "metadata":
+        metadata_extras: dict[str, Any] = {}
+        for key, value in args.metadata_extras or []:
+            if key in metadata_extras:
+                print(
+                    f"error: --extra key {key!r} was passed more than once",
+                    file=sys.stderr,
+                )
+                return 2
+            metadata_extras[key] = value
+        try:
+            result = set_usdz_metadata(
+                args.input,
+                args.output,
+                uuid=args.uuid,
+                scene_id=args.scene_id,
+                version_string=args.version_string,
+                extras=metadata_extras or None,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     else:  # pragma: no cover — argparse enforces choices
         parser.error(f"unknown command: {args.command}")
 

@@ -7,6 +7,10 @@ Supports:
   ``scene.json.extras.map_lanelet2``.
 * :func:`update_camera_intrinsics_in_usdz` — rewrite a camera's intrinsics
   inside the ``rig_trajectories.json`` embedded in the USDZ.
+* :func:`set_usdz_metadata` — write (or overwrite) ``metadata.yaml`` at the
+  archive root so downstream consumers can read a stable identity card
+  (``uuid`` / ``scene_id`` / ``version_string``) without rebuilding the
+  Gaussian chunks.
 
 Every output archive preserves entry order (``default.usda`` stays first, per
 the USDZ spec) and uses ``ZIP_STORED`` for every entry.
@@ -29,11 +33,20 @@ from .rig_trajectories import (
     serialize_rig_trajectories,
     update_camera_intrinsics,
 )
+from .usdz_metadata import (
+    USDZ_METADATA_ARCHIVE_PATH,
+    UsdzMetadata,
+    encode_usdz_metadata,
+    load_usdz_metadata,
+    make_default_metadata,
+)
 
 __all__ = [
     "EditUsdzResult",
     "IntrinsicsEditResult",
+    "MetadataEditResult",
     "add_lanelet2_to_usdz",
+    "set_usdz_metadata",
     "update_camera_intrinsics_in_usdz",
 ]
 
@@ -61,6 +74,16 @@ class IntrinsicsEditResult:
     camera_name: str
     camera_model: dict[str, Any]
     updated_fields: list[str]
+    replaced: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MetadataEditResult:
+    """Summary of a :func:`set_usdz_metadata` invocation."""
+
+    out_path: Path
+    metadata: dict[str, Any]
+    added: list[str] = field(default_factory=list)
     replaced: list[str] = field(default_factory=list)
 
 
@@ -212,6 +235,91 @@ def update_camera_intrinsics_in_usdz(
     )
 
 
+def set_usdz_metadata(
+    input_usdz: str | Path,
+    output_usdz: str | Path,
+    *,
+    uuid: str | None = None,
+    scene_id: str | None = None,
+    version_string: str | None = None,
+    extras: dict[str, Any] | None = None,
+) -> MetadataEditResult:
+    """Write (or overwrite) ``metadata.yaml`` at the root of an existing USDZ.
+
+    Any field not explicitly passed is inherited from the input's existing
+    ``metadata.yaml`` (if one is present and parseable). Fields that remain
+    unset after the merge fall back to the same defaults as
+    :func:`3dgs_io.save_scene_usdz`:
+
+    - ``uuid`` → a fresh random UUID4.
+    - ``scene_id`` → the *output* USDZ filename stem.
+    - ``version_string`` → ``"3dgs_io/<installed-package-version>"``.
+
+    Gaussian chunks and every other archive entry are copied through
+    unchanged; only ``metadata.yaml`` is added / replaced.
+
+    Parameters
+    ----------
+    input_usdz, output_usdz:
+        Same semantics as :func:`add_lanelet2_to_usdz` — ``output_usdz`` may
+        equal ``input_usdz`` for atomic in-place edits.
+    uuid, scene_id, version_string:
+        Overrides for the three required manifest keys. Non-empty strings.
+    extras:
+        Free-form additional keys to merge into the manifest. Values must be
+        JSON-serialisable and must not shadow the required keys.
+    """
+    input_usdz = Path(input_usdz).expanduser()
+    output_usdz = Path(output_usdz).expanduser()
+
+    for name, value in (("uuid", uuid), ("scene_id", scene_id), ("version_string", version_string)):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"{name} override must be a non-empty string, got {value!r}")
+
+    if not input_usdz.is_file():
+        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
+
+    existing: UsdzMetadata | None = None
+    with zipfile.ZipFile(input_usdz, "r") as zin:
+        if USDZ_METADATA_ARCHIVE_PATH in zin.namelist():
+            try:
+                existing = load_usdz_metadata(zin.read(USDZ_METADATA_ARCHIVE_PATH))
+            except (ValueError, json.JSONDecodeError) as exc:
+                _log.warning(
+                    "%s: existing %s could not be parsed (%s); regenerating from scratch.",
+                    input_usdz,
+                    USDZ_METADATA_ARCHIVE_PATH,
+                    exc,
+                )
+
+    merged_extras: dict[str, Any] = dict(existing.extras) if existing is not None else {}
+    if extras:
+        merged_extras.update(extras)
+
+    new_metadata = make_default_metadata(
+        out_path=output_usdz,
+        uuid=uuid or (existing.uuid if existing is not None else None),
+        scene_id=scene_id or (existing.scene_id if existing is not None else None),
+        version_string=version_string
+        or (existing.version_string if existing is not None else None),
+        extras=merged_extras,
+    )
+    payload = encode_usdz_metadata(new_metadata)
+
+    added, replaced = _repack_usdz(
+        input_usdz,
+        output_usdz,
+        entries_to_write={USDZ_METADATA_ARCHIVE_PATH: payload},
+    )
+
+    return MetadataEditResult(
+        out_path=output_usdz,
+        metadata=new_metadata.to_dict(),
+        added=added,
+        replaced=replaced,
+    )
+
+
 def _rewrite_scene_extras(scene_json_bytes: bytes, key: str, value: str) -> bytes:
     """Load ``scene.json``, set ``extras[key] = value``, return re-encoded bytes."""
     scene_doc = json.loads(scene_json_bytes.decode("utf-8-sig"))
@@ -283,7 +391,9 @@ def _write_stored(zf: zipfile.ZipFile, name: str, content: bytes) -> None:
     zf.writestr(zi, content)
 
 
-def _result_summary(result: EditUsdzResult | IntrinsicsEditResult) -> dict[str, Any]:
+def _result_summary(
+    result: EditUsdzResult | IntrinsicsEditResult | MetadataEditResult,
+) -> dict[str, Any]:
     """Stringified summary used by the CLI."""
     d = asdict(result)
     d["out_path"] = str(result.out_path)

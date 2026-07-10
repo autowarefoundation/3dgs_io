@@ -469,3 +469,209 @@ def test_cli_intrinsics_distortion_coeffs_on_opencv(tmp_path: Path) -> None:
     assert rc == 0
     params = _read_rig_camera_params(out)
     assert params["distortion_coeffs"] == pytest.approx([0.1, -0.05, 0.001, 0.002, 0.0])
+
+
+# ----------------------------------------------------------------------------
+# set_usdz_metadata — library API
+# ----------------------------------------------------------------------------
+
+
+def _read_metadata_yaml(usdz_path: Path) -> dict[str, Any]:
+    with zipfile.ZipFile(usdz_path) as zf:
+        return json.loads(zf.read("metadata.yaml").decode("utf-8-sig"))
+
+
+def test_set_usdz_metadata_overwrites_default_manifest(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "edited.usdz"
+
+    result = _edit.set_usdz_metadata(
+        src,
+        out,
+        uuid="odaibatest5",
+        scene_id="odaibatest5",
+        version_string="local-e2e",
+    )
+    assert result.out_path == out
+    assert result.replaced == ["metadata.yaml"]
+    assert result.added == []
+    assert result.metadata == {
+        "uuid": "odaibatest5",
+        "scene_id": "odaibatest5",
+        "version_string": "local-e2e",
+    }
+
+    doc = _read_metadata_yaml(out)
+    assert doc["uuid"] == "odaibatest5"
+    assert doc["scene_id"] == "odaibatest5"
+    assert doc["version_string"] == "local-e2e"
+
+
+def test_set_usdz_metadata_adds_manifest_when_missing(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    # Simulate a legacy archive that predates the metadata.yaml commitment.
+    stripped = tmp_path / "legacy.usdz"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(stripped, "w", zipfile.ZIP_STORED) as zout:
+        for info in zin.infolist():
+            if info.filename == "metadata.yaml":
+                continue
+            zout.writestr(info, zin.read(info.filename))
+    with zipfile.ZipFile(stripped) as zf:
+        assert "metadata.yaml" not in zf.namelist()
+
+    out = tmp_path / "restored.usdz"
+    result = _edit.set_usdz_metadata(stripped, out, uuid="u", scene_id="s", version_string="v")
+    assert result.added == ["metadata.yaml"]
+    assert result.replaced == []
+    doc = _read_metadata_yaml(out)
+    assert doc == {"uuid": "u", "scene_id": "s", "version_string": "v"}
+
+
+def test_set_usdz_metadata_inherits_missing_fields_from_existing(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    existing = _read_metadata_yaml(src)
+
+    out = tmp_path / "partial.usdz"
+    result = _edit.set_usdz_metadata(src, out, uuid="fixed-uuid")
+    assert result.metadata["uuid"] == "fixed-uuid"
+    # scene_id / version_string carry through from the source manifest.
+    assert result.metadata["scene_id"] == existing["scene_id"]
+    assert result.metadata["version_string"] == existing["version_string"]
+
+
+def test_set_usdz_metadata_output_can_equal_input(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    result = _edit.set_usdz_metadata(src, src, uuid="u2", scene_id="s2", version_string="v2")
+    assert result.out_path == src
+    doc = _read_metadata_yaml(src)
+    assert doc == {"uuid": "u2", "scene_id": "s2", "version_string": "v2"}
+
+
+def test_set_usdz_metadata_rejects_empty_required_field(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(ValueError, match="uuid"):
+        _edit.set_usdz_metadata(src, tmp_path / "out.usdz", uuid="")
+
+
+def test_set_usdz_metadata_extras_persist(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "with_extras.usdz"
+    _edit.set_usdz_metadata(
+        src,
+        out,
+        uuid="u",
+        scene_id="s",
+        version_string="v",
+        extras={"pipeline": "alpasim", "frame_count": 60},
+    )
+    doc = _read_metadata_yaml(out)
+    assert doc["pipeline"] == "alpasim"
+    assert doc["frame_count"] == 60
+
+
+def test_set_usdz_metadata_missing_input_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        _edit.set_usdz_metadata(
+            tmp_path / "missing.usdz",
+            tmp_path / "out.usdz",
+            uuid="u",
+            scene_id="s",
+            version_string="v",
+        )
+
+
+# ----------------------------------------------------------------------------
+# CLI — metadata subcommand
+# ----------------------------------------------------------------------------
+
+
+def test_cli_metadata_writes_manifest_and_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "cli.usdz"
+
+    rc = _cli.main(
+        [
+            "metadata",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--uuid",
+            "odaibatest5",
+            "--scene-id",
+            "odaibatest5",
+            "--version-string",
+            "local-e2e",
+        ]
+    )
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["out_path"] == str(out)
+    assert summary["metadata"] == {
+        "uuid": "odaibatest5",
+        "scene_id": "odaibatest5",
+        "version_string": "local-e2e",
+    }
+    assert summary["replaced"] == ["metadata.yaml"]
+
+    doc = _read_metadata_yaml(out)
+    assert doc["uuid"] == "odaibatest5"
+
+
+def test_cli_metadata_extras_flag_is_json_parsed(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "metadata",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--uuid",
+            "u",
+            "--scene-id",
+            "s",
+            "--version-string",
+            "v",
+            "--extra",
+            "frame_count=60",
+            "--extra",
+            'tags=["mock","alpasim"]',
+            "--extra",
+            "pipeline=alpasim",
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    doc = _read_metadata_yaml(out)
+    assert doc["frame_count"] == 60
+    assert doc["tags"] == ["mock", "alpasim"]
+    assert doc["pipeline"] == "alpasim"
+
+
+def test_cli_metadata_rejects_shadowing_extra(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz(tmp_path)
+    rc = _cli.main(
+        [
+            "metadata",
+            "--input",
+            str(src),
+            "--output",
+            str(tmp_path / "out.usdz"),
+            "--uuid",
+            "u",
+            "--scene-id",
+            "s",
+            "--version-string",
+            "v",
+            "--extra",
+            "uuid=other",
+        ]
+    )
+    assert rc == 2
+    assert "shadow" in capsys.readouterr().err

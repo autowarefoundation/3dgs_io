@@ -28,6 +28,7 @@ from .scene_usdz import (
     save_scene_usdz,
 )
 from .tracks import parse_alpasim_sequence_tracks, parse_tracks
+from .usdz_metadata import make_default_metadata
 
 
 def _parse_extra(spec: str) -> tuple[str, Path]:
@@ -114,6 +115,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--far-plane", type=float, default=300.0)
     p.add_argument("--geometric-error", type=float, default=100.0)
 
+    p.add_argument(
+        "--uuid",
+        default=None,
+        help="metadata.yaml uuid for the output USDZ (default: fresh random UUID4)",
+    )
+    p.add_argument(
+        "--scene-id",
+        dest="scene_id",
+        default=None,
+        help="metadata.yaml scene_id for the output USDZ (default: output filename stem)",
+    )
+    p.add_argument(
+        "--version-string",
+        dest="version_string",
+        default=None,
+        help=(
+            "metadata.yaml version_string for the output USDZ "
+            "(default: '3dgs_io/<installed-version>')"
+        ),
+    )
+
     p.add_argument("-v", "--verbose", action="count", default=0)
     p.add_argument(
         "--quiet",
@@ -166,12 +188,19 @@ def main(argv: list[str] | None = None) -> int:
         rig_path = Path(args.rig_trajectories).expanduser()
         rig_doc = json.loads(rig_path.read_text(encoding="utf-8-sig"))
         rig_trajectories = load_rig_trajectories_doc(rig_doc)
+    metadata = make_default_metadata(
+        out_path=args.out_usdz,
+        uuid=args.uuid,
+        scene_id=args.scene_id,
+        version_string=args.version_string,
+    )
     result = save_scene_usdz(
         args.tileset,
         args.out_usdz,
         extras=extras,
         tracks=tracks,
         rig_trajectories=rig_trajectories,
+        metadata=metadata,
         options=_options_from_args(args),
     )
 

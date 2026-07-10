@@ -15,6 +15,8 @@ Features
 - **LiDAR 2DGS** dedicated I/O for surfel-based Gaussian representations
 - **SPZ / PLY** import & export with automatic coordinate system conversion
 - **Typed metadata** (``GlbMetadata``) stored in ``asset.extras``
+- **USDZ scene bundles** with a guaranteed ``metadata.yaml`` identity card
+  (``uuid`` / ``scene_id`` / ``version_string``) at the archive root
 
 Installation
 ------------
@@ -41,4 +43,5 @@ Or with `uv <https://docs.astral.sh/uv/>`_:
    api/tiles_export
    api/lidar_2dgs
    api/metadata
+   api/usdz_metadata
    api/viewer
