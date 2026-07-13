@@ -12,10 +12,13 @@ from .converters import (
     run_uvx_tool,
 )
 from .edit_usdz import (
+    AlpasimBundleResult,
     EditUsdzResult,
     IntrinsicsEditResult,
     MetadataEditResult,
     add_lanelet2_to_usdz,
+    bundle_usdz_for_alpasim,
+    convert_rig_trajectories_to_alpasim_schema,
     set_usdz_metadata,
     update_camera_intrinsics_in_usdz,
 )
@@ -40,6 +43,7 @@ from .metadata import (
 from .rig_trajectories import (
     RigPose,
     RigTrajectory,
+    dump_alpasim_rig_trajectories,
     load_rig_trajectories_doc,
     parse_alpasim_rig_trajectories,
     parse_rig_trajectories,
@@ -95,9 +99,12 @@ __all__ = [
     "run_uvx_tool",
     "compute_bounding_volume",
     "DatasetType",
+    "AlpasimBundleResult",
     "EditUsdzResult",
     "IntrinsicsEditResult",
     "MetadataEditResult",
+    "bundle_usdz_for_alpasim",
+    "convert_rig_trajectories_to_alpasim_schema",
     "Export",
     "EXT_GAUSSIAN_LIDAR_NAME",
     "ExtAttributeSpec",
@@ -124,6 +131,7 @@ __all__ = [
     "set_usdz_metadata",
     "update_camera_intrinsics_in_usdz",
     "decode_lidar_sidecar",
+    "dump_alpasim_rig_trajectories",
     "encode_lidar_sidecar",
     "load_rig_trajectories_doc",
     "parse_alpasim_rig_trajectories",

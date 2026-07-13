@@ -52,6 +52,7 @@ __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
     "RigPose",
     "RigTrajectory",
+    "dump_alpasim_rig_trajectories",
     "load_rig_trajectories_doc",
     "parse_alpasim_rig_trajectories",
     "parse_rig_trajectories",
@@ -523,3 +524,118 @@ def _attach_alpasim_cameras_to_rig(
             )
         )
     return cameras
+
+
+def _matrix_from_rigpose(pose: RigPose) -> np.ndarray:
+    """Inverse of :func:`_pose_from_matrix`: (t, quat_xyzw) → 4×4."""
+    m = np.eye(4, dtype=np.float64)
+    m[:3, :3] = Rotation.from_quat(list(pose.rotation)).as_matrix()
+    m[:3, 3] = np.array(pose.translation, dtype=np.float64)
+    return m
+
+
+def dump_alpasim_rig_trajectories(
+    rigs: list[RigTrajectory],
+    *,
+    world_to_nre: Any | None = None,
+    t_world_base: Any | None = None,
+) -> dict[str, Any]:
+    """Serialize :class:`RigTrajectory` list into an alpasim ``rig_trajectories.json`` document.
+
+    The parse direction (:func:`parse_alpasim_rig_trajectories`) composes each
+    rig pose as ``M_root_local = world_to_nre @ T_rig_in_base`` and stores
+    ``M_root_local`` on :class:`RigPose`. Here we reverse that: we recover
+    ``T_rig_in_base = inv(world_to_nre) @ M_root_local`` and emit it as
+    ``T_rig_worlds[i]`` (alpasim's legacy naming — despite "world" the field
+    is in the base frame).
+
+    Parameters
+    ----------
+    rigs:
+        Rigs (already in the v1 in-memory shape, root-local poses).
+    world_to_nre:
+        4×4 world→NRE transform to emit. If ``None`` (typical for USDZs whose
+        v1 rig never stored this), an identity matrix is used, and the poses
+        are written verbatim (equivalent, since parse would compose them back
+        to the same root-local frame).
+    t_world_base:
+        4×4 base→ECEF transform. If ``None`` the value is pulled from the
+        first rig's ``metadata['T_world_base']`` if present, otherwise it is
+        omitted (alpasim runtime treats a missing value as identity).
+    """
+    if world_to_nre is None:
+        w2n = np.eye(4, dtype=np.float64)
+    else:
+        w2n = _as_4x4(world_to_nre)
+    inv_w2n = np.linalg.inv(w2n)
+
+    if t_world_base is None:
+        for rig in rigs:
+            candidate = rig.metadata.get("T_world_base")
+            if candidate is not None:
+                t_world_base = candidate
+                break
+    twb_matrix: np.ndarray | None = None
+    if t_world_base is not None:
+        twb_matrix = _as_4x4(t_world_base)
+
+    camera_calibrations: dict[str, dict[str, Any]] = {}
+    for rig in rigs:
+        for cam in rig.cameras:
+            if cam.name in camera_calibrations:
+                raise ValueError(
+                    f"camera name {cam.name!r} appears in multiple rigs; "
+                    "alpasim camera_calibrations is a flat dict and requires unique names"
+                )
+            entry: dict[str, Any] = {
+                "T_sensor_rig": cam.extrinsics.to_t_sensor_rig(),
+                "camera_model": cam.camera_model.to_dict(),
+                "logical_sensor_name": cam.metadata.get("logical_sensor_name", cam.name),
+            }
+            unique_idx = cam.metadata.get("unique_sensor_idx")
+            if unique_idx is not None:
+                entry["unique_sensor_idx"] = unique_idx
+            camera_calibrations[cam.name] = entry
+
+    rig_trajectories_out: list[dict[str, Any]] = []
+    for rig in rigs:
+        poses_sorted = sorted(rig.poses, key=lambda p: p.timestamp_us)
+        ts_list = [int(p.timestamp_us) for p in poses_sorted]
+        t_rig_worlds: list[list[list[float]]] = []
+        for pose in poses_sorted:
+            m_root_local = _matrix_from_rigpose(pose)
+            t_rig_in_base = inv_w2n @ m_root_local
+            t_rig_worlds.append(t_rig_in_base.tolist())
+
+        cameras_frame_ts: dict[str, list[list[int]]] = {}
+        if ts_list and rig.cameras:
+            deltas = [ts_list[i + 1] - ts_list[i] for i in range(len(ts_list) - 1)]
+            positive = [d for d in deltas if d > 0]
+            median_dt = sorted(positive)[len(positive) // 2] if positive else 1
+            ranges: list[list[int]] = [
+                [ts_list[i], ts_list[i + 1]] for i in range(len(ts_list) - 1)
+            ]
+            ranges.append([ts_list[-1], ts_list[-1] + int(median_dt)])
+            for cam in rig.cameras:
+                cameras_frame_ts[cam.name] = [list(r) for r in ranges]
+
+        sequence_id = rig.metadata.get("sequence_id") or rig.rig_id
+        rig_dict: dict[str, Any] = {
+            "sequence_id": str(sequence_id),
+            "T_rig_world_timestamps_us": ts_list,
+            "T_rig_worlds": t_rig_worlds,
+        }
+        if cameras_frame_ts:
+            rig_dict["cameras_frame_timestamps_us"] = cameras_frame_ts
+        rig_bbox = rig.metadata.get("rig_bbox")
+        if rig_bbox is not None:
+            rig_dict["rig_bbox"] = rig_bbox
+        rig_trajectories_out.append(rig_dict)
+
+    doc: dict[str, Any] = {}
+    if twb_matrix is not None:
+        doc["T_world_base"] = twb_matrix.tolist()
+    doc["world_to_nre"] = {"matrix": w2n.tolist()}
+    doc["rig_trajectories"] = rig_trajectories_out
+    doc["camera_calibrations"] = camera_calibrations
+    return doc
