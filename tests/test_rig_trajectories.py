@@ -18,6 +18,7 @@ CameraModel = _mod.CameraModel
 RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
 dump_alpasim_rig_trajectories = _mod.dump_alpasim_rig_trajectories
+load_rig_trajectories_doc = _mod.load_rig_trajectories_doc
 parse_alpasim_rig_trajectories = _mod.parse_alpasim_rig_trajectories
 parse_rig_trajectories = _mod.parse_rig_trajectories
 save_scene_usdz = _mod.save_scene_usdz
@@ -29,7 +30,7 @@ def _read_rig_trajectories_from_usdz(path: Path) -> list[RigTrajectory]:
     """Test helper: pull rig_trajectories.json out of a USDZ and parse it."""
     with zipfile.ZipFile(path) as zf:
         doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
-    return parse_rig_trajectories(doc)
+    return load_rig_trajectories_doc(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -305,8 +306,84 @@ def test_save_scene_usdz_embeds_rig_trajectories(
         scene = json.loads(zf.read("scene.json"))
         rig_doc = json.loads(zf.read("rig_trajectories.json"))
     assert scene["extras"]["rig_trajectories"] == "rig_trajectories.json"
+    assert "world_to_nre" in rig_doc
+    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+
+
+def test_save_scene_usdz_defaults_to_alpasim_schema(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, rig_trajectories=[_trajectory("ego")])
+
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
+    assert "schema" not in rig_doc
+    assert rig_doc["world_to_nre"] == {"matrix": _eye_4x4()}
+    assert "T_world_base" not in rig_doc
+    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+
+
+def test_save_scene_usdz_splatsim_v1_opt_in(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(
+        ts,
+        out,
+        rig_trajectories=[_trajectory("ego")],
+        rig_schema="splatsim/v1",
+    )
+
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
     assert rig_doc["schema"] == "splatsim.rig_trajectories/v1"
     assert [r["rig_id"] for r in rig_doc["rigs"]] == ["ego"]
+
+
+def test_save_scene_usdz_alpasim_with_world_to_nre(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    w2n = np.array(_translation_only_4x4(-100.0, 20.0, 0.0), dtype=np.float64)
+    twb = np.array(_translation_only_4x4(1_000_000.0, 0.0, 0.0), dtype=np.float64)
+    save_scene_usdz(
+        ts,
+        out,
+        rig_trajectories=[_trajectory("ego")],
+        world_to_nre=w2n,
+        t_world_base=twb,
+    )
+
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
+    assert rig_doc["world_to_nre"] == {"matrix": w2n.tolist()}
+    assert rig_doc["T_world_base"] == twb.tolist()
+
+
+def test_save_scene_usdz_transforms_without_rig_raises(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    with pytest.raises(ValueError, match="require rig_trajectories"):
+        save_scene_usdz(ts, out, world_to_nre=np.eye(4))
+
+
+def test_save_scene_usdz_splatsim_with_transforms_raises(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    with pytest.raises(ValueError, match="only meaningful when"):
+        save_scene_usdz(
+            ts,
+            out,
+            rig_trajectories=[_trajectory("ego")],
+            rig_schema="splatsim/v1",
+            world_to_nre=np.eye(4),
+        )
 
 
 def test_rig_trajectories_round_trip_via_usdz(

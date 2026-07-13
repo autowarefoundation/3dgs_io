@@ -40,14 +40,18 @@ import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import spz
 
 from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
 from .gltf_io import load_gltf_with_metadata
-from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
+from .rig_trajectories import (
+    RigTrajectory,
+    dump_alpasim_rig_trajectories,
+    serialize_rig_trajectories,
+)
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
@@ -688,6 +692,9 @@ def save_scene_usdz(
     extras: Mapping[str, str | Path] | None = None,
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
+    rig_schema: Literal["alpasim", "splatsim/v1"] = "alpasim",
+    world_to_nre: Any | None = None,
+    t_world_base: Any | None = None,
     metadata: UsdzMetadata | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
@@ -764,15 +771,31 @@ def save_scene_usdz(
         archive_paths.add("sequence_tracks.json")
 
     rig_trajectories_payload: bytes | None = None
+    if rig_trajectories is None and (world_to_nre is not None or t_world_base is not None):
+        raise ValueError("world_to_nre / t_world_base require rig_trajectories to be provided")
     if rig_trajectories is not None:
         if "rig_trajectories.json" in archive_paths:
             raise ValueError(
                 "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
                 "present in extras; pick one of the two"
             )
-        rig_trajectories_payload = json.dumps(
-            serialize_rig_trajectories(rig_trajectories), indent=2
-        ).encode("utf-8")
+        if rig_schema == "alpasim":
+            rig_doc = dump_alpasim_rig_trajectories(
+                rig_trajectories,
+                world_to_nre=world_to_nre,
+                t_world_base=t_world_base,
+            )
+        elif rig_schema == "splatsim/v1":
+            if world_to_nre is not None or t_world_base is not None:
+                raise ValueError(
+                    "world_to_nre / t_world_base are only meaningful when rig_schema='alpasim'"
+                )
+            rig_doc = serialize_rig_trajectories(rig_trajectories)
+        else:
+            raise ValueError(
+                f"unknown rig_schema {rig_schema!r}; expected 'alpasim' or 'splatsim/v1'"
+            )
+        rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
         archive_paths.add("rig_trajectories.json")
 
     extras_meta = _detect_known_extras(archive_paths)
