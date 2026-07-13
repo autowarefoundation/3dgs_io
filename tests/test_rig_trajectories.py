@@ -413,7 +413,7 @@ def test_rig_trajectories_and_extras_collision_rejected(
         )
 
 
-def test_cli_rig_trajectories_flag_native_schema(
+def test_cli_rig_trajectories_flag_writes_alpasim_by_default(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
@@ -424,6 +424,11 @@ def test_cli_rig_trajectories_flag_native_schema(
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--rig-trajectories", str(rig_path), "--quiet"])
     assert rc == 0
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
+    assert "schema" not in rig_doc
+    assert "world_to_nre" in rig_doc
+    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
     recovered = _read_rig_trajectories_from_usdz(out)
     assert [r.rig_id for r in recovered] == ["ego"]
 
