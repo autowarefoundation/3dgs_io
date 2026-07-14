@@ -28,10 +28,8 @@ from pathlib import Path
 from typing import Any
 
 from .rig_trajectories import (
-    RIG_TRAJECTORIES_SCHEMA,
     dump_alpasim_rig_trajectories,
     load_rig_trajectories_doc,
-    serialize_rig_trajectories,
     update_camera_intrinsics,
 )
 from .usdz_metadata import (
@@ -185,8 +183,8 @@ def update_camera_intrinsics_in_usdz(
     ``rig_trajectories`` extra). The file is loaded, the camera addressed by
     ``camera_name`` (and optionally ``rig_id``) is updated via
     :func:`3dgs_io.rig_trajectories.update_camera_intrinsics`, and the result
-    is written back — always in the splatsim schema, even if the original
-    file was in the alpasim shape.
+    is written back in the flat alpasim layout (matching what
+    :func:`3dgs_io.save_scene_usdz` emits).
 
     Parameters
     ----------
@@ -221,20 +219,12 @@ def update_camera_intrinsics_in_usdz(
             raise ValueError(f"{input_usdz} does not contain {_RIG_TRAJECTORIES_ARCHIVE_PATH!r}")
         rig_doc = json.loads(zin.read(_RIG_TRAJECTORIES_ARCHIVE_PATH).decode("utf-8-sig"))
 
-    if isinstance(rig_doc, dict) and rig_doc.get("schema") != RIG_TRAJECTORIES_SCHEMA:
-        _log.warning(
-            "%s: embedded %s is not %s; treating as alpasim and rewriting in our schema "
-            "(alpasim-only fields not retained by the splatsim schema will be lost).",
-            input_usdz,
-            _RIG_TRAJECTORIES_ARCHIVE_PATH,
-            RIG_TRAJECTORIES_SCHEMA,
-        )
-
     rigs = load_rig_trajectories_doc(rig_doc)
     cam = update_camera_intrinsics(
         rigs, camera_name=camera_name, rig_id=rig_id, **intrinsic_updates
     )
-    new_rig_bytes = (json.dumps(serialize_rig_trajectories(rigs), indent=2) + "\n").encode("utf-8")
+    new_rig_doc = dump_alpasim_rig_trajectories(rigs)
+    new_rig_bytes = (json.dumps(new_rig_doc, indent=2) + "\n").encode("utf-8")
 
     _added, replaced = _repack_usdz(
         input_usdz,

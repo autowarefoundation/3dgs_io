@@ -40,18 +40,14 @@ import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import spz
 
 from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
 from .gltf_io import load_gltf_with_metadata
-from .rig_trajectories import (
-    RigTrajectory,
-    dump_alpasim_rig_trajectories,
-    serialize_rig_trajectories,
-)
+from .rig_trajectories import RigTrajectory, dump_alpasim_rig_trajectories
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
@@ -692,7 +688,6 @@ def save_scene_usdz(
     extras: Mapping[str, str | Path] | None = None,
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
-    rig_schema: Literal["alpasim", "splatsim/v1"] = "alpasim",
     world_to_nre: Any | None = None,
     t_world_base: Any | None = None,
     metadata: UsdzMetadata | None = None,
@@ -728,25 +723,20 @@ def save_scene_usdz(
     rig_trajectories:
         Optional list of sensor-rig :class:`RigTrajectory` objects (typically
         an ego trajectory). When given they are serialised into
-        ``rig_trajectories.json`` inside the archive and recorded under
-        ``scene.json.extras.rig_trajectories``. The on-disk shape is
-        controlled by ``rig_schema``. Rig poses live in the root-local frame;
-        cameras nested under each rig (:attr:`RigTrajectory.cameras`) carry
-        rig-relative extrinsics (``T_sensor_rig``).
-    rig_schema:
-        Which layout to write when ``rig_trajectories`` is provided.
-        ``"alpasim"`` (the default) emits the legacy flat alpasim document
-        (top-level ``world_to_nre`` / ``T_world_base`` / ``rig_trajectories`` /
-        ``camera_calibrations``, no ``schema`` key). ``"splatsim/v1"`` emits
-        the native ``splatsim.rig_trajectories/v1`` document.
+        ``rig_trajectories.json`` inside the archive (flat alpasim layout:
+        top-level ``world_to_nre`` / ``T_world_base`` / ``rig_trajectories`` /
+        ``camera_calibrations``) and recorded under
+        ``scene.json.extras.rig_trajectories``. Rig poses live in the
+        root-local frame; cameras nested under each rig
+        (:attr:`RigTrajectory.cameras`) carry rig-relative extrinsics
+        (``T_sensor_rig``).
     world_to_nre:
-        4×4 array-like transform mapping root-local poses into the alpasim
-        ``world`` frame. Only meaningful for ``rig_schema="alpasim"``; must
-        be omitted (or paired with ``rig_trajectories``) otherwise. Defaults
-        to identity when omitted.
+        Optional 4×4 array-like transform mapping root-local poses into the
+        alpasim ``world`` frame; defaults to identity when omitted. Requires
+        ``rig_trajectories``.
     t_world_base:
         Optional 4×4 array-like ECEF anchor written to alpasim
-        ``T_world_base``. Only meaningful for ``rig_schema="alpasim"``.
+        ``T_world_base``. Requires ``rig_trajectories``.
     metadata:
         Identity card written to ``metadata.yaml`` at the archive root
         (``uuid`` / ``scene_id`` / ``version_string``). When ``None`` a
@@ -792,22 +782,11 @@ def save_scene_usdz(
                 "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
                 "present in extras; pick one of the two"
             )
-        if rig_schema == "alpasim":
-            rig_doc = dump_alpasim_rig_trajectories(
-                rig_trajectories,
-                world_to_nre=world_to_nre,
-                t_world_base=t_world_base,
-            )
-        elif rig_schema == "splatsim/v1":
-            if world_to_nre is not None or t_world_base is not None:
-                raise ValueError(
-                    "world_to_nre / t_world_base are only meaningful when rig_schema='alpasim'"
-                )
-            rig_doc = serialize_rig_trajectories(rig_trajectories)
-        else:
-            raise ValueError(
-                f"unknown rig_schema {rig_schema!r}; expected 'alpasim' or 'splatsim/v1'"
-            )
+        rig_doc = dump_alpasim_rig_trajectories(
+            rig_trajectories,
+            world_to_nre=world_to_nre,
+            t_world_base=t_world_base,
+        )
         rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
         archive_paths.add("rig_trajectories.json")
 

@@ -119,7 +119,8 @@ def _make_usdz_with_rig(tmp_path: Path, **rig_kwargs: Any) -> Path:
 def _read_rig_camera_params(usdz_path: Path) -> dict[str, Any]:
     with zipfile.ZipFile(usdz_path) as zf:
         doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
-    return doc["rigs"][0]["cameras"][0]["camera_model"]["parameters"]
+    (params,) = (cam["camera_model"]["parameters"] for cam in doc["camera_calibrations"].values())
+    return params
 
 
 # ----------------------------------------------------------------------------
