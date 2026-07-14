@@ -223,7 +223,15 @@ def update_camera_intrinsics_in_usdz(
     cam = update_camera_intrinsics(
         rigs, camera_name=camera_name, rig_id=rig_id, **intrinsic_updates
     )
-    new_rig_doc = dump_alpasim_rig_trajectories(rigs)
+    # parse absorbs world_to_nre into the poses; forward the original matrix so
+    # dump unwinds it and a no-op intrinsic edit is a byte-level round trip.
+    original_w2n = (
+        rig_doc.get("world_to_nre", {}).get("matrix") if isinstance(rig_doc, dict) else None
+    )
+    original_twb = rig_doc.get("T_world_base") if isinstance(rig_doc, dict) else None
+    new_rig_doc = dump_alpasim_rig_trajectories(
+        rigs, world_to_nre=original_w2n, t_world_base=original_twb
+    )
     new_rig_bytes = (json.dumps(new_rig_doc, indent=2) + "\n").encode("utf-8")
 
     _added, replaced = _repack_usdz(
