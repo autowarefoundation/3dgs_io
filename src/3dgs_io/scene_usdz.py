@@ -47,7 +47,7 @@ import spz
 
 from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
 from .gltf_io import load_gltf_with_metadata
-from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
+from .rig_trajectories import RigTrajectory, dump_alpasim_rig_trajectories
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
@@ -688,6 +688,8 @@ def save_scene_usdz(
     extras: Mapping[str, str | Path] | None = None,
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
+    world_to_nre: Any | None = None,
+    t_world_base: Any | None = None,
     metadata: UsdzMetadata | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
@@ -721,12 +723,20 @@ def save_scene_usdz(
     rig_trajectories:
         Optional list of sensor-rig :class:`RigTrajectory` objects (typically
         an ego trajectory). When given they are serialised into
-        ``rig_trajectories.json`` inside the archive (schema
-        ``splatsim.rig_trajectories/v1``) and recorded under
+        ``rig_trajectories.json`` inside the archive (flat alpasim layout:
+        top-level ``world_to_nre`` / ``T_world_base`` / ``rig_trajectories`` /
+        ``camera_calibrations``) and recorded under
         ``scene.json.extras.rig_trajectories``. Rig poses live in the
         root-local frame; cameras nested under each rig
         (:attr:`RigTrajectory.cameras`) carry rig-relative extrinsics
         (``T_sensor_rig``).
+    world_to_nre:
+        Optional 4×4 array-like transform mapping root-local poses into the
+        alpasim ``world`` frame; defaults to identity when omitted. Requires
+        ``rig_trajectories``.
+    t_world_base:
+        Optional 4×4 array-like ECEF anchor written to alpasim
+        ``T_world_base``. Requires ``rig_trajectories``.
     metadata:
         Identity card written to ``metadata.yaml`` at the archive root
         (``uuid`` / ``scene_id`` / ``version_string``). When ``None`` a
@@ -764,15 +774,20 @@ def save_scene_usdz(
         archive_paths.add("sequence_tracks.json")
 
     rig_trajectories_payload: bytes | None = None
-    if rig_trajectories is not None:
+    if not rig_trajectories and (world_to_nre is not None or t_world_base is not None):
+        raise ValueError("world_to_nre / t_world_base require rig_trajectories to be provided")
+    if rig_trajectories:
         if "rig_trajectories.json" in archive_paths:
             raise ValueError(
                 "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
                 "present in extras; pick one of the two"
             )
-        rig_trajectories_payload = json.dumps(
-            serialize_rig_trajectories(rig_trajectories), indent=2
-        ).encode("utf-8")
+        rig_doc = dump_alpasim_rig_trajectories(
+            rig_trajectories,
+            world_to_nre=world_to_nre,
+            t_world_base=t_world_base,
+        )
+        rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
         archive_paths.add("rig_trajectories.json")
 
     extras_meta = _detect_known_extras(archive_paths)

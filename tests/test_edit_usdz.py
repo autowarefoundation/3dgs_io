@@ -119,7 +119,8 @@ def _make_usdz_with_rig(tmp_path: Path, **rig_kwargs: Any) -> Path:
 def _read_rig_camera_params(usdz_path: Path) -> dict[str, Any]:
     with zipfile.ZipFile(usdz_path) as zf:
         doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
-    return doc["rigs"][0]["cameras"][0]["camera_model"]["parameters"]
+    (params,) = (cam["camera_model"]["parameters"] for cam in doc["camera_calibrations"].values())
+    return params
 
 
 # ----------------------------------------------------------------------------
@@ -675,3 +676,146 @@ def test_cli_metadata_rejects_shadowing_extra(
     )
     assert rc == 2
     assert "shadow" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# convert_rig_trajectories_to_alpasim_schema & bundle_usdz_for_alpasim
+# ----------------------------------------------------------------------------
+
+
+def _read_archive_json(usdz_path: Path, name: str) -> Any:
+    with zipfile.ZipFile(usdz_path) as zf:
+        return json.loads(zf.read(name).decode("utf-8-sig"))
+
+
+def test_convert_rig_trajectories_to_alpasim_schema_rewrites_in_legacy_schema(
+    tmp_path: Path,
+) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "scene.alpasim.usdz"
+
+    result = _edit.convert_rig_trajectories_to_alpasim_schema(usdz, out)
+
+    assert result.out_path == out
+    assert "rig_trajectories.json" in result.replaced
+    doc = _read_archive_json(out, "rig_trajectories.json")
+    # Legacy alpasim keys must be present; splatsim v1 keys must NOT be.
+    assert "rig_trajectories" in doc
+    assert "camera_calibrations" in doc
+    assert "world_to_nre" in doc
+    assert "rigs" not in doc  # splatsim v1 top-level key
+    assert "front" in doc["camera_calibrations"]
+    assert doc["rig_trajectories"][0]["sequence_id"] == "ego"
+
+
+def test_convert_rig_trajectories_requires_rig_trajectories_json(tmp_path: Path) -> None:
+    usdz = _make_usdz(tmp_path)  # no rig_trajectories.json
+    with pytest.raises(ValueError, match="rig_trajectories.json"):
+        _edit.convert_rig_trajectories_to_alpasim_schema(usdz, tmp_path / "out.usdz")
+
+
+def test_convert_rig_trajectories_in_place_overwrites_input(tmp_path: Path) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    _edit.convert_rig_trajectories_to_alpasim_schema(usdz, usdz)
+    doc = _read_archive_json(usdz, "rig_trajectories.json")
+    assert "camera_calibrations" in doc
+
+
+def test_bundle_usdz_for_alpasim_converts_rig_and_writes_metadata(tmp_path: Path) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "scene.bundle.usdz"
+
+    result = _edit.bundle_usdz_for_alpasim(usdz, out)
+
+    assert result.rig_schema_converted is True
+    assert result.metadata_written is True
+    assert result.lanelet2_embedded is False
+    doc = _read_archive_json(out, "rig_trajectories.json")
+    assert "camera_calibrations" in doc
+    # metadata.yaml must be present
+    with zipfile.ZipFile(out) as zf:
+        assert _mod.USDZ_METADATA_ARCHIVE_PATH in zf.namelist()
+
+
+def test_bundle_usdz_for_alpasim_embeds_lanelet2_when_provided(tmp_path: Path) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    osm = _make_osm(tmp_path)
+    out = tmp_path / "scene.bundle.usdz"
+
+    result = _edit.bundle_usdz_for_alpasim(usdz, out, lanelet2_path=osm)
+
+    assert result.lanelet2_embedded is True
+    scene = _read_archive_json(out, "scene.json")
+    assert scene["extras"]["map_lanelet2"] == "map.osm"
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("map.osm") == _SAMPLE_OSM
+
+
+def test_bundle_usdz_for_alpasim_applies_world_to_nre(tmp_path: Path) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "scene.bundle.usdz"
+    w2n = [
+        [1.0, 0.0, 0.0, 10.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+    _edit.bundle_usdz_for_alpasim(usdz, out, world_to_nre=w2n)
+
+    doc = _read_archive_json(out, "rig_trajectories.json")
+    np.testing.assert_allclose(doc["world_to_nre"]["matrix"], w2n)
+
+
+def test_bundle_usdz_for_alpasim_missing_rig_trajectories_raises(tmp_path: Path) -> None:
+    usdz = _make_usdz(tmp_path)
+    with pytest.raises(ValueError, match="rig_trajectories.json"):
+        _edit.bundle_usdz_for_alpasim(usdz, tmp_path / "out.usdz")
+
+
+def test_bundle_usdz_for_alpasim_missing_lanelet2_raises(tmp_path: Path) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.bundle_usdz_for_alpasim(
+            usdz, tmp_path / "out.usdz", lanelet2_path=tmp_path / "does_not_exist.osm"
+        )
+
+
+def test_cli_alpasim_bundle_end_to_end(tmp_path: Path) -> None:
+    usdz = _make_usdz_with_rig(tmp_path)
+    osm = _make_osm(tmp_path)
+    out = tmp_path / "scene.bundle.usdz"
+    w2n_path = tmp_path / "w2n.json"
+    w2n_path.write_text(
+        json.dumps(
+            [
+                [1.0, 0.0, 0.0, 5.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+    )
+
+    rc = _cli.main(
+        [
+            "alpasim-bundle",
+            "--input",
+            str(usdz),
+            "--output",
+            str(out),
+            "--lanelet2",
+            str(osm),
+            "--world-to-nre",
+            str(w2n_path),
+            "--quiet",
+        ]
+    )
+
+    assert rc == 0
+    doc = _read_archive_json(out, "rig_trajectories.json")
+    assert "camera_calibrations" in doc
+    assert doc["world_to_nre"]["matrix"][0][3] == 5.0
+    with zipfile.ZipFile(out) as zf:
+        assert "map.osm" in zf.namelist()
+        assert _mod.USDZ_METADATA_ARCHIVE_PATH in zf.namelist()

@@ -17,6 +17,8 @@ CameraExtrinsics = _mod.CameraExtrinsics
 CameraModel = _mod.CameraModel
 RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
+dump_alpasim_rig_trajectories = _mod.dump_alpasim_rig_trajectories
+load_rig_trajectories_doc = _mod.load_rig_trajectories_doc
 parse_alpasim_rig_trajectories = _mod.parse_alpasim_rig_trajectories
 parse_rig_trajectories = _mod.parse_rig_trajectories
 save_scene_usdz = _mod.save_scene_usdz
@@ -28,7 +30,7 @@ def _read_rig_trajectories_from_usdz(path: Path) -> list[RigTrajectory]:
     """Test helper: pull rig_trajectories.json out of a USDZ and parse it."""
     with zipfile.ZipFile(path) as zf:
         doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
-    return parse_rig_trajectories(doc)
+    return load_rig_trajectories_doc(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -304,8 +306,53 @@ def test_save_scene_usdz_embeds_rig_trajectories(
         scene = json.loads(zf.read("scene.json"))
         rig_doc = json.loads(zf.read("rig_trajectories.json"))
     assert scene["extras"]["rig_trajectories"] == "rig_trajectories.json"
-    assert rig_doc["schema"] == "splatsim.rig_trajectories/v1"
-    assert [r["rig_id"] for r in rig_doc["rigs"]] == ["ego"]
+    assert "world_to_nre" in rig_doc
+    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+
+
+def test_save_scene_usdz_defaults_to_alpasim_schema(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, rig_trajectories=[_trajectory("ego")])
+
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
+    assert "schema" not in rig_doc
+    assert rig_doc["world_to_nre"] == {"matrix": _eye_4x4()}
+    assert "T_world_base" not in rig_doc
+    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+
+
+def test_save_scene_usdz_alpasim_with_world_to_nre(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    w2n = np.array(_translation_only_4x4(-100.0, 20.0, 0.0), dtype=np.float64)
+    twb = np.array(_translation_only_4x4(1_000_000.0, 0.0, 0.0), dtype=np.float64)
+    save_scene_usdz(
+        ts,
+        out,
+        rig_trajectories=[_trajectory("ego")],
+        world_to_nre=w2n,
+        t_world_base=twb,
+    )
+
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
+    assert rig_doc["world_to_nre"] == {"matrix": w2n.tolist()}
+    assert rig_doc["T_world_base"] == twb.tolist()
+
+
+def test_save_scene_usdz_transforms_without_rig_raises(
+    tmp_path: Path, make_minimal_tileset_with_glb
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
+    out = tmp_path / "scene.usdz"
+    with pytest.raises(ValueError, match="require rig_trajectories"):
+        save_scene_usdz(ts, out, world_to_nre=np.eye(4))
 
 
 def test_rig_trajectories_round_trip_via_usdz(
@@ -335,7 +382,7 @@ def test_rig_trajectories_and_extras_collision_rejected(
         )
 
 
-def test_cli_rig_trajectories_flag_native_schema(
+def test_cli_rig_trajectories_flag_writes_alpasim_by_default(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
@@ -346,6 +393,11 @@ def test_cli_rig_trajectories_flag_native_schema(
     out = tmp_path / "scene.usdz"
     rc = cli.main([str(ts), str(out), "--rig-trajectories", str(rig_path), "--quiet"])
     assert rc == 0
+    with zipfile.ZipFile(out) as zf:
+        rig_doc = json.loads(zf.read("rig_trajectories.json"))
+    assert "schema" not in rig_doc
+    assert "world_to_nre" in rig_doc
+    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
     recovered = _read_rig_trajectories_from_usdz(out)
     assert [r.rig_id for r in recovered] == ["ego"]
 
@@ -451,3 +503,86 @@ def test_update_camera_intrinsics_preserves_extra_camera_fields() -> None:
     )
     cam = update_camera_intrinsics(rigs, camera_name="front", fx=1234.5)
     assert cam.metadata == {"sensor_id": "C1"}
+
+
+# --- dump_alpasim_rig_trajectories --------------------------------------
+
+
+def test_dump_alpasim_produces_required_top_level_keys() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    assert "world_to_nre" in doc and "matrix" in doc["world_to_nre"]
+    assert "rig_trajectories" in doc and len(doc["rig_trajectories"]) == 1
+    assert "camera_calibrations" in doc and "front" in doc["camera_calibrations"]
+    rig0 = doc["rig_trajectories"][0]
+    assert rig0["sequence_id"] == "ego"
+    assert rig0["T_rig_world_timestamps_us"] == [0]
+    assert len(rig0["T_rig_worlds"]) == 1
+    # cameras_frame_timestamps_us must be [start, end] pairs, one per rig frame
+    frame_ts = rig0["cameras_frame_timestamps_us"]["front"]
+    assert len(frame_ts) == 1 and all(len(r) == 2 and r[1] > r[0] for r in frame_ts)
+
+
+def test_dump_alpasim_camera_calibrations_use_logical_name_and_matrix() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    entry = doc["camera_calibrations"]["front"]
+    assert entry["logical_sensor_name"] == "front"
+    assert np.array(entry["T_sensor_rig"]).shape == (4, 4)
+    assert "camera_model" in entry
+    assert entry["camera_model"]["parameters"]["resolution"] == [1920, 1080]
+
+
+def test_dump_alpasim_round_trip_preserves_poses_and_intrinsics() -> None:
+    rigs_in = [_rig_with_camera("ego", "front")]
+    doc = dump_alpasim_rig_trajectories(rigs_in)
+    rigs_out = parse_alpasim_rig_trajectories(doc)
+    assert len(rigs_out) == 1
+    out = rigs_out[0]
+    assert out.rig_id == "ego"
+    assert [p.timestamp_us for p in out.poses] == [p.timestamp_us for p in rigs_in[0].poses]
+    for pin, pout in zip(rigs_in[0].poses, out.poses, strict=False):
+        np.testing.assert_allclose(pout.translation, pin.translation, atol=1e-9)
+        np.testing.assert_allclose(pout.rotation, pin.rotation, atol=1e-9)
+    # Intrinsics survive the alpasim serialisation
+    assert out.cameras[0].camera_model.width == rigs_in[0].cameras[0].camera_model.width
+
+
+def test_dump_alpasim_uses_metadata_t_world_base_when_arg_absent() -> None:
+    rigs = [_rig_with_camera("ego", "front")]
+    twb = _translation_only_4x4(1_000_000.0, 0.0, 0.0)
+    rigs[0].metadata["T_world_base"] = twb
+    doc = dump_alpasim_rig_trajectories(rigs)
+    np.testing.assert_allclose(np.array(doc["T_world_base"]), twb, atol=1e-9)
+
+
+def test_dump_alpasim_explicit_world_to_nre_inverts_into_base_frame() -> None:
+    """When world_to_nre != I, T_rig_worlds must be inv(w2n) @ M_root_local."""
+    rigs = [_rig_with_camera("ego", "front")]
+    w2n = _translation_only_4x4(10.0, 0.0, 0.0)
+    doc = dump_alpasim_rig_trajectories(rigs, world_to_nre=w2n)
+    # Round-trip: parse should recover the exact same root-local poses.
+    rigs_rt = parse_alpasim_rig_trajectories(doc)
+    for pin, pout in zip(rigs[0].poses, rigs_rt[0].poses, strict=False):
+        np.testing.assert_allclose(pout.translation, pin.translation, atol=1e-9)
+
+
+def test_dump_alpasim_rejects_duplicate_camera_names_across_rigs() -> None:
+    rigs = [
+        _rig_with_camera("ego-a", "front"),
+        _rig_with_camera("ego-b", "front"),
+    ]
+    with pytest.raises(ValueError, match="camera name 'front' appears in multiple rigs"):
+        dump_alpasim_rig_trajectories(rigs)
+
+
+def test_dump_alpasim_no_frame_timestamps_when_rig_has_no_cameras() -> None:
+    rigs = [
+        RigTrajectory(
+            rig_id="ego",
+            poses=[_pose(1_000_000, 0.0, 0.0, 0.0)],
+            cameras=[],
+        )
+    ]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    assert "cameras_frame_timestamps_us" not in doc["rig_trajectories"][0]
