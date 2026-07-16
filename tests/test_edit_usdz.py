@@ -236,6 +236,99 @@ def test_add_lanelet2_missing_lanelet2_raises(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------------
+# add_clipgt_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def _make_clipgt_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "clipgt_src"
+    d.mkdir()
+    (d / "lane.parquet").write_bytes(b"parquet-lane")
+    (d / "road_boundary.parquet").write_bytes(b"parquet-rb")
+    sub = d / "extras"
+    sub.mkdir()
+    (sub / "wait_line.parquet").write_bytes(b"parquet-wl")
+    return d
+
+
+def test_add_clipgt_inserts_files_under_prefix(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "with_clipgt.usdz"
+
+    result = _edit.add_clipgt_to_usdz(src, out, src_dir)
+    assert sorted(result.added) == [
+        "clipgt/extras/wait_line.parquet",
+        "clipgt/lane.parquet",
+        "clipgt/road_boundary.parquet",
+    ]
+    assert result.replaced == []
+    assert result.out_path == out
+
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        assert names[0] == "default.usda", "default.usda must remain first per USDZ spec"
+        assert zf.read("clipgt/lane.parquet") == b"parquet-lane"
+        assert zf.read("clipgt/road_boundary.parquet") == b"parquet-rb"
+        assert zf.read("clipgt/extras/wait_line.parquet") == b"parquet-wl"
+
+
+def test_add_clipgt_preserves_original_entry_order(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "with_clipgt.usdz"
+
+    _edit.add_clipgt_to_usdz(src, out, src_dir)
+
+    with zipfile.ZipFile(src) as zin:
+        src_names = zin.namelist()
+    with zipfile.ZipFile(out) as zout:
+        out_names = zout.namelist()
+    assert out_names[: len(src_names)] == src_names
+    assert all(n.startswith("clipgt/") for n in out_names[len(src_names) :])
+
+
+def test_add_clipgt_replaces_existing_entries(tmp_path: Path) -> None:
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "lane.parquet").write_bytes(b"stale")
+    src = _make_usdz(tmp_path, extras={"clipgt/lane.parquet": stale_dir / "lane.parquet"})
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "replaced.usdz"
+
+    result = _edit.add_clipgt_to_usdz(src, out, src_dir)
+    assert "clipgt/lane.parquet" in result.replaced
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("clipgt/lane.parquet") == b"parquet-lane"
+
+
+def test_add_clipgt_no_overwrite_raises_on_existing_prefix(tmp_path: Path) -> None:
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "lane.parquet").write_bytes(b"stale")
+    src = _make_usdz(tmp_path, extras={"clipgt/lane.parquet": stale_dir / "lane.parquet"})
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "should_not_write.usdz"
+
+    with pytest.raises(FileExistsError):
+        _edit.add_clipgt_to_usdz(src, out, src_dir, overwrite=False)
+
+
+def test_add_clipgt_empty_dir_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError):
+        _edit.add_clipgt_to_usdz(src, tmp_path / "out.usdz", empty)
+
+
+def test_add_clipgt_missing_dir_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_clipgt_to_usdz(src, tmp_path / "out.usdz", tmp_path / "nope")
+
+
+# ----------------------------------------------------------------------------
 # update_camera_intrinsics_in_usdz — library API
 # ----------------------------------------------------------------------------
 
