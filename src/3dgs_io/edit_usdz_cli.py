@@ -70,6 +70,7 @@ from typing import Any
 
 from .edit_usdz import (
     _result_summary,
+    add_clipgt_to_usdz,
     add_lanelet2_to_usdz,
     bundle_usdz_for_alpasim,
     set_usdz_metadata,
@@ -204,6 +205,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-overwrite",
         action="store_true",
         help="Fail if the input archive already contains map.osm",
+    )
+
+    clipgt = sub.add_parser(
+        "clipgt",
+        help="Embed a clipgt vector-map directory into the USDZ",
+        description=(
+            "Copy every file under --clipgt-dir into the USDZ under the "
+            "clipgt/ prefix, matching the layout the alpasim runtime loads "
+            "via artifact._extract_map_directories."
+        ),
+    )
+    _add_common_io_args(clipgt)
+    clipgt.add_argument(
+        "--clipgt-dir",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Directory of clipgt parquet files (recursively embedded).",
+    )
+    clipgt.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Fail if the input archive already contains clipgt/ entries",
     )
 
     intr = sub.add_parser(
@@ -377,6 +401,13 @@ def main(argv: list[str] | None = None) -> int:
             args.input,
             args.output,
             args.lanelet2,
+            overwrite=not args.no_overwrite,
+        )
+    elif args.command == "clipgt":
+        result = add_clipgt_to_usdz(
+            args.input,
+            args.output,
+            args.clipgt_dir,
             overwrite=not args.no_overwrite,
         )
     elif args.command == "intrinsics":

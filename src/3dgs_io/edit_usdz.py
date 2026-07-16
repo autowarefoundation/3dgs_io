@@ -45,6 +45,7 @@ __all__ = [
     "EditUsdzResult",
     "IntrinsicsEditResult",
     "MetadataEditResult",
+    "add_clipgt_to_usdz",
     "add_lanelet2_to_usdz",
     "bundle_usdz_for_alpasim",
     "convert_rig_trajectories_to_alpasim_schema",
@@ -57,6 +58,7 @@ _log = logging.getLogger(__name__)
 _LANELET2_ARCHIVE_PATH = "map.osm"
 _LANELET2_SCENE_KEY = "map_lanelet2"
 _RIG_TRAJECTORIES_ARCHIVE_PATH = "rig_trajectories.json"
+_CLIPGT_ARCHIVE_PREFIX = "clipgt/"
 
 
 @dataclass
@@ -165,6 +167,63 @@ def add_lanelet2_to_usdz(
     # scene.json is always a replacement (validated to exist above), don't
     # surface it as a user-facing edit.
     replaced = [n for n in replaced if n != "scene.json"]
+    return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
+
+
+def add_clipgt_to_usdz(
+    input_usdz: str | Path,
+    output_usdz: str | Path,
+    clipgt_dir: str | Path,
+    *,
+    overwrite: bool = True,
+) -> EditUsdzResult:
+    """Embed a clipgt vector-map directory into ``input_usdz`` under ``clipgt/``.
+
+    Every regular file under ``clipgt_dir`` (recursively) is written into the
+    output USDZ at ``clipgt/<relative_path>``. Runtimes that key on the
+    ``clipgt/`` prefix (see alpasim ``artifact._extract_map_directories``) will
+    pick up the map without any scene.json update.
+
+    Parameters
+    ----------
+    input_usdz, output_usdz, clipgt_dir:
+        Filesystem paths. ``output_usdz`` may equal ``input_usdz``.
+    overwrite:
+        If ``False`` and the input already contains ``clipgt/`` entries, raise
+        ``FileExistsError``. Defaults to ``True``.
+    """
+    input_usdz = Path(input_usdz).expanduser()
+    output_usdz = Path(output_usdz).expanduser()
+    clipgt_dir = Path(clipgt_dir).expanduser()
+
+    if not input_usdz.is_file():
+        raise FileNotFoundError(f"Input USDZ not found: {input_usdz}")
+    if not clipgt_dir.is_dir():
+        raise FileNotFoundError(f"clipgt directory not found: {clipgt_dir}")
+
+    entries_to_write: dict[str, bytes] = {}
+    for file_path in sorted(clipgt_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+        rel = file_path.relative_to(clipgt_dir).as_posix()
+        entries_to_write[f"{_CLIPGT_ARCHIVE_PREFIX}{rel}"] = file_path.read_bytes()
+
+    if not entries_to_write:
+        raise ValueError(f"No files found under {clipgt_dir}")
+
+    if not overwrite:
+        with zipfile.ZipFile(input_usdz, "r") as zin:
+            existing = [n for n in zin.namelist() if n.startswith(_CLIPGT_ARCHIVE_PREFIX)]
+        if existing:
+            raise FileExistsError(
+                f"{input_usdz} already has clipgt/ entries; pass overwrite=True to replace"
+            )
+
+    added, replaced = _repack_usdz(
+        input_usdz,
+        output_usdz,
+        entries_to_write=entries_to_write,
+    )
     return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
 
 
