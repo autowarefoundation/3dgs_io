@@ -26,6 +26,9 @@ archive path                      scene.json key
 ``carla_world/manifest.json``     ``extras.carla_world``
 ``tracks.parquet``                ``extras.tracks``
 ``trajectory.parquet``            ``extras.trajectory``
+``sequence_tracks.json``          ``extras.sequence_tracks``
+``rig_trajectories.json``         ``extras.rig_trajectories``
+``ppisp.json``                    ``extras.ppisp``
 ================================  =================================
 """
 
@@ -47,6 +50,7 @@ import spz
 
 from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
 from .gltf_io import load_gltf_with_metadata
+from .ppisp import Ppisp, serialize_ppisp
 from .rig_trajectories import RigTrajectory, dump_alpasim_rig_trajectories
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
@@ -122,6 +126,7 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "trajectory.parquet": "trajectory",
     "sequence_tracks.json": "sequence_tracks",
     "rig_trajectories.json": "rig_trajectories",
+    "ppisp.json": "ppisp",
 }
 
 
@@ -688,6 +693,7 @@ def save_scene_usdz(
     extras: Mapping[str, str | Path] | None = None,
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
+    ppisp: Ppisp | None = None,
     world_to_nre: Any | None = None,
     t_world_base: Any | None = None,
     metadata: UsdzMetadata | None = None,
@@ -730,6 +736,14 @@ def save_scene_usdz(
         root-local frame; cameras nested under each rig
         (:attr:`RigTrajectory.cameras`) carry rig-relative extrinsics
         (``T_sensor_rig``).
+    ppisp:
+        Optional :class:`Ppisp` describing per-camera / per-frame PPISP
+        appearance-correction parameters (exposure / vignetting / colour /
+        CRF). When given the parameters are serialised into ``ppisp.json``
+        inside the archive (schema ``splatsim.ppisp/v1``) and recorded under
+        ``scene.json.extras.ppisp``. Cameras are keyed by name (matching
+        ``rig_trajectories.json`` cameras) and frames by ``timestamp_us``
+        (matching rig poses).
     world_to_nre:
         Optional 4×4 array-like transform mapping root-local poses into the
         alpasim ``world`` frame; defaults to identity when omitted. Requires
@@ -790,6 +804,16 @@ def save_scene_usdz(
         rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
         archive_paths.add("rig_trajectories.json")
 
+    ppisp_payload: bytes | None = None
+    if ppisp is not None:
+        if "ppisp.json" in archive_paths:
+            raise ValueError(
+                "ppisp=... was passed but 'ppisp.json' is also present in "
+                "extras; pick one of the two"
+            )
+        ppisp_payload = json.dumps(serialize_ppisp(ppisp), indent=2).encode("utf-8")
+        archive_paths.add("ppisp.json")
+
     extras_meta = _detect_known_extras(archive_paths)
     scene_doc = _compose_scene_json(
         arrays=arrays,
@@ -826,6 +850,8 @@ def save_scene_usdz(
                 _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
             if rig_trajectories_payload is not None:
                 _zip_write_bytes(zf, "rig_trajectories.json", rig_trajectories_payload)
+            if ppisp_payload is not None:
+                _zip_write_bytes(zf, "ppisp.json", ppisp_payload)
             for arc, src in chunk_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
             for arc, src in ext_chunk_entries:

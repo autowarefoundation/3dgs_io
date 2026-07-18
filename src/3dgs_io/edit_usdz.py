@@ -5,6 +5,8 @@ Supports:
 * :func:`add_lanelet2_to_usdz` — embed a lanelet2 ``map.osm`` file into an
   existing USDZ produced by :func:`3dgs_io.save_scene_usdz` and record it in
   ``scene.json.extras.map_lanelet2``.
+* :func:`add_ppisp_to_usdz` — embed PPISP appearance-correction parameters
+  as ``ppisp.json`` and record it in ``scene.json.extras.ppisp``.
 * :func:`update_camera_intrinsics_in_usdz` — rewrite a camera's intrinsics
   inside the ``rig_trajectories.json`` embedded in the USDZ.
 * :func:`set_usdz_metadata` — write (or overwrite) ``metadata.yaml`` at the
@@ -27,6 +29,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .ppisp import Ppisp, parse_ppisp, serialize_ppisp
 from .rig_trajectories import (
     dump_alpasim_rig_trajectories,
     load_rig_trajectories_doc,
@@ -47,6 +50,7 @@ __all__ = [
     "MetadataEditResult",
     "add_clipgt_to_usdz",
     "add_lanelet2_to_usdz",
+    "add_ppisp_to_usdz",
     "bundle_usdz_for_alpasim",
     "convert_rig_trajectories_to_alpasim_schema",
     "set_usdz_metadata",
@@ -59,6 +63,8 @@ _LANELET2_ARCHIVE_PATH = "map.osm"
 _LANELET2_SCENE_KEY = "map_lanelet2"
 _RIG_TRAJECTORIES_ARCHIVE_PATH = "rig_trajectories.json"
 _CLIPGT_ARCHIVE_PREFIX = "clipgt/"
+_PPISP_ARCHIVE_PATH = "ppisp.json"
+_PPISP_SCENE_KEY = "ppisp"
 
 
 @dataclass
@@ -224,6 +230,79 @@ def add_clipgt_to_usdz(
         output_usdz,
         entries_to_write=entries_to_write,
     )
+    return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
+
+
+def add_ppisp_to_usdz(
+    input_usdz: str | Path,
+    output_usdz: str | Path,
+    ppisp: Ppisp | str | Path,
+    *,
+    overwrite: bool = True,
+) -> EditUsdzResult:
+    """Add PPISP appearance-correction parameters to an existing USDZ scene bundle.
+
+    The PPISP payload is serialised into ``ppisp.json`` at the archive root
+    (schema ``splatsim.ppisp/v1``) and ``scene.json.extras.ppisp`` is set to
+    ``"ppisp.json"``. All other archive entries are copied through in their
+    original order.
+
+    Parameters
+    ----------
+    input_usdz:
+        Path to an existing ``.usdz`` produced by
+        :func:`3dgs_io.save_scene_usdz` (must contain ``scene.json``).
+    output_usdz:
+        Destination ``.usdz`` path. May equal ``input_usdz`` for atomic
+        in-place edits.
+    ppisp:
+        Either an in-memory :class:`Ppisp` object or a filesystem path to a
+        JSON document following the ``splatsim.ppisp/v1`` schema. Path
+        inputs are parsed via :func:`3dgs_io.parse_ppisp`.
+    overwrite:
+        When ``True`` (default), replace an existing ``ppisp.json`` entry.
+        When ``False``, raise :class:`FileExistsError` if the archive
+        already contains one.
+    """
+    input_usdz = Path(input_usdz).expanduser()
+    output_usdz = Path(output_usdz).expanduser()
+
+    if not input_usdz.is_file():
+        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
+
+    if isinstance(ppisp, Ppisp):
+        ppisp_obj = ppisp
+    else:
+        ppisp_path = Path(ppisp).expanduser()
+        if not ppisp_path.is_file():
+            raise FileNotFoundError(f"ppisp JSON file not found: {ppisp_path}")
+        ppisp_obj = parse_ppisp(json.loads(ppisp_path.read_text(encoding="utf-8-sig")))
+
+    ppisp_bytes = (json.dumps(serialize_ppisp(ppisp_obj), indent=2) + "\n").encode("utf-8")
+
+    with zipfile.ZipFile(input_usdz, "r") as zin:
+        names = zin.namelist()
+        if "scene.json" not in names:
+            raise ValueError(f"{input_usdz} is not a splatsim scene USDZ (missing scene.json)")
+        if _PPISP_ARCHIVE_PATH in names and not overwrite:
+            raise FileExistsError(
+                f"{input_usdz} already contains {_PPISP_ARCHIVE_PATH!r}; "
+                "pass overwrite=True to replace"
+            )
+        scene_bytes = _rewrite_scene_extras(
+            zin.read("scene.json"), _PPISP_SCENE_KEY, _PPISP_ARCHIVE_PATH
+        )
+
+    added, replaced = _repack_usdz(
+        input_usdz,
+        output_usdz,
+        entries_to_write={
+            "scene.json": scene_bytes,
+            _PPISP_ARCHIVE_PATH: ppisp_bytes,
+        },
+    )
+    # scene.json is always a pre-existing replacement, not a user-facing edit.
+    replaced = [n for n in replaced if n != "scene.json"]
     return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
 
 

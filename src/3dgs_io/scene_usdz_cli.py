@@ -21,6 +21,7 @@ import math
 import sys
 from pathlib import Path
 
+from .ppisp import parse_ppisp
 from .rig_trajectories import load_rig_trajectories_doc
 from .scene_usdz import (
     SceneUsdzOptions,
@@ -71,7 +72,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Embed SRC (file or directory) at archive path ARC. Repeatable. "
             "Known archive paths get recorded in scene.json's extras block: "
             "map.osm, map.xodr, carla_world/manifest.json, tracks.parquet, "
-            "trajectory.parquet, sequence_tracks.json, rig_trajectories.json."
+            "trajectory.parquet, sequence_tracks.json, rig_trajectories.json, "
+            "ppisp.json."
         ),
     )
 
@@ -95,6 +97,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Path to a splatsim.rig_trajectories/v1 JSON file (or an alpasim "
             "rig_trajectories.json, auto-detected) describing ego / sensor-rig "
             "pose time-series. Embedded as rig_trajectories.json in the output USDZ."
+        ),
+    )
+    p.add_argument(
+        "--ppisp",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a splatsim.ppisp/v1 JSON file describing per-camera / "
+            "per-frame PPISP appearance-correction parameters. Embedded as "
+            "ppisp.json in the output USDZ."
         ),
     )
 
@@ -188,6 +201,11 @@ def main(argv: list[str] | None = None) -> int:
         rig_path = Path(args.rig_trajectories).expanduser()
         rig_doc = json.loads(rig_path.read_text(encoding="utf-8-sig"))
         rig_trajectories = load_rig_trajectories_doc(rig_doc)
+    ppisp = None
+    if args.ppisp is not None:
+        ppisp_path = Path(args.ppisp).expanduser()
+        ppisp_doc = json.loads(ppisp_path.read_text(encoding="utf-8-sig"))
+        ppisp = parse_ppisp(ppisp_doc)
     metadata = make_default_metadata(
         out_path=args.out_usdz,
         uuid=args.uuid,
@@ -200,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
         extras=extras,
         tracks=tracks,
         rig_trajectories=rig_trajectories,
+        ppisp=ppisp,
         metadata=metadata,
         options=_options_from_args(args),
     )

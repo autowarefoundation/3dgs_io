@@ -43,6 +43,15 @@ Subcommands
             [--version-string VERSION]                                 \\
             [--extra KEY=VALUE]...
 
+``ppisp``
+    Embed PPISP appearance-correction parameters as ``ppisp.json`` and
+    register it under ``scene.json.extras.ppisp``::
+
+        python -m 3dgs_io.edit_usdz_cli ppisp                              \\
+            --input  path/to/scene.usdz                                    \\
+            --output path/to/scene_with_ppisp.usdz                         \\
+            --ppisp  path/to/ppisp.json
+
 ``alpasim-bundle``
     Prepare a splatsim USDZ for the alpasim runtime in one shot: convert
     ``rig_trajectories.json`` from splatsim ``v1`` to the legacy alpasim
@@ -72,6 +81,7 @@ from .edit_usdz import (
     _result_summary,
     add_clipgt_to_usdz,
     add_lanelet2_to_usdz,
+    add_ppisp_to_usdz,
     bundle_usdz_for_alpasim,
     set_usdz_metadata,
     update_camera_intrinsics_in_usdz,
@@ -228,6 +238,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-overwrite",
         action="store_true",
         help="Fail if the input archive already contains clipgt/ entries",
+    )
+
+    ppisp = sub.add_parser(
+        "ppisp",
+        help="Embed PPISP appearance-correction parameters into the USDZ",
+        description=(
+            "Embed a splatsim.ppisp/v1 JSON at archive path ppisp.json and "
+            "record it in scene.json.extras.ppisp."
+        ),
+    )
+    _add_common_io_args(ppisp)
+    ppisp.add_argument(
+        "--ppisp",
+        dest="ppisp_path",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help=(
+            "Path to a JSON file following the splatsim.ppisp/v1 schema "
+            "(per-camera vignetting + CRF, per-frame exposure + colour)."
+        ),
+    )
+    ppisp.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Fail if the input archive already contains ppisp.json",
     )
 
     intr = sub.add_parser(
@@ -410,6 +446,17 @@ def main(argv: list[str] | None = None) -> int:
             args.clipgt_dir,
             overwrite=not args.no_overwrite,
         )
+    elif args.command == "ppisp":
+        try:
+            result = add_ppisp_to_usdz(
+                args.input,
+                args.output,
+                args.ppisp_path,
+                overwrite=not args.no_overwrite,
+            )
+        except (FileNotFoundError, FileExistsError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     elif args.command == "intrinsics":
         updates = _collect_intrinsic_updates(args)
         if not updates:
