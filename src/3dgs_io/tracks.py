@@ -61,6 +61,7 @@ __all__ = [
     "TRACKS_SCHEMA",
     "Track",
     "TrackFrame",
+    "dump_alpasim_sequence_tracks",
     "parse_alpasim_sequence_tracks",
     "parse_tracks",
     "serialize_tracks",
@@ -293,3 +294,88 @@ def parse_alpasim_sequence_tracks(doc: dict[str, Any]) -> list[Track]:
                 )
             )
     return out
+
+
+def dump_alpasim_sequence_tracks(
+    tracks: list[Track],
+    *,
+    chunk_id: str = "ego",
+) -> dict[str, Any]:
+    """Serialize :class:`Track` list into an alpasim ``sequence_tracks.json`` document.
+
+    Inverse of :func:`parse_alpasim_sequence_tracks`. The output is the
+    columnar shape alpasim's ``TrafficObjects.load_from_json`` expects::
+
+        {
+          "<chunk_id>": {
+            "tracks_data": {
+              "tracks_id":            [str, ...],
+              "tracks_poses":         [[[tx, ty, tz, qx, qy, qz, qw], ...], ...],
+              "tracks_timestamps_us": [[int, ...], ...],
+              "tracks_label_class":   [str, ...],
+              "tracks_flags":         [str, ...]
+            },
+            "cuboidtracks_data": {
+              "cuboids_dims": [[dx, dy, dz], ...]
+            }
+          }
+        }
+
+    Even when ``tracks`` is empty, every columnar sub-key is emitted with an
+    empty list — alpasim's ``TrafficObjects.load_from_json`` unconditionally
+    indexes these keys and would ``KeyError`` on a bare
+    ``{"tracks_data": {}, "cuboidtracks_data": {}}``.
+
+    Parameters
+    ----------
+    tracks:
+        Tracks in the v1 in-memory shape (root-local frames). Duplicate
+        ``track_id`` values raise ``ValueError`` — same invariant as
+        :func:`serialize_tracks`.
+    chunk_id:
+        The single chunk key to write the columnar block under. Multi-chunk
+        output is not modelled; callers who need multi-chunk output should
+        partition their tracks and merge multiple dumps.
+    """
+    tracks_id: list[str] = []
+    tracks_poses: list[list[list[float]]] = []
+    tracks_timestamps_us: list[list[int]] = []
+    tracks_label_class: list[str] = []
+    tracks_flags: list[str] = []
+    cuboids_dims: list[list[float]] = []
+
+    seen: set[str] = set()
+    for track in tracks:
+        if track.track_id in seen:
+            raise ValueError(f"duplicate track_id: {track.track_id!r}")
+        seen.add(track.track_id)
+
+        pose_rows: list[list[float]] = []
+        ts_row: list[int] = []
+        for frame in track.frames:
+            tx, ty, tz = (float(v) for v in frame.translation)
+            qx, qy, qz, qw = (float(v) for v in frame.rotation)
+            pose_rows.append([tx, ty, tz, qx, qy, qz, qw])
+            ts_row.append(int(frame.timestamp_us))
+
+        tracks_id.append(str(track.track_id))
+        tracks_poses.append(pose_rows)
+        tracks_timestamps_us.append(ts_row)
+        tracks_label_class.append(str(track.class_name))
+        tracks_flags.append(str(track.flag))
+        cuboids_dims.append([float(v) for v in track.size])
+
+    return {
+        str(chunk_id): {
+            "tracks_data": {
+                "tracks_id": tracks_id,
+                "tracks_label_class": tracks_label_class,
+                "tracks_flags": tracks_flags,
+                "tracks_timestamps_us": tracks_timestamps_us,
+                "tracks_poses": tracks_poses,
+            },
+            "cuboidtracks_data": {
+                "cuboids_dims": cuboids_dims,
+            },
+        }
+    }

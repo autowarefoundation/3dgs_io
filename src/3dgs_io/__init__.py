@@ -52,6 +52,8 @@ from .ppisp import (
     serialize_ppisp,
 )
 from .rig_trajectories import (
+    LidarCalibration,
+    LidarModel,
     RigPose,
     RigTrajectory,
     dump_alpasim_rig_trajectories,
@@ -80,11 +82,13 @@ from .tiles_io import (
 from .tracks import (
     Track,
     TrackFrame,
+    dump_alpasim_sequence_tracks,
     parse_alpasim_sequence_tracks,
     parse_tracks,
     serialize_tracks,
 )
 from .usdz_metadata import (
+    USDZ_METADATA_ALPASIM_OPTIONAL_KEYS,
     USDZ_METADATA_ARCHIVE_PATH,
     USDZ_METADATA_REQUIRED_KEYS,
     UsdzMetadata,
@@ -127,6 +131,8 @@ __all__ = [
     "GaussianCloud",
     "GlbMetadata",
     "GltfSaveOptions",
+    "LidarCalibration",
+    "LidarModel",
     "Model",
     "Placement",
     "RigPose",
@@ -136,6 +142,7 @@ __all__ = [
     "Track",
     "TrackFrame",
     "TrainingData",
+    "USDZ_METADATA_ALPASIM_OPTIONAL_KEYS",
     "USDZ_METADATA_ARCHIVE_PATH",
     "USDZ_METADATA_REQUIRED_KEYS",
     "UsdzMetadata",
@@ -150,6 +157,7 @@ __all__ = [
     "update_camera_intrinsics_in_usdz",
     "decode_lidar_sidecar",
     "dump_alpasim_rig_trajectories",
+    "dump_alpasim_sequence_tracks",
     "encode_lidar_sidecar",
     "load_rig_trajectories_doc",
     "parse_alpasim_rig_trajectories",
