@@ -83,3 +83,86 @@ def test_load_usdz_metadata_accepts_utf8_bom() -> None:
     ).encode("utf-8")
     m = load_usdz_metadata(raw)
     assert m.uuid == "u"
+
+
+# ---------------------------------------------------------------------------
+# alpasim scene_metadata fields
+# ---------------------------------------------------------------------------
+
+
+def test_usdz_metadata_alpasim_optional_fields_appear_at_top_level() -> None:
+    m = UsdzMetadata(
+        uuid="u",
+        scene_id="s",
+        version_string="v",
+        training_date="2026-07-22T00:00:00Z",
+        dataset_hash="abcd1234",
+        is_resumable=True,
+        sensors=["camera_front", "lidar_top"],
+        logger="alpasim/1.2.3",
+        time_range={"start_us": 0, "end_us": 1_000_000},
+    )
+    out = m.to_dict()
+    assert out["training_date"] == "2026-07-22T00:00:00Z"
+    assert out["dataset_hash"] == "abcd1234"
+    assert out["is_resumable"] is True
+    assert out["sensors"] == ["camera_front", "lidar_top"]
+    assert out["logger"] == "alpasim/1.2.3"
+    assert out["time_range"] == {"start_us": 0, "end_us": 1_000_000}
+
+
+def test_usdz_metadata_alpasim_optional_fields_omitted_when_none() -> None:
+    # Producers that don't care about alpasim should see no schema drift.
+    m = UsdzMetadata(uuid="u", scene_id="s", version_string="v")
+    out = m.to_dict()
+    assert set(out) == {"uuid", "scene_id", "version_string"}
+
+
+def test_usdz_metadata_from_dict_round_trips_alpasim_fields() -> None:
+    payload = {
+        "uuid": "u",
+        "scene_id": "s",
+        "version_string": "v",
+        "training_date": "2026-07-22",
+        "dataset_hash": "hash",
+        "is_resumable": False,
+        "sensors": ["a", "b"],
+        "logger": "log",
+        "time_range": {"start_us": 1, "end_us": 2},
+        "extras_key": "extras_value",
+    }
+    m = UsdzMetadata.from_dict(payload)
+    assert m.training_date == "2026-07-22"
+    assert m.dataset_hash == "hash"
+    assert m.is_resumable is False
+    assert m.sensors == ["a", "b"]
+    assert m.logger == "log"
+    assert m.time_range == {"start_us": 1, "end_us": 2}
+    # Non-alpasim, non-required keys should still fall through to extras.
+    assert m.extras == {"extras_key": "extras_value"}
+    # Round-trip
+    assert m.to_dict() == payload
+
+
+def test_usdz_metadata_extras_may_not_shadow_alpasim_fields() -> None:
+    with pytest.raises(ValueError, match="alpasim fields"):
+        UsdzMetadata(
+            uuid="u",
+            scene_id="s",
+            version_string="v",
+            training_date="2026-07-22",
+            extras={"training_date": "conflict"},
+        )
+
+
+def test_usdz_metadata_extras_still_allowed_when_alpasim_field_unset() -> None:
+    # Setting an alpasim key ONLY through extras (with the typed field left
+    # as None) should still work — this preserves the existing escape hatch
+    # for consumers who don't want to migrate to the typed fields yet.
+    m = UsdzMetadata(
+        uuid="u",
+        scene_id="s",
+        version_string="v",
+        extras={"training_date": "via-extras"},
+    )
+    assert m.to_dict()["training_date"] == "via-extras"

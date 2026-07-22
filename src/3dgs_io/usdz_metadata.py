@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "USDZ_METADATA_ALPASIM_OPTIONAL_KEYS",
     "USDZ_METADATA_ARCHIVE_PATH",
     "USDZ_METADATA_REQUIRED_KEYS",
     "UsdzMetadata",
@@ -58,6 +59,21 @@ __all__ = [
 
 USDZ_METADATA_ARCHIVE_PATH = "metadata.yaml"
 USDZ_METADATA_REQUIRED_KEYS: tuple[str, ...] = ("uuid", "scene_id", "version_string")
+
+# alpasim's ``scene_metadata`` block carries these optional fields alongside
+# the required trio above. They are first-class on :class:`UsdzMetadata` so
+# producers don't have to route them through ``extras`` (which works but is
+# untyped and easy to typo). Structure is not validated here — alpasim owns
+# the schema — but each field, when set, is written at the top level of the
+# emitted dict, in the same slot ``extras`` uses.
+USDZ_METADATA_ALPASIM_OPTIONAL_KEYS: tuple[str, ...] = (
+    "training_date",
+    "dataset_hash",
+    "is_resumable",
+    "sensors",
+    "logger",
+    "time_range",
+)
 
 
 @dataclass
@@ -74,16 +90,29 @@ class UsdzMetadata:
     version_string:
         Free-form identifier of the producing pipeline (e.g. the ``3dgs_io``
         release, or the parent pipeline's own version). Non-empty string.
+    training_date, dataset_hash, is_resumable, sensors, logger, time_range:
+        Optional alpasim ``scene_metadata`` fields. When set (not ``None``)
+        they are emitted at the top level of the metadata dict, in the same
+        slot ``extras`` uses. Structure is not validated — alpasim owns the
+        schema. Producers that don't care about alpasim can leave these at
+        ``None``; the emitted dict is unchanged in that case.
     extras:
-        Free-form additional fields written alongside the required trio.
-        Values must be JSON-serialisable (``str`` / ``int`` / ``float`` /
-        ``bool`` / ``list`` / ``dict`` / ``None``). Extras must not shadow the
-        required keys.
+        Free-form additional fields written alongside the required trio and
+        the alpasim block. Values must be JSON-serialisable (``str`` /
+        ``int`` / ``float`` / ``bool`` / ``list`` / ``dict`` / ``None``).
+        Extras must not shadow the required keys or any alpasim key that is
+        also set on the dataclass; use the typed field instead.
     """
 
     uuid: str
     scene_id: str
     version_string: str
+    training_date: str | None = None
+    dataset_hash: str | None = None
+    is_resumable: bool | None = None
+    sensors: Any = None
+    logger: str | None = None
+    time_range: Any = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -96,6 +125,17 @@ class UsdzMetadata:
             raise ValueError(
                 f"UsdzMetadata.extras must not shadow required keys: {sorted(overlap)}"
             )
+        # extras may not shadow an alpasim field that is also set on the
+        # dataclass — that would silently drop one of the two on emit.
+        typed_alpasim_set = {
+            k for k in USDZ_METADATA_ALPASIM_OPTIONAL_KEYS if getattr(self, k) is not None
+        }
+        alpasim_overlap = typed_alpasim_set & set(self.extras)
+        if alpasim_overlap:
+            raise ValueError(
+                "UsdzMetadata.extras must not shadow alpasim fields already set on the "
+                f"dataclass: {sorted(alpasim_overlap)}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable dictionary of all fields."""
@@ -104,6 +144,10 @@ class UsdzMetadata:
             "scene_id": self.scene_id,
             "version_string": self.version_string,
         }
+        for key in USDZ_METADATA_ALPASIM_OPTIONAL_KEYS:
+            val = getattr(self, key)
+            if val is not None:
+                out[key] = val
         out.update(self.extras)
         return out
 
@@ -118,11 +162,18 @@ class UsdzMetadata:
         missing = [k for k in USDZ_METADATA_REQUIRED_KEYS if k not in data]
         if missing:
             raise ValueError(f"metadata document missing required keys: {missing}")
-        extras = {k: v for k, v in data.items() if k not in USDZ_METADATA_REQUIRED_KEYS}
+        known = set(USDZ_METADATA_REQUIRED_KEYS) | set(USDZ_METADATA_ALPASIM_OPTIONAL_KEYS)
+        extras = {k: v for k, v in data.items() if k not in known}
         return cls(
             uuid=data["uuid"],
             scene_id=data["scene_id"],
             version_string=data["version_string"],
+            training_date=data.get("training_date"),
+            dataset_hash=data.get("dataset_hash"),
+            is_resumable=data.get("is_resumable"),
+            sensors=data.get("sensors"),
+            logger=data.get("logger"),
+            time_range=data.get("time_range"),
             extras=extras,
         )
 
@@ -145,6 +196,12 @@ def make_default_metadata(
     uuid: str | None = None,
     scene_id: str | None = None,
     version_string: str | None = None,
+    training_date: str | None = None,
+    dataset_hash: str | None = None,
+    is_resumable: bool | None = None,
+    sensors: Any = None,
+    logger: str | None = None,
+    time_range: Any = None,
     extras: dict[str, Any] | None = None,
 ) -> UsdzMetadata:
     """Build a :class:`UsdzMetadata` filling unset fields with sensible defaults.
@@ -154,12 +211,23 @@ def make_default_metadata(
     - ``uuid`` → a fresh random UUID4.
     - ``scene_id`` → the output USDZ filename stem (``out_path.stem``).
     - ``version_string`` → ``"3dgs_io/<installed-package-version>"``.
+
+    The alpasim ``scene_metadata`` fields (``training_date``, ``dataset_hash``,
+    ``is_resumable``, ``sensors``, ``logger``, ``time_range``) are passed
+    through unchanged and are omitted from the emitted dict when left at
+    their default ``None``.
     """
     out_path = Path(out_path)
     return UsdzMetadata(
         uuid=uuid or default_uuid(),
         scene_id=scene_id or out_path.stem,
         version_string=version_string or f"3dgs_io/{_get_package_version()}",
+        training_date=training_date,
+        dataset_hash=dataset_hash,
+        is_resumable=is_resumable,
+        sensors=sensors,
+        logger=logger,
+        time_range=time_range,
         extras=dict(extras) if extras else {},
     )
 

@@ -14,6 +14,7 @@ import pytest
 _mod = importlib.import_module("3dgs_io")
 Track = _mod.Track
 TrackFrame = _mod.TrackFrame
+dump_alpasim_sequence_tracks = _mod.dump_alpasim_sequence_tracks
 parse_alpasim_sequence_tracks = _mod.parse_alpasim_sequence_tracks
 parse_tracks = _mod.parse_tracks
 save_scene_usdz = _mod.save_scene_usdz
@@ -222,6 +223,106 @@ def test_alpasim_ingestion_against_real_sample() -> None:
         for f in t.frames:
             n = np.linalg.norm(f.rotation)
             np.testing.assert_allclose(n, 1.0, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# dump_alpasim_sequence_tracks
+# ---------------------------------------------------------------------------
+
+
+_EMPTY_ALPASIM_KEYS = {
+    "tracks_id",
+    "tracks_label_class",
+    "tracks_flags",
+    "tracks_timestamps_us",
+    "tracks_poses",
+}
+
+
+def test_dump_alpasim_sequence_tracks_empty_still_emits_full_key_structure() -> None:
+    # alpasim's TrafficObjects.load_from_json indexes these keys
+    # unconditionally, so a bare {"tracks_data": {}, "cuboidtracks_data": {}}
+    # would KeyError. Even a track-free scene must carry the full skeleton.
+    doc = dump_alpasim_sequence_tracks([], chunk_id="ego")
+    assert list(doc) == ["ego"]
+    chunk = doc["ego"]
+    assert set(chunk["tracks_data"].keys()) == _EMPTY_ALPASIM_KEYS
+    for k in _EMPTY_ALPASIM_KEYS:
+        assert chunk["tracks_data"][k] == []
+    assert chunk["cuboidtracks_data"] == {"cuboids_dims": []}
+
+
+def test_dump_alpasim_sequence_tracks_default_chunk_id_is_ego() -> None:
+    # "ego" matches the minimal empty-doc example in the issue's follow-up
+    # comment; alpasim treats the chunk key as the sequence identifier.
+    doc = dump_alpasim_sequence_tracks([])
+    assert list(doc) == ["ego"]
+
+
+def test_dump_alpasim_sequence_tracks_round_trips_via_parse() -> None:
+    tracks = [
+        Track(
+            track_id="100",
+            class_name="automobile",
+            size=(3.989, 1.803, 1.484),
+            frames=[
+                TrackFrame(
+                    timestamp_us=27_567_868_848,
+                    translation=(113.62, -58.55, 1.92),
+                    rotation=(-0.0005, -0.0113, 0.6645, 0.7472),
+                ),
+                TrackFrame(
+                    timestamp_us=27_567_968_602,
+                    translation=(113.57, -58.59, 1.88),
+                    rotation=(-0.0003, -0.0113, 0.6646, 0.7471),
+                ),
+            ],
+            flag="NONE",
+        ),
+        Track(
+            track_id="104",
+            class_name="person",
+            size=(0.6, 0.6, 1.7),
+            frames=[
+                TrackFrame(
+                    timestamp_us=27_567_868_848,
+                    translation=(50.0, 10.0, 1.5),
+                    rotation=(0.0, 0.0, 0.0, 1.0),
+                ),
+            ],
+            flag="NONE",
+        ),
+    ]
+    doc = dump_alpasim_sequence_tracks(tracks, chunk_id="dummy_chunk_id")
+
+    # Columnar shape matches what parse expects.
+    td = doc["dummy_chunk_id"]["tracks_data"]
+    assert td["tracks_id"] == ["100", "104"]
+    assert td["tracks_label_class"] == ["automobile", "person"]
+    assert td["tracks_flags"] == ["NONE", "NONE"]
+    assert doc["dummy_chunk_id"]["cuboidtracks_data"]["cuboids_dims"] == [
+        [3.989, 1.803, 1.484],
+        [0.6, 0.6, 1.7],
+    ]
+    assert len(td["tracks_poses"][0]) == 2
+    assert len(td["tracks_poses"][1]) == 1
+
+    reparsed = parse_alpasim_sequence_tracks(doc)
+    assert [t.track_id for t in reparsed] == ["100", "104"]
+    assert [t.class_name for t in reparsed] == ["automobile", "person"]
+    assert reparsed[0].size == (3.989, 1.803, 1.484)
+    assert len(reparsed[0].frames) == 2
+    np.testing.assert_allclose(reparsed[0].frames[0].translation, (113.62, -58.55, 1.92))
+    np.testing.assert_allclose(reparsed[0].frames[0].rotation, (-0.0005, -0.0113, 0.6645, 0.7472))
+
+
+def test_dump_alpasim_sequence_tracks_rejects_duplicate_track_ids() -> None:
+    dup = [
+        Track(track_id="a", class_name="x", size=(1.0, 1.0, 1.0), frames=[]),
+        Track(track_id="a", class_name="y", size=(1.0, 1.0, 1.0), frames=[]),
+    ]
+    with pytest.raises(ValueError, match="duplicate track_id"):
+        dump_alpasim_sequence_tracks(dup)
 
 
 # ---------------------------------------------------------------------------

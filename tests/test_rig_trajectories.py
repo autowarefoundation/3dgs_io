@@ -15,6 +15,7 @@ _mod = importlib.import_module("3dgs_io")
 Camera = _mod.Camera
 CameraExtrinsics = _mod.CameraExtrinsics
 CameraModel = _mod.CameraModel
+LidarCalibration = _mod.LidarCalibration
 RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
 dump_alpasim_rig_trajectories = _mod.dump_alpasim_rig_trajectories
@@ -586,3 +587,163 @@ def test_dump_alpasim_no_frame_timestamps_when_rig_has_no_cameras() -> None:
     ]
     doc = dump_alpasim_rig_trajectories(rigs)
     assert "cameras_frame_timestamps_us" not in doc["rig_trajectories"][0]
+
+
+# ---------------------------------------------------------------------------
+# LiDAR calibration support
+# ---------------------------------------------------------------------------
+
+
+def _lidar(name: str, tx: float = 0.0, ty: float = 0.0, tz: float = 0.0) -> LidarCalibration:
+    return LidarCalibration(
+        name=name,
+        extrinsics=CameraExtrinsics(
+            translation=(tx, ty, tz),
+            rotation=(0.0, 0.0, 0.0, 1.0),
+        ),
+        logical_sensor_name=name,
+    )
+
+
+def test_dump_alpasim_emits_lidar_calibrations_when_present() -> None:
+    rigs = [
+        RigTrajectory(
+            rig_id="ego",
+            poses=[_pose(1_000_000)],
+            lidars=[_lidar("lidar_top", tx=0.5, ty=0.0, tz=1.8)],
+        )
+    ]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    assert "lidar_calibrations" in doc
+    entry = doc["lidar_calibrations"]["lidar_top"]
+    assert entry["logical_sensor_name"] == "lidar_top"
+    mat = np.array(entry["T_sensor_rig"], dtype=np.float64)
+    assert mat.shape == (4, 4)
+    assert list(mat[:3, 3]) == [0.5, 0.0, 1.8]
+
+
+def test_dump_alpasim_omits_lidar_calibrations_when_absent() -> None:
+    # Preserve backwards compat: rigs without any LiDARs must produce the
+    # exact same top-level key set as before this feature landed.
+    rigs = [RigTrajectory(rig_id="ego", poses=[_pose(0)])]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    assert "lidar_calibrations" not in doc
+
+
+def test_dump_alpasim_rejects_duplicate_lidar_names_across_rigs() -> None:
+    rigs = [
+        RigTrajectory(rig_id="ego_a", poses=[_pose(0)], lidars=[_lidar("lidar_top")]),
+        RigTrajectory(rig_id="ego_b", poses=[_pose(0)], lidars=[_lidar("lidar_top")]),
+    ]
+    with pytest.raises(ValueError, match="lidar name 'lidar_top' appears in multiple rigs"):
+        dump_alpasim_rig_trajectories(rigs)
+
+
+def test_parse_alpasim_attaches_lidars_via_frame_timestamps() -> None:
+    doc = {
+        "world_to_nre": {"matrix": np.eye(4).tolist()},
+        "rig_trajectories": [
+            {
+                "sequence_id": "ego",
+                "T_rig_worlds": [np.eye(4).tolist()],
+                "T_rig_world_timestamps_us": [1_000_000],
+                "lidars_frame_timestamps_us": {"lidar_top": [[1_000_000, 1_100_000]]},
+            }
+        ],
+        "camera_calibrations": {},
+        "lidar_calibrations": {
+            "lidar_top": {
+                "T_sensor_rig": np.eye(4).tolist(),
+                "logical_sensor_name": "top",
+            },
+            "lidar_unused": {  # not referenced by any rig; should not be attached
+                "T_sensor_rig": np.eye(4).tolist(),
+                "logical_sensor_name": "unused",
+            },
+        },
+    }
+    rigs = parse_alpasim_rig_trajectories(doc)
+    assert len(rigs) == 1
+    assert [lidar.name for lidar in rigs[0].lidars] == ["lidar_top"]
+    assert rigs[0].lidars[0].logical_sensor_name == "top"
+
+
+def test_parse_alpasim_attaches_all_lidars_when_single_rig_has_no_membership() -> None:
+    doc = {
+        "world_to_nre": {"matrix": np.eye(4).tolist()},
+        "rig_trajectories": [
+            {
+                "sequence_id": "ego",
+                "T_rig_worlds": [np.eye(4).tolist()],
+                "T_rig_world_timestamps_us": [1_000_000],
+            }
+        ],
+        "camera_calibrations": {},
+        "lidar_calibrations": {
+            "lidar_top": {"T_sensor_rig": np.eye(4).tolist()},
+            "lidar_front": {"T_sensor_rig": np.eye(4).tolist()},
+        },
+    }
+    rigs = parse_alpasim_rig_trajectories(doc)
+    assert sorted(lidar.name for lidar in rigs[0].lidars) == ["lidar_front", "lidar_top"]
+
+
+def test_dump_alpasim_emits_lidars_frame_timestamps_for_membership() -> None:
+    # Parse uses `lidars_frame_timestamps_us` as the rig-membership signal
+    # in multi-rig documents. Without emitting it here, a multi-rig
+    # round-trip would collapse or misattach LiDARs on re-parse.
+    rigs = [
+        RigTrajectory(
+            rig_id="ego_a",
+            poses=[_pose(1_000_000), _pose(1_100_000)],
+            lidars=[_lidar("lidar_a")],
+        ),
+        RigTrajectory(
+            rig_id="ego_b",
+            poses=[_pose(1_000_000), _pose(1_100_000)],
+            lidars=[_lidar("lidar_b")],
+        ),
+    ]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    assert doc["rig_trajectories"][0]["lidars_frame_timestamps_us"] == {
+        "lidar_a": [[1_000_000, 1_100_000], [1_100_000, 1_200_000]]
+    }
+    assert doc["rig_trajectories"][1]["lidars_frame_timestamps_us"] == {
+        "lidar_b": [[1_000_000, 1_100_000], [1_100_000, 1_200_000]]
+    }
+    # Re-parsing must recover the same per-rig LiDAR attachment.
+    reparsed = parse_alpasim_rig_trajectories(doc)
+    by_id = {r.rig_id: r for r in reparsed}
+    assert [lidar.name for lidar in by_id["ego_a"].lidars] == ["lidar_a"]
+    assert [lidar.name for lidar in by_id["ego_b"].lidars] == ["lidar_b"]
+
+
+def test_alpasim_lidar_round_trip_preserves_extrinsics_and_logical_name() -> None:
+    original = {
+        "world_to_nre": {"matrix": np.eye(4).tolist()},
+        "rig_trajectories": [
+            {
+                "sequence_id": "ego",
+                "T_rig_worlds": [np.eye(4).tolist()],
+                "T_rig_world_timestamps_us": [1_000_000],
+                "lidars_frame_timestamps_us": {"lidar_top": [[1_000_000, 1_100_000]]},
+            }
+        ],
+        "camera_calibrations": {},
+        "lidar_calibrations": {
+            "lidar_top": {
+                "T_sensor_rig": _translation_only_4x4(0.5, 0.0, 1.8),
+                "logical_sensor_name": "top",
+                "unique_sensor_idx": 7,
+            }
+        },
+    }
+    rigs = parse_alpasim_rig_trajectories(original)
+    redumped = dump_alpasim_rig_trajectories(rigs)
+    round_tripped = redumped["lidar_calibrations"]["lidar_top"]
+    assert round_tripped["logical_sensor_name"] == "top"
+    assert round_tripped["unique_sensor_idx"] == 7
+    np.testing.assert_allclose(
+        np.array(round_tripped["T_sensor_rig"]),
+        np.array(_translation_only_4x4(0.5, 0.0, 1.8)),
+    )
