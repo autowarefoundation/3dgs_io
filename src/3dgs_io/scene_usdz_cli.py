@@ -6,10 +6,9 @@ Invoke with ``python -m 3dgs_io`` (or ``python -m 3dgs_io.scene_usdz_cli``)::
         [--extra ARCHIVE_PATH=SOURCE_PATH ...]              \\
         [--chunk-size N]  [--min-scale F]  ...
 
-The input must be a Cesium 3D Tiles ``tileset.json``. Its ``root.transform``
-(the world anchor — typically an ECEF placement) is preserved verbatim into
-the output archive. Extras are user-supplied files or directories that get
-embedded verbatim into the output archive at the requested path.
+The input must be a Cesium 3D Tiles ``tileset.json``. Its ECEF placement is
+preserved while glTF/RUB payloads are reconciled to the bundle's Z-up ENU
+world convention.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from .scene_usdz import (
     _result_summary,
     save_scene_usdz,
 )
-from .tracks import parse_alpasim_sequence_tracks, parse_tracks
+from .tracks import parse_tracks
 from .usdz_metadata import make_default_metadata
 
 
@@ -83,8 +82,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Path to a splatsim.sequence_tracks/v1 JSON file (or an alpasim "
-            "sequence_tracks.json, auto-detected) describing dynamic-object "
+            "Path to a splatsim.sequence_tracks/v2 JSON file describing dynamic-object "
             "trajectories. Embedded as sequence_tracks.json in the output USDZ."
         ),
     )
@@ -94,8 +92,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "Path to a splatsim.rig_trajectories/v1 JSON file (or an alpasim "
-            "rig_trajectories.json, auto-detected) describing ego / sensor-rig "
+            "Path to a splatsim.rig_trajectories/v2 JSON file describing ego / sensor-rig "
             "pose time-series. Embedded as rig_trajectories.json in the output USDZ."
         ),
     )
@@ -191,11 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"--tracks: {tracks_path} top-level value must be a JSON object, "
                 f"got {type(tracks_doc).__name__}"
             )
-        # Auto-detect: our schema has top-level "schema" key; alpasim's doesn't.
-        if tracks_doc.get("schema") == "splatsim.sequence_tracks/v1":
-            tracks = parse_tracks(tracks_doc)
-        else:
-            tracks = parse_alpasim_sequence_tracks(tracks_doc)
+        tracks = parse_tracks(tracks_doc)
     rig_trajectories = None
     if args.rig_trajectories is not None:
         rig_path = Path(args.rig_trajectories).expanduser()

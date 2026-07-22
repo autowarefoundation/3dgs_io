@@ -25,6 +25,20 @@ def save_spz(gc: spz.GaussianCloud, path: str | Path) -> None:
     spz.save_spz(gc, opts, str(path))
 
 
+def load_spz_world(path: str | Path) -> spz.GaussianCloud:
+    """Load an SPZ whose numeric axes already use the scene's ENU world frame."""
+    opts = spz.UnpackOptions()
+    opts.to_coord = spz.UNSPECIFIED
+    return spz.load_spz(str(path), opts)
+
+
+def save_spz_world(gc: spz.GaussianCloud, path: str | Path) -> None:
+    """Save ENU world-frame values without applying an implicit axis conversion."""
+    opts = spz.PackOptions()
+    opts.from_coord = spz.UNSPECIFIED
+    spz.save_spz(gc, opts, str(path))
+
+
 def load_ply(path: str | Path) -> spz.GaussianCloud:
     """Load a PLY file (3DGS training output) and return a GaussianCloud.
 

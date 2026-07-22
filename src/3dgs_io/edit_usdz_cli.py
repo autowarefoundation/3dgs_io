@@ -52,20 +52,6 @@ Subcommands
             --output path/to/scene_with_ppisp.usdz                         \\
             --ppisp  path/to/ppisp.json
 
-``alpasim-bundle``
-    Prepare a splatsim USDZ for the alpasim runtime in one shot: convert
-    ``rig_trajectories.json`` from splatsim ``v1`` to the legacy alpasim
-    schema, optionally embed a lanelet2 ``.osm``, and (re)write
-    ``metadata.yaml``::
-
-        python -m 3dgs_io.edit_usdz_cli alpasim-bundle                 \\
-            --input  path/to/scene.usdz                                \\
-            --output path/to/scene.alpasim.usdz                        \\
-            [--lanelet2 path/to/map.osm]                               \\
-            [--world-to-nre path/to/w2n.json]                          \\
-            [--t-world-base path/to/twb.json]                          \\
-            [--uuid UUID] [--scene-id SCENE_ID]                        \\
-            [--version-string VERSION] [--extra KEY=VALUE]...
 """
 
 from __future__ import annotations
@@ -82,7 +68,6 @@ from .edit_usdz import (
     add_clipgt_to_usdz,
     add_lanelet2_to_usdz,
     add_ppisp_to_usdz,
-    bundle_usdz_for_alpasim,
     set_usdz_metadata,
     update_camera_intrinsics_in_usdz,
 )
@@ -116,29 +101,6 @@ def _parse_xy(spec: str) -> tuple[float, float]:
     if len(vals) != 2:
         raise argparse.ArgumentTypeError(f"expected exactly 2 comma-separated floats, got {spec!r}")
     return vals[0], vals[1]
-
-
-def _load_4x4_matrix_json(path_str: str) -> list[list[float]]:
-    """Load a JSON file containing a 4×4 matrix (list-of-lists or ``{"matrix": ...}``)."""
-    path = Path(path_str).expanduser()
-    if not path.is_file():
-        raise argparse.ArgumentTypeError(f"matrix JSON file not found: {path}")
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise argparse.ArgumentTypeError(f"could not parse {path} as JSON: {exc}") from exc
-    if isinstance(doc, dict) and "matrix" in doc:
-        doc = doc["matrix"]
-    if (
-        not isinstance(doc, list)
-        or len(doc) != 4
-        or not all(isinstance(row, list) and len(row) == 4 for row in doc)
-    ):
-        raise argparse.ArgumentTypeError(f"{path}: expected a 4×4 list-of-lists")
-    try:
-        return [[float(v) for v in row] for row in doc]
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(f"{path}: matrix entries must be numeric ({exc})") from exc
 
 
 def _parse_metadata_extra(spec: str) -> tuple[str, Any]:
@@ -350,66 +312,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    bundle = sub.add_parser(
-        "alpasim-bundle",
-        help="Prepare a splatsim USDZ for the alpasim runtime in one shot",
-        description=(
-            "One-shot preparation of a USDZ for the alpasim runtime. Converts "
-            "rig_trajectories.json from splatsim v1 to the legacy alpasim "
-            "schema, optionally embeds a lanelet2 .osm, and writes / refreshes "
-            "metadata.yaml at the archive root."
-        ),
-    )
-    _add_common_io_args(bundle)
-    bundle.add_argument(
-        "--lanelet2",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="Optional lanelet2 .osm to embed as map.osm",
-    )
-    bundle.add_argument(
-        "--world-to-nre",
-        dest="world_to_nre",
-        type=_load_4x4_matrix_json,
-        default=None,
-        metavar="PATH",
-        help="JSON file with the 4×4 base→root-local (NRE) matrix. Defaults to identity.",
-    )
-    bundle.add_argument(
-        "--t-world-base",
-        dest="t_world_base",
-        type=_load_4x4_matrix_json,
-        default=None,
-        metavar="PATH",
-        help=(
-            "JSON file with the 4×4 world (ECEF)→base matrix to embed under "
-            "the top-level T_world_base key."
-        ),
-    )
-    bundle.add_argument("--uuid", default=None, help="metadata.yaml uuid (non-empty string)")
-    bundle.add_argument(
-        "--scene-id",
-        dest="scene_id",
-        default=None,
-        help="metadata.yaml scene_id (defaults to the output filename stem)",
-    )
-    bundle.add_argument(
-        "--version-string",
-        dest="version_string",
-        default=None,
-        help="metadata.yaml version_string (defaults to '3dgs_io/<installed-version>')",
-    )
-    bundle.add_argument(
-        "--extra",
-        action="append",
-        dest="metadata_extras",
-        default=[],
-        metavar="KEY=VALUE",
-        type=_parse_metadata_extra,
-        help="Extra metadata.yaml key. Same semantics as `metadata --extra`.",
-    )
-
     return p
 
 
@@ -488,25 +390,6 @@ def main(argv: list[str] | None = None) -> int:
                 extras=metadata_extras or None,
             )
         except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
-    elif args.command == "alpasim-bundle":
-        bundle_extras = _dedup_metadata_extras(args.metadata_extras)
-        if bundle_extras is None:
-            return 2
-        try:
-            result = bundle_usdz_for_alpasim(
-                args.input,
-                args.output,
-                lanelet2_path=args.lanelet2,
-                world_to_nre=args.world_to_nre,
-                t_world_base=args.t_world_base,
-                uuid=args.uuid,
-                scene_id=args.scene_id,
-                version_string=args.version_string,
-                extras=bundle_extras or None,
-            )
-        except (FileNotFoundError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     else:  # pragma: no cover — argparse enforces choices

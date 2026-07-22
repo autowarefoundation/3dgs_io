@@ -156,7 +156,9 @@ def save_tileset(
         raise ValueError(f"chunk_size must be positive, got {cs}")
 
     if isinstance(source, spz.GaussianCloud):
-        return _save_from_cloud(source, output_dir, cs, options, ext_attributes)
+        return _save_from_cloud(
+            source, output_dir, cs, options, ext_attributes, root_transform=root_transform
+        )
     if ext_attributes is not None:
         raise ValueError(
             "ext_attributes is only supported for GaussianCloud sources; "
@@ -229,6 +231,8 @@ def _save_from_cloud(
     cs: float,
     options: TilesetSaveOptions,
     ext_attributes: dict[str, np.ndarray] | None = None,
+    *,
+    root_transform: np.ndarray | None = None,
 ) -> Path:
     n = gc.num_points
     if n == 0:
@@ -302,6 +306,7 @@ def _save_from_cloud(
         bbox_max,
         children,
         options,
+        root_transform,
         has_ext_attributes=bool(ext_attrs),
     )
 

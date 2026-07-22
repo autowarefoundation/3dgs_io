@@ -13,14 +13,13 @@ A :class:`Camera` is mounted on a sensor rig and lives under
     ``pixeldist_to_angle_poly``, ``angle_to_pixeldist_poly``, ``shutter_type``,
     ``reference_poly``, ``external_distortion_parameters``.
 
-* :class:`CameraExtrinsics` — **sensor-to-rig** 4×4 rigid transform
-  (``T_sensor_rig``). Stored in Python as translation + xyzw quaternion,
-  serialised as the alpasim-style flat 4×4 list of lists.
+* :class:`CameraExtrinsics` — **sensor-in-rig** rigid pose, stored and
+  serialised directly as translation + xyzw quaternion.
 
 To compute a camera's pose in scene coordinates, compose the camera
 extrinsics with the rig's pose at the relevant timestamp::
 
-    T_sensor_scene = T_rig_scene @ T_sensor_rig
+    sensor_in_world = rig_in_world @ sensor_in_rig
 """
 
 from __future__ import annotations
@@ -285,9 +284,7 @@ class CameraExtrinsics:
     """Sensor-to-rig rigid pose.
 
     Stored as a translation triple + xyzw unit quaternion (rig-relative).
-    Serialises as ``{"T_sensor_rig": <4x4 row-major nested list>}`` to match
-    alpasim's ``rig_trajectories.json.camera_calibrations[*].T_sensor_rig``
-    layout.
+    The v2 schema serialises this directly under ``sensor_in_rig``.
     """
 
     translation: tuple[float, float, float]
@@ -329,17 +326,6 @@ class CameraExtrinsics:
             rotation=(float(x), float(y), float(z), float(w)),
         )
 
-    # ------------ (de)serialisation ------------
-
-    def to_t_sensor_rig(self) -> list[list[float]]:
-        """Return the 4×4 as a nested list of Python floats (JSON-safe)."""
-        m = self.to_matrix()
-        return [[float(m[i, j]) for j in range(4)] for i in range(4)]
-
-    @classmethod
-    def from_t_sensor_rig(cls, mat: Any) -> CameraExtrinsics:
-        return cls.from_matrix(np.asarray(mat, dtype=np.float64))
-
 
 # ---------------------------------------------------------------------------
 # Camera (mounted on a rig)
@@ -356,23 +342,34 @@ class Camera:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "name": str(self.name),
-            "T_sensor_rig": self.extrinsics.to_t_sensor_rig(),
+            "sensor_in_rig": {
+                "translation": [float(v) for v in self.extrinsics.translation],
+                "rotation": [float(v) for v in self.extrinsics.rotation],
+            },
             "camera_model": self.camera_model.to_dict(),
             "metadata": dict(self.metadata),
         }
+        resolution = self.camera_model.parameters.get("resolution")
+        if resolution is not None:
+            out["calibration_resolution"] = list(resolution)
+        return out
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Camera:
-        missing = {k for k in ("name", "T_sensor_rig", "camera_model") if k not in d}
+        missing = {k for k in ("name", "sensor_in_rig", "camera_model") if k not in d}
         if missing:
             raise ValueError(
                 f"camera entry is missing required key(s) {sorted(missing)}; got keys {sorted(d)}"
             )
+        pose = d["sensor_in_rig"]
         return cls(
             name=str(d["name"]),
             camera_model=CameraModel.from_dict(d["camera_model"]),
-            extrinsics=CameraExtrinsics.from_t_sensor_rig(d["T_sensor_rig"]),
+            extrinsics=CameraExtrinsics(
+                translation=tuple(float(v) for v in pose["translation"]),
+                rotation=tuple(float(v) for v in pose["rotation"]),
+            ),
             metadata=dict(d.get("metadata") or {}),
         )

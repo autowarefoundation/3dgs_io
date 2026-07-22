@@ -250,6 +250,8 @@ def test_usdz_index_alignment_preserved(tmp_path: Path) -> None:
     raydrop = rng.standard_normal(n).astype(np.float32)
 
     src_positions = np.asarray(gc.positions, dtype=np.float32).reshape(n, 3)
+    rub_to_enu = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    src_positions = src_positions @ rub_to_enu.T
 
     ts_dir = tmp_path / "tileset"
     save_tileset(
