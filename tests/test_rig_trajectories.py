@@ -15,6 +15,7 @@ _mod = importlib.import_module("3dgs_io")
 Camera = _mod.Camera
 CameraExtrinsics = _mod.CameraExtrinsics
 CameraModel = _mod.CameraModel
+FRAME_CONVENTION = _mod.FRAME_CONVENTION
 LidarCalibration = _mod.LidarCalibration
 LidarModel = _mod.LidarModel
 RigPose = _mod.RigPose
@@ -64,8 +65,8 @@ def _trajectory(rig_id: str = "ego", n_frames: int = 4) -> RigTrajectory:
 def test_serialize_then_parse_roundtrip() -> None:
     rigs = [_trajectory("ego"), _trajectory("aux", n_frames=2)]
     doc = serialize_rig_trajectories(rigs)
-    assert doc["schema"] == "splatsim.rig_trajectories/v1"
-    assert doc["frame"] == "root_local"
+    assert doc["schema"] == "splatsim.rig_trajectories/v2"
+    assert doc["frame"] == "world"
     assert len(doc["rigs"]) == 2
 
     recovered = parse_rig_trajectories(doc)
@@ -79,6 +80,18 @@ def test_serialize_then_parse_roundtrip() -> None:
 def test_serialize_rejects_duplicate_ids() -> None:
     with pytest.raises(ValueError, match="duplicate rig_id"):
         serialize_rig_trajectories([_trajectory("ego"), _trajectory("ego")])
+
+
+def test_serialize_rejects_invalid_pose_contract() -> None:
+    duplicate_time = _trajectory("ego", n_frames=2)
+    duplicate_time.poses[1].timestamp_us = duplicate_time.poses[0].timestamp_us
+    with pytest.raises(ValueError, match="strictly increasing"):
+        serialize_rig_trajectories([duplicate_time])
+
+    bad_rotation = _trajectory("ego", n_frames=1)
+    bad_rotation.poses[0].rotation = (0.0, 0.0, 0.0, 2.0)
+    with pytest.raises(ValueError, match="unit-norm"):
+        serialize_rig_trajectories([bad_rotation])
 
 
 def test_serialize_rejects_duplicate_camera_names_within_rig() -> None:
@@ -99,7 +112,9 @@ def test_parse_rejects_duplicate_ids() -> None:
     """parse must also enforce uniqueness — symmetric with serialize."""
     rig = _trajectory("ego")
     bad = {
-        "schema": "splatsim.rig_trajectories/v1",
+        "schema": "splatsim.rig_trajectories/v2",
+        "frame": "world",
+        "frame_convention": FRAME_CONVENTION,
         "rigs": [rig.to_dict(), rig.to_dict()],
     }
     with pytest.raises(ValueError, match="duplicate rig_id"):
@@ -113,7 +128,11 @@ def test_parse_rejects_wrong_schema() -> None:
 
 
 def test_parse_rejects_missing_rigs_list() -> None:
-    bad = {"schema": "splatsim.rig_trajectories/v1"}
+    bad = {
+        "schema": "splatsim.rig_trajectories/v2",
+        "frame": "world",
+        "frame_convention": FRAME_CONVENTION,
+    }
     with pytest.raises(ValueError, match="missing the 'rigs' list"):
         parse_rig_trajectories(bad)
 
@@ -122,7 +141,14 @@ def test_pose_validates_translation_length() -> None:
     bad_pose = {"timestamp_us": 1, "translation": [1, 2], "rotation": [0, 0, 0, 1]}
     bad_rig = {"rig_id": "ego", "poses": [bad_pose]}
     with pytest.raises(ValueError, match="translation must have 3"):
-        parse_rig_trajectories({"schema": "splatsim.rig_trajectories/v1", "rigs": [bad_rig]})
+        parse_rig_trajectories(
+            {
+                "schema": "splatsim.rig_trajectories/v2",
+                "frame": "world",
+                "frame_convention": FRAME_CONVENTION,
+                "rigs": [bad_rig],
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -308,11 +334,13 @@ def test_save_scene_usdz_embeds_rig_trajectories(
         scene = json.loads(zf.read("scene.json"))
         rig_doc = json.loads(zf.read("rig_trajectories.json"))
     assert scene["extras"]["rig_trajectories"] == "rig_trajectories.json"
-    assert "world_to_nre" in rig_doc
-    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+    assert rig_doc["schema"] == "splatsim.rig_trajectories/v2"
+    assert rig_doc["frame"] == "world"
+    assert rig_doc["frame_convention"] == FRAME_CONVENTION
+    assert [r["rig_id"] for r in rig_doc["rigs"]] == ["ego"]
 
 
-def test_save_scene_usdz_defaults_to_alpasim_schema(
+def test_save_scene_usdz_writes_only_v2_schema(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     ts = make_minimal_tileset_with_glb(tmp_path)
@@ -321,39 +349,18 @@ def test_save_scene_usdz_defaults_to_alpasim_schema(
 
     with zipfile.ZipFile(out) as zf:
         rig_doc = json.loads(zf.read("rig_trajectories.json"))
-    assert "schema" not in rig_doc
-    assert rig_doc["world_to_nre"] == {"matrix": _eye_4x4()}
+    assert rig_doc["schema"] == "splatsim.rig_trajectories/v2"
+    assert "world_to_nre" not in rig_doc
     assert "T_world_base" not in rig_doc
-    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+    assert [r["rig_id"] for r in rig_doc["rigs"]] == ["ego"]
 
 
-def test_save_scene_usdz_alpasim_with_world_to_nre(
+def test_save_scene_usdz_rejects_legacy_transform_arguments(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
-    w2n = np.array(_translation_only_4x4(-100.0, 20.0, 0.0), dtype=np.float64)
-    twb = np.array(_translation_only_4x4(1_000_000.0, 0.0, 0.0), dtype=np.float64)
-    save_scene_usdz(
-        ts,
-        out,
-        rig_trajectories=[_trajectory("ego")],
-        world_to_nre=w2n,
-        t_world_base=twb,
-    )
-
-    with zipfile.ZipFile(out) as zf:
-        rig_doc = json.loads(zf.read("rig_trajectories.json"))
-    assert rig_doc["world_to_nre"] == {"matrix": w2n.tolist()}
-    assert rig_doc["T_world_base"] == twb.tolist()
-
-
-def test_save_scene_usdz_transforms_without_rig_raises(
-    tmp_path: Path, make_minimal_tileset_with_glb
-) -> None:
-    ts = make_minimal_tileset_with_glb(tmp_path)
-    out = tmp_path / "scene.usdz"
-    with pytest.raises(ValueError, match="require rig_trajectories"):
+    with pytest.raises(TypeError, match="world_to_nre"):
         save_scene_usdz(ts, out, world_to_nre=np.eye(4))
 
 
@@ -384,9 +391,7 @@ def test_rig_trajectories_and_extras_collision_rejected(
         )
 
 
-def test_cli_rig_trajectories_flag_writes_alpasim_by_default(
-    tmp_path: Path, make_minimal_tileset_with_glb
-) -> None:
+def test_cli_rig_trajectories_flag_writes_v2(tmp_path: Path, make_minimal_tileset_with_glb) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
     ts = make_minimal_tileset_with_glb(tmp_path)
     rig_path = tmp_path / "rigs.json"
@@ -397,14 +402,13 @@ def test_cli_rig_trajectories_flag_writes_alpasim_by_default(
     assert rc == 0
     with zipfile.ZipFile(out) as zf:
         rig_doc = json.loads(zf.read("rig_trajectories.json"))
-    assert "schema" not in rig_doc
-    assert "world_to_nre" in rig_doc
-    assert [r["sequence_id"] for r in rig_doc["rig_trajectories"]] == ["ego"]
+    assert rig_doc["schema"] == "splatsim.rig_trajectories/v2"
+    assert [r["rig_id"] for r in rig_doc["rigs"]] == ["ego"]
     recovered = _read_rig_trajectories_from_usdz(out)
     assert [r.rig_id for r in recovered] == ["ego"]
 
 
-def test_cli_rig_trajectories_flag_accepts_alpasim_format(
+def test_cli_rig_trajectories_flag_rejects_alpasim_format(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
@@ -424,12 +428,8 @@ def test_cli_rig_trajectories_flag_accepts_alpasim_format(
     alp_path.write_text(json.dumps(alpasim_doc))
 
     out = tmp_path / "scene.usdz"
-    rc = cli.main([str(ts), str(out), "--rig-trajectories", str(alp_path), "--quiet"])
-    assert rc == 0
-    recovered = _read_rig_trajectories_from_usdz(out)
-    assert len(recovered) == 1
-    assert recovered[0].rig_id == "ego"
-    assert recovered[0].poses[1].translation == (1.0, 2.0, 3.0)
+    with pytest.raises(ValueError, match="unexpected rig_trajectories schema"):
+        cli.main([str(ts), str(out), "--rig-trajectories", str(alp_path), "--quiet"])
 
 
 # ---------------------------------------------------------------------------

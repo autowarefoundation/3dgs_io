@@ -1,16 +1,14 @@
-"""Single-file USDZ writer for a Cesium 3D Tiles ``tileset.json``.
+"""Single-file, frame-explicit USDZ scene writer.
 
-The writer is **driven by a tileset.json** so the source's root world-anchor
-transform (Cesium 3D Tiles ``root.transform`` — 4×4 column-major) is
-preserved verbatim into the output archive. Gaussian payloads stay in the
-root-local frame; the world offset lives in ``tileset.json``'s
-``root.transform`` exactly as in the input.
+Input glTF/RUB gaussians are baked into the bundle's Z-up ENU world frame.
+The Cesium root anchor is reconciled by the inverse rotation, preserving the
+same ECEF placement without leaving an implicit axis conversion to consumers.
 
 Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
 
     default.usda                 # USDZ root stage (asset reference to tileset.json)
     metadata.yaml                # identity card (uuid / scene_id / version_string)
-    scene.json                   # splatsim.scene/v1 bundle index
+    scene.json                   # splatsim.scene/v2 bundle index
     tileset.json                 # Cesium 3D Tiles v1.0 + EXT_3dgs_spz, root.transform preserved
     chunks/chunk_NNNNNN.spz      # Niantic SPZ tiles (spatially split)
     <user-supplied extras>       # verbatim files / dirs at user-chosen paths
@@ -49,9 +47,10 @@ import numpy as np
 import spz
 
 from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
+from .frame_convention import FRAME_CONVENTION, RUB_TO_ENU, validate_rigid_transform
 from .gltf_io import load_gltf_with_metadata
 from .ppisp import Ppisp, serialize_ppisp
-from .rig_trajectories import RigTrajectory, dump_alpasim_rig_trajectories
+from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
 from .spz_io import save_spz
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
@@ -73,7 +72,7 @@ _log = logging.getLogger(__name__)
 
 _TOOL_NAME = "3dgs_io.scene_usdz"
 _TOOL_VERSION = "0.1.0"
-_SCENE_SCHEMA = "splatsim.scene/v1"
+_SCENE_SCHEMA = "splatsim.scene/v2"
 
 # 3D Tiles tile-content extension key for spz payloads.
 _EXT_3DGS_SPZ = "EXT_3dgs_spz"
@@ -212,6 +211,12 @@ def _apply_transform_to_cloud(gc: spz.GaussianCloud, transform: np.ndarray) -> s
     positions = np.array(gc.positions, dtype=np.float32).reshape(n, 3)
     rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
     r = transform[:3, :3].astype(np.float32)
+    det = float(np.linalg.det(r))
+    if not np.isfinite(det) or det <= 0.0:
+        raise ValueError(
+            "tile transform contains a reflection or singular rotation "
+            f"(det={det:.6g}); positions and orientations cannot be baked consistently"
+        )
     t = transform[:3, 3].astype(np.float32)
     new_positions = positions @ r.T + t
     new_rotations = _apply_rotation_to_quats(r, rotations)
@@ -223,8 +228,11 @@ def _apply_transform_to_cloud(gc: spz.GaussianCloud, transform: np.ndarray) -> s
     out.scales = np.array(gc.scales, dtype=np.float32)
     out.colors = np.array(gc.colors, dtype=np.float32)
     out.alphas = np.array(gc.alphas, dtype=np.float32)
-    out.sh = np.array(gc.sh, dtype=np.float32)
     out.sh_degree = gc.sh_degree
+    if gc.sh_degree > 0:
+        out.sh = np.array(gc.sh, dtype=np.float32)
+    else:
+        out.sh = np.zeros(0, dtype=np.float32)
     return out
 
 
@@ -667,11 +675,10 @@ def _compose_scene_json(
             "source_tileset": source_tileset,
         },
         "world": {
-            "up_axis": "z",
-            "units": "meters",
-            "root_transform": root_transform,
+            "frame_convention": FRAME_CONVENTION,
+            "ecef_anchor": np.array(root_transform, dtype=np.float64).reshape(4, 4).T.tolist(),
         },
-        "gaussians": gaussians,
+        "gaussians": {**gaussians, "frame": "world"},
         "extras": extras,
         "render_defaults": {
             "exposure": float(options.exposure),
@@ -694,8 +701,6 @@ def save_scene_usdz(
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
     ppisp: Ppisp | None = None,
-    world_to_nre: Any | None = None,
-    t_world_base: Any | None = None,
     metadata: UsdzMetadata | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
@@ -723,19 +728,15 @@ def save_scene_usdz(
     tracks:
         Optional list of dynamic-object :class:`Track` objects. When given
         they are serialised into ``sequence_tracks.json`` inside the archive
-        (schema ``splatsim.sequence_tracks/v1``) and recorded under
+        (schema ``splatsim.sequence_tracks/v2``) and recorded under
         ``scene.json.extras.sequence_tracks``. Track poses live in the same
-        root-local frame as the SPZ payload.
+        declared world frame as the SPZ payload.
     rig_trajectories:
         Optional list of sensor-rig :class:`RigTrajectory` objects (typically
         an ego trajectory). When given they are serialised into
-        ``rig_trajectories.json`` inside the archive (flat alpasim layout:
-        top-level ``world_to_nre`` / ``T_world_base`` / ``rig_trajectories`` /
-        ``camera_calibrations``) and recorded under
-        ``scene.json.extras.rig_trajectories``. Rig poses live in the
-        root-local frame; cameras nested under each rig
-        (:attr:`RigTrajectory.cameras`) carry rig-relative extrinsics
-        (``T_sensor_rig``).
+        ``rig_trajectories.json`` inside the archive using the frame-explicit
+        ``splatsim.rig_trajectories/v2`` schema. Poses and sensor extrinsics
+        are directly consumable as child-to-parent translation + xyzw rotation.
     ppisp:
         Optional :class:`Ppisp` describing per-camera / per-frame PPISP
         appearance-correction parameters (exposure / vignetting / colour /
@@ -744,13 +745,6 @@ def save_scene_usdz(
         ``scene.json.extras.ppisp``. Cameras are keyed by name (matching
         ``rig_trajectories.json`` cameras) and frames by ``timestamp_us``
         (matching rig poses).
-    world_to_nre:
-        Optional 4×4 array-like transform mapping root-local poses into the
-        alpasim ``world`` frame; defaults to identity when omitted. Requires
-        ``rig_trajectories``.
-    t_world_base:
-        Optional 4×4 array-like ECEF anchor written to alpasim
-        ``T_world_base``. Requires ``rig_trajectories``.
     metadata:
         Identity card written to ``metadata.yaml`` at the archive root
         (``uuid`` / ``scene_id`` / ``version_string``). When ``None`` a
@@ -770,6 +764,13 @@ def save_scene_usdz(
     metadata_payload = encode_usdz_metadata(metadata)
 
     cloud, root_transform, source_ext_attrs = _load_from_tileset(tileset_path)
+    source_root_matrix = np.array(root_transform, dtype=np.float64).reshape(4, 4).T
+    source_to_world = np.eye(4, dtype=np.float64)
+    source_to_world[:3, :3] = RUB_TO_ENU
+    cloud = _apply_transform_to_cloud(cloud, source_to_world)
+    root_matrix = source_root_matrix @ np.linalg.inv(source_to_world)
+    validate_rigid_transform(root_matrix, where="tileset root.transform")
+    root_transform = root_matrix.T.ravel().tolist()
     arrays = _filter_and_clamp(cloud, options, source_ext_attrs)
     sub_clouds, bounds, chunk_ext = _split_cloud_into_chunks(arrays, options)
     tileset_doc = _build_tileset(sub_clouds, bounds, options, root_transform, chunk_ext)
@@ -788,19 +789,13 @@ def save_scene_usdz(
         archive_paths.add("sequence_tracks.json")
 
     rig_trajectories_payload: bytes | None = None
-    if not rig_trajectories and (world_to_nre is not None or t_world_base is not None):
-        raise ValueError("world_to_nre / t_world_base require rig_trajectories to be provided")
     if rig_trajectories:
         if "rig_trajectories.json" in archive_paths:
             raise ValueError(
                 "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
                 "present in extras; pick one of the two"
             )
-        rig_doc = dump_alpasim_rig_trajectories(
-            rig_trajectories,
-            world_to_nre=world_to_nre,
-            t_world_base=t_world_base,
-        )
+        rig_doc = serialize_rig_trajectories(rig_trajectories)
         rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
         archive_paths.add("rig_trajectories.json")
 

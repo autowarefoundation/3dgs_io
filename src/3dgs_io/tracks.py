@@ -9,13 +9,12 @@ but transposed to a per-track, frames-as-list form for ergonomics.
 * :class:`Track` — track id + class label + constant box size + sorted list
   of :class:`TrackFrame` + optional per-track flag string.
 
-The on-disk schema (used both inside the USDZ as ``sequence_tracks.json`` and
-as a standalone JSON file accepted by the CLI) is
-``splatsim.sequence_tracks/v1``::
+The on-disk schema is ``splatsim.sequence_tracks/v2``::
 
     {
-      "schema": "splatsim.sequence_tracks/v1",
-      "frame": "root_local",
+      "schema": "splatsim.sequence_tracks/v2",
+      "frame": "world",
+      "frame_convention": {...},
       "tracks": [
         {
           "track_id": "100",
@@ -50,6 +49,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from .frame_convention import (
+    FRAME_CONVENTION,
+    validate_frame_convention,
+    validate_rotation,
+    validate_timestamps,
+)
+
 _log = logging.getLogger(__name__)
 
 _ALPASIM_KNOWN_TRACKS_KEYS = frozenset(
@@ -68,11 +74,10 @@ __all__ = [
 ]
 
 
-TRACKS_SCHEMA = "splatsim.sequence_tracks/v1"
+TRACKS_SCHEMA = "splatsim.sequence_tracks/v2"
 
-# Frame label written into the JSON. Tracks live in the same frame as the
-# embedded SPZ chunks (root-local).
-_FRAME = "root_local"
+# Tracks live in the same declared world frame as the embedded SPZ chunks.
+_FRAME = "world"
 
 
 @dataclass
@@ -98,6 +103,7 @@ class TrackFrame:
             raise ValueError(f"frame.translation must have 3 elements, got {len(tr)}")
         if len(ro) != 4:
             raise ValueError(f"frame.rotation must have 4 elements (xyzw), got {len(ro)}")
+        validate_timestamps([d["timestamp_us"]], where="track frame")
         return cls(
             timestamp_us=int(d["timestamp_us"]),
             translation=(float(tr[0]), float(tr[1]), float(tr[2])),
@@ -147,17 +153,22 @@ class Track:
 
 
 def serialize_tracks(tracks: list[Track]) -> dict[str, Any]:
-    """Build the JSON-ready ``splatsim.sequence_tracks/v1`` document."""
+    """Build a frame-explicit world-coordinate track document."""
     seen: set[str] = set()
     out_list: list[dict[str, Any]] = []
     for t in tracks:
         if t.track_id in seen:
             raise ValueError(f"duplicate track_id: {t.track_id!r}")
         seen.add(t.track_id)
+        timestamps = [frame.timestamp_us for frame in t.frames]
+        validate_timestamps(timestamps, where=f"track {t.track_id!r}")
+        for i, frame in enumerate(t.frames):
+            validate_rotation(frame.rotation, where=f"track {t.track_id!r} frame {i} rotation")
         out_list.append(t.to_dict())
     return {
         "schema": TRACKS_SCHEMA,
         "frame": _FRAME,
+        "frame_convention": FRAME_CONVENTION,
         "tracks": out_list,
     }
 
@@ -171,6 +182,9 @@ def parse_tracks(doc: dict[str, Any]) -> list[Track]:
     schema = doc.get("schema")
     if schema != TRACKS_SCHEMA:
         raise ValueError(f"unexpected tracks schema {schema!r}; expected {TRACKS_SCHEMA!r}")
+    if doc.get("frame") != _FRAME:
+        raise ValueError(f"tracks frame must be {_FRAME!r}")
+    validate_frame_convention(doc.get("frame_convention"))
     raw = doc.get("tracks")
     if not isinstance(raw, list):
         raise ValueError("tracks document is missing the 'tracks' list")
@@ -181,6 +195,12 @@ def parse_tracks(doc: dict[str, Any]) -> list[Track]:
         if track.track_id in seen:
             raise ValueError(f"duplicate track_id: {track.track_id!r}")
         seen.add(track.track_id)
+        validate_timestamps(
+            [frame.timestamp_us for frame in track.frames],
+            where=f"track {track.track_id!r}",
+        )
+        for i, frame in enumerate(track.frames):
+            validate_rotation(frame.rotation, where=f"track {track.track_id!r} frame {i} rotation")
         out.append(track)
     return out
 

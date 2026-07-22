@@ -192,12 +192,10 @@ def test_extrinsics_zero_norm_quaternion_raises() -> None:
 def _camera_dict() -> dict[str, Any]:
     return {
         "name": "front_left",
-        "T_sensor_rig": [
-            [1.0, 0.0, 0.0, 1.5],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 1.8],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
+        "sensor_in_rig": {
+            "translation": [1.5, 0.0, 1.8],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+        },
         "camera_model": {
             "type": "pinhole",
             "parameters": {
@@ -217,7 +215,8 @@ def test_camera_round_trip() -> None:
     cam = Camera.from_dict(d)
     again = cam.to_dict()
     assert again["name"] == "front_left"
-    assert again["T_sensor_rig"] == d["T_sensor_rig"]
+    assert again["sensor_in_rig"] == d["sensor_in_rig"]
+    assert again["calibration_resolution"] == [1920, 1080]
     assert again["camera_model"]["type"] == "pinhole"
     assert again["camera_model"]["parameters"]["fx"] == 1000.0
     assert again["metadata"] == {"sequence_id": "test_seq"}
@@ -232,8 +231,8 @@ def test_camera_from_dict_default_metadata() -> None:
 
 def test_camera_from_dict_missing_keys_raises_clearly() -> None:
     d = _camera_dict()
-    del d["T_sensor_rig"]
-    with pytest.raises(ValueError, match=r"missing required key.*T_sensor_rig"):
+    del d["sensor_in_rig"]
+    with pytest.raises(ValueError, match=r"missing required key.*sensor_in_rig"):
         Camera.from_dict(d)
 
 

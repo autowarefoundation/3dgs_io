@@ -1,17 +1,15 @@
-"""Sensor-rig (ego / multi-rig) trajectory dataclasses + JSON (de)serialisation.
+"""Frame-explicit, alpasim-native sensor-rig trajectories.
 
-A :class:`RigTrajectory` is a time-series of :class:`RigPose` samples for a
-single sensor rig (typically the ego vehicle). Poses live in the bundle's
-**root-local frame** (the same coordinate system as the embedded SPZ chunks,
-the cameras and the dynamic-object tracks), so applying the output USDZ's
-``tileset.json.root.transform`` after the rig pose lifts it into world space.
+The v2 document stores world-frame rig poses and sensor-in-rig calibrations as
+translation + xyzw quaternion pairs. All matrices are row-major child-to-parent
+transforms and timestamps are strictly increasing u64 microseconds.
 
-On-disk schema (``rig_trajectories.json`` inside the USDZ; also accepted as a
-standalone JSON file by the CLI) — ``splatsim.rig_trajectories/v1``::
+On-disk schema — ``splatsim.rig_trajectories/v2``::
 
     {
-      "schema": "splatsim.rig_trajectories/v1",
-      "frame": "root_local",
+      "schema": "splatsim.rig_trajectories/v2",
+      "frame": "world",
+      "frame_convention": {...},
       "rigs": [
         {
           "rig_id": "ego",
@@ -29,12 +27,8 @@ standalone JSON file by the CLI) — ``splatsim.rig_trajectories/v1``::
       ]
     }
 
-This is **not** byte-compatible with alpasim's ``rig_trajectories.json`` —
-alpasim stores per-rig ``T_rig_worlds`` (a list of 4×4 matrices, relative to
-the top-level ``T_world_base`` and ``world_to_nre``). Use
-:func:`parse_alpasim_rig_trajectories` to ingest alpasim documents into our
-schema: the alpasim ingester composes the global frames and extracts a clean
-(translation, xyzw quaternion) tuple per timestamp.
+Legacy alpasim conversion helpers remain explicit utilities; the primary
+reader accepts v2 documents only.
 """
 
 from __future__ import annotations
@@ -47,6 +41,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .cameras import Camera, CameraExtrinsics, CameraModel
+from .frame_convention import (
+    FRAME_CONVENTION,
+    validate_frame_convention,
+    validate_rigid_transform,
+    validate_rotation,
+    validate_timestamps,
+)
 
 __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
@@ -63,8 +64,8 @@ __all__ = [
 ]
 
 
-RIG_TRAJECTORIES_SCHEMA = "splatsim.rig_trajectories/v1"
-_FRAME = "root_local"
+RIG_TRAJECTORIES_SCHEMA = "splatsim.rig_trajectories/v2"
+_FRAME = "world"
 
 _log = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class RigPose:
             raise ValueError(f"pose.translation must have 3 elements, got {len(tr)}")
         if len(ro) != 4:
             raise ValueError(f"pose.rotation must have 4 elements (xyzw), got {len(ro)}")
+        validate_timestamps([d["timestamp_us"]], where="rig pose")
         return cls(
             timestamp_us=int(d["timestamp_us"]),
             translation=(float(tr[0]), float(tr[1]), float(tr[2])),
@@ -208,7 +210,10 @@ class LidarCalibration:
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
             "name": str(self.name),
-            "T_sensor_rig": self.extrinsics.to_t_sensor_rig(),
+            "sensor_in_rig": {
+                "translation": [float(v) for v in self.extrinsics.translation],
+                "rotation": [float(v) for v in self.extrinsics.rotation],
+            },
         }
         if self.logical_sensor_name is not None:
             out["logical_sensor_name"] = str(self.logical_sensor_name)
@@ -223,9 +228,13 @@ class LidarCalibration:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> LidarCalibration:
         model_raw = d.get("lidar_model")
+        pose = d["sensor_in_rig"]
         return cls(
             name=str(d["name"]),
-            extrinsics=CameraExtrinsics.from_t_sensor_rig(d["T_sensor_rig"]),
+            extrinsics=CameraExtrinsics(
+                translation=tuple(float(v) for v in pose["translation"]),
+                rotation=tuple(float(v) for v in pose["rotation"]),
+            ),
             logical_sensor_name=(
                 str(d["logical_sensor_name"]) if d.get("logical_sensor_name") is not None else None
             ),
@@ -279,7 +288,7 @@ class RigTrajectory:
 
 
 def serialize_rig_trajectories(rigs: list[RigTrajectory]) -> dict[str, Any]:
-    """Build the JSON-ready ``splatsim.rig_trajectories/v1`` document.
+    """Build the JSON-ready ``splatsim.rig_trajectories/v2`` document.
 
     Enforces unique ``rig_id`` across rigs and unique ``name`` for cameras
     within each rig — duplicates would silently collapse on round-trip when
@@ -291,15 +300,34 @@ def serialize_rig_trajectories(rigs: list[RigTrajectory]) -> dict[str, Any]:
         if rig.rig_id in seen_rigs:
             raise ValueError(f"duplicate rig_id: {rig.rig_id!r}")
         seen_rigs.add(rig.rig_id)
+        validate_timestamps([p.timestamp_us for p in rig.poses], where=f"rig {rig.rig_id!r}")
+        for i, pose in enumerate(rig.poses):
+            validate_rotation(pose.rotation, where=f"rig {rig.rig_id!r} pose {i} rotation")
         seen_cams: set[str] = set()
         for cam in rig.cameras:
             if cam.name in seen_cams:
                 raise ValueError(f"duplicate camera name {cam.name!r} in rig {rig.rig_id!r}")
             seen_cams.add(cam.name)
+            validate_rotation(
+                cam.extrinsics.rotation,
+                where=f"camera {cam.name!r} sensor_in_rig rotation",
+            )
+            validate_rigid_transform(
+                cam.extrinsics.to_matrix(), where=f"camera {cam.name!r} sensor_in_rig"
+            )
+        for lidar in rig.lidars:
+            validate_rotation(
+                lidar.extrinsics.rotation,
+                where=f"lidar {lidar.name!r} sensor_in_rig rotation",
+            )
+            validate_rigid_transform(
+                lidar.extrinsics.to_matrix(), where=f"lidar {lidar.name!r} sensor_in_rig"
+            )
         out_list.append(rig.to_dict())
     return {
         "schema": RIG_TRAJECTORIES_SCHEMA,
         "frame": _FRAME,
+        "frame_convention": FRAME_CONVENTION,
         "rigs": out_list,
     }
 
@@ -362,7 +390,7 @@ def update_camera_intrinsics(
 
 
 def load_rig_trajectories_doc(doc: dict[str, Any]) -> list[RigTrajectory]:
-    """Parse either a ``splatsim.rig_trajectories/v1`` doc or an alpasim one.
+    """Parse a ``splatsim.rig_trajectories/v2`` document.
 
     Single dispatcher used by CLIs and library callers that accept both
     schemas. Dispatch is by the top-level ``schema`` key: matches the
@@ -375,9 +403,7 @@ def load_rig_trajectories_doc(doc: dict[str, Any]) -> list[RigTrajectory]:
             f"rig_trajectories document must be a JSON object at top level, "
             f"got {type(doc).__name__}"
         )
-    if doc.get("schema") == RIG_TRAJECTORIES_SCHEMA:
-        return parse_rig_trajectories(doc)
-    return parse_alpasim_rig_trajectories(doc)
+    return parse_rig_trajectories(doc)
 
 
 def parse_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
@@ -387,6 +413,9 @@ def parse_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
         raise ValueError(
             f"unexpected rig_trajectories schema {schema!r}; expected {RIG_TRAJECTORIES_SCHEMA!r}"
         )
+    if doc.get("frame") != _FRAME:
+        raise ValueError(f"rig_trajectories frame must be {_FRAME!r}")
+    validate_frame_convention(doc.get("frame_convention"))
     raw = doc.get("rigs")
     if not isinstance(raw, list):
         raise ValueError("rig_trajectories document is missing the 'rigs' list")
@@ -397,6 +426,9 @@ def parse_rig_trajectories(doc: dict[str, Any]) -> list[RigTrajectory]:
         if rig.rig_id in seen:
             raise ValueError(f"duplicate rig_id: {rig.rig_id!r}")
         seen.add(rig.rig_id)
+        validate_timestamps([p.timestamp_us for p in rig.poses], where=f"rig {rig.rig_id!r}")
+        for i, pose in enumerate(rig.poses):
+            validate_rotation(pose.rotation, where=f"rig {rig.rig_id!r} pose {i} rotation")
         seen_cams: set[str] = set()
         for cam in rig.cameras:
             if cam.name in seen_cams:

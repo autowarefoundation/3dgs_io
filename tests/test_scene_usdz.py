@@ -23,6 +23,15 @@ SceneUsdzOptions = _mod.SceneUsdzOptions
 UsdzMetadata = _mod.UsdzMetadata
 save_gltf = _mod.save_gltf
 save_scene_usdz = _mod.save_scene_usdz
+FRAME_CONVENTION = _mod.FRAME_CONVENTION
+
+
+def _expected_enu_root(transform: list[float]) -> list[float]:
+    rub_to_enu = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    conversion = np.eye(4)
+    conversion[:3, :3] = rub_to_enu
+    source = np.asarray(transform, dtype=np.float64).reshape(4, 4).T
+    return (source @ np.linalg.inv(conversion)).T.ravel().tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -146,14 +155,15 @@ def test_zip_entries_are_uncompressed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_root_transform_preserved_in_output_tileset(tmp_path: Path) -> None:
+def test_root_transform_reconciled_for_enu_payload(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path, transform=_NONIDENT_TRANSFORM)
     out = tmp_path / "scene.usdz"
     res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
 
     out_tileset = json.loads(_read(out, "tileset.json"))
-    assert out_tileset["root"]["transform"] == _NONIDENT_TRANSFORM
-    assert res.root_transform == _NONIDENT_TRANSFORM
+    expected = _expected_enu_root(_NONIDENT_TRANSFORM)
+    assert out_tileset["root"]["transform"] == expected
+    assert res.root_transform == expected
 
 
 def test_root_transform_recorded_in_scene_json(tmp_path: Path) -> None:
@@ -161,7 +171,8 @@ def test_root_transform_recorded_in_scene_json(tmp_path: Path) -> None:
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
     scene = json.loads(_read(out, "scene.json"))
-    assert scene["world"]["root_transform"] == _NONIDENT_TRANSFORM
+    expected = np.asarray(_expected_enu_root(_NONIDENT_TRANSFORM)).reshape(4, 4).T.tolist()
+    assert scene["world"]["ecef_anchor"] == expected
 
 
 def _make_nested_tileset(
@@ -264,7 +275,7 @@ def test_sub_root_translation_applied_to_positions(tmp_path: Path) -> None:
     pos = np.concatenate(
         [np.array(spz_io.load_spz(c).positions, dtype=np.float32).reshape(-1, 3) for c in chunks]
     )
-    np.testing.assert_allclose(pos.mean(axis=0), [10.0, 20.0, 30.0], atol=1e-4)
+    np.testing.assert_allclose(pos.mean(axis=0), [-30.0, -10.0, 20.0], atol=1e-4)
 
 
 def test_nested_rotation_composition_order(tmp_path: Path) -> None:
@@ -323,7 +334,7 @@ def test_nested_rotation_composition_order(tmp_path: Path) -> None:
         [np.array(spz_io.load_spz(c).positions, dtype=np.float32).reshape(-1, 3) for c in chunks]
     )
     # Point at the origin moves to (10, 0, 0) under child.transform.
-    np.testing.assert_allclose(pos.mean(axis=0), [10.0, 0.0, 0.0], atol=1e-4)
+    np.testing.assert_allclose(pos.mean(axis=0), [0.0, -10.0, 0.0], atol=1e-4)
 
 
 def test_tileset_with_utf8_bom_is_accepted(tmp_path: Path) -> None:
@@ -343,14 +354,15 @@ def test_extras_trailing_slash_still_rejected(tmp_path: Path) -> None:
         save_scene_usdz(ts, tmp_path / "out.usdz", extras={"scene.json/": f})
 
 
-def test_missing_root_transform_defaults_to_identity(tmp_path: Path) -> None:
+def test_missing_root_transform_gets_enu_reconciliation(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path, transform=None)
     out = tmp_path / "scene.usdz"
     res = save_scene_usdz(ts, out)
-    identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-    assert res.root_transform == identity
+    identity = np.eye(4).T.ravel().tolist()
+    expected = _expected_enu_root(identity)
+    assert res.root_transform == expected
     out_tileset = json.loads(_read(out, "tileset.json"))
-    assert out_tileset["root"]["transform"] == identity
+    assert out_tileset["root"]["transform"] == expected
 
 
 def test_positions_stay_in_root_local_frame(tmp_path: Path) -> None:
@@ -387,10 +399,11 @@ def test_scene_json_schema(tmp_path: Path) -> None:
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
     scene = json.loads(_read(out, "scene.json"))
-    assert scene["schema"] == "splatsim.scene/v1"
+    assert scene["schema"] == "splatsim.scene/v2"
     assert scene["producer"]["source_tileset"] == "tileset.json"
-    assert scene["world"]["up_axis"] == "z"
-    assert "root_transform" in scene["world"]
+    assert scene["world"]["frame_convention"] == FRAME_CONVENTION
+    assert "ecef_anchor" in scene["world"]
+    assert scene["gaussians"]["frame"] == "world"
     assert scene["gaussians"]["tileset"] == "tileset.json"
     assert scene["gaussians"]["sh_degree"] == 3
     assert scene["gaussians"]["n_gaussians"] > 0
@@ -668,7 +681,7 @@ def test_cli_with_tileset_input(tmp_path: Path, capsys: pytest.CaptureFixture[st
     summary = json.loads(capsys.readouterr().out)
     assert summary["out_path"].endswith("out.usdz")
     assert summary["n_gaussians"] > 0
-    assert summary["root_transform"] == _NONIDENT_TRANSFORM
+    assert summary["root_transform"] == _expected_enu_root(_NONIDENT_TRANSFORM)
 
 
 def test_cli_quiet_suppresses_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

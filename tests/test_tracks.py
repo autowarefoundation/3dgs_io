@@ -14,6 +14,7 @@ import pytest
 _mod = importlib.import_module("3dgs_io")
 Track = _mod.Track
 TrackFrame = _mod.TrackFrame
+FRAME_CONVENTION = _mod.FRAME_CONVENTION
 dump_alpasim_sequence_tracks = _mod.dump_alpasim_sequence_tracks
 parse_alpasim_sequence_tracks = _mod.parse_alpasim_sequence_tracks
 parse_tracks = _mod.parse_tracks
@@ -68,8 +69,8 @@ def _track(
 def test_serialize_then_parse_roundtrip() -> None:
     tracks = [_track("veh_0"), _track("veh_1", class_name="person")]
     doc = serialize_tracks(tracks)
-    assert doc["schema"] == "splatsim.sequence_tracks/v1"
-    assert doc["frame"] == "root_local"
+    assert doc["schema"] == "splatsim.sequence_tracks/v2"
+    assert doc["frame"] == "world"
     assert len(doc["tracks"]) == 2
 
     recovered = parse_tracks(doc)
@@ -89,6 +90,18 @@ def test_serialize_rejects_duplicate_ids() -> None:
         serialize_tracks([_track("a"), _track("a")])
 
 
+def test_serialize_rejects_invalid_frame_contract() -> None:
+    duplicate_time = _track("a")
+    duplicate_time.frames[1].timestamp_us = duplicate_time.frames[0].timestamp_us
+    with pytest.raises(ValueError, match="strictly increasing"):
+        serialize_tracks([duplicate_time])
+
+    bad_rotation = _track("b")
+    bad_rotation.frames[0].rotation = (0.0, 0.0, 0.0, 0.5)
+    with pytest.raises(ValueError, match="unit-norm"):
+        serialize_tracks([bad_rotation])
+
+
 def test_parse_rejects_wrong_schema() -> None:
     bad = {"schema": "other/v1", "tracks": []}
     with pytest.raises(ValueError, match="unexpected tracks schema"):
@@ -96,7 +109,11 @@ def test_parse_rejects_wrong_schema() -> None:
 
 
 def test_parse_rejects_missing_tracks_list() -> None:
-    bad = {"schema": "splatsim.sequence_tracks/v1"}
+    bad = {
+        "schema": "splatsim.sequence_tracks/v2",
+        "frame": "world",
+        "frame_convention": FRAME_CONVENTION,
+    }
     with pytest.raises(ValueError, match="missing the 'tracks' list"):
         parse_tracks(bad)
 
@@ -110,7 +127,14 @@ def test_parse_validates_frame_lengths() -> None:
         "frames": [bad_frame],
     }
     with pytest.raises(ValueError, match="translation must have 3"):
-        parse_tracks({"schema": "splatsim.sequence_tracks/v1", "tracks": [bad_track]})
+        parse_tracks(
+            {
+                "schema": "splatsim.sequence_tracks/v2",
+                "frame": "world",
+                "frame_convention": FRAME_CONVENTION,
+                "tracks": [bad_track],
+            }
+        )
 
 
 def test_parse_validates_size_length() -> None:
@@ -121,7 +145,14 @@ def test_parse_validates_size_length() -> None:
         "frames": [],
     }
     with pytest.raises(ValueError, match="size must have 3"):
-        parse_tracks({"schema": "splatsim.sequence_tracks/v1", "tracks": [bad_track]})
+        parse_tracks(
+            {
+                "schema": "splatsim.sequence_tracks/v2",
+                "frame": "world",
+                "frame_convention": FRAME_CONVENTION,
+                "tracks": [bad_track],
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +375,9 @@ def test_save_scene_usdz_embeds_sequence_tracks(
         scene = json.loads(zf.read("scene.json"))
         tracks_doc = json.loads(zf.read("sequence_tracks.json"))
     assert scene["extras"]["sequence_tracks"] == "sequence_tracks.json"
-    assert tracks_doc["schema"] == "splatsim.sequence_tracks/v1"
+    assert tracks_doc["schema"] == "splatsim.sequence_tracks/v2"
+    assert tracks_doc["frame"] == "world"
+    assert tracks_doc["frame_convention"] == FRAME_CONVENTION
     assert {t["track_id"] for t in tracks_doc["tracks"]} == {"a", "b"}
 
 
@@ -388,7 +421,7 @@ def test_cli_tracks_flag_native_schema(tmp_path: Path, make_minimal_tileset_with
     assert [t.track_id for t in recovered] == ["c0"]
 
 
-def test_cli_tracks_flag_accepts_alpasim_format(
+def test_cli_tracks_flag_rejects_alpasim_format(
     tmp_path: Path, make_minimal_tileset_with_glb
 ) -> None:
     cli = importlib.import_module("3dgs_io.scene_usdz_cli")
@@ -397,7 +430,5 @@ def test_cli_tracks_flag_accepts_alpasim_format(
     alpasim_path.write_text(json.dumps(_ALPASIM_DOC))
 
     out = tmp_path / "scene.usdz"
-    rc = cli.main([str(ts), str(out), "--tracks", str(alpasim_path), "--quiet"])
-    assert rc == 0
-    recovered = _read_tracks_from_usdz(out)
-    assert {t.track_id for t in recovered} == {"100", "104"}
+    with pytest.raises(ValueError, match="unexpected tracks schema"):
+        cli.main([str(ts), str(out), "--tracks", str(alpasim_path), "--quiet"])

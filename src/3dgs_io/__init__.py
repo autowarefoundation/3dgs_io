@@ -30,6 +30,7 @@ from .ext_attributes import (
     decode_lidar_sidecar,
     encode_lidar_sidecar,
 )
+from .frame_convention import FRAME_CONVENTION
 from .gltf_io import GltfSaveOptions, load_gltf, load_gltf_with_metadata, save_gltf
 from .metadata import (
     Checkpoint,
@@ -97,6 +98,7 @@ from .usdz_metadata import (
     load_usdz_metadata,
     make_default_metadata,
 )
+from .usdz_tiles_export import export_usdz_tileset
 from .viewer import launch_viewer
 
 __all__ = [
@@ -126,6 +128,7 @@ __all__ = [
     "bundle_usdz_for_alpasim",
     "convert_rig_trajectories_to_alpasim_schema",
     "Export",
+    "FRAME_CONVENTION",
     "EXT_GAUSSIAN_LIDAR_NAME",
     "ExtAttributeSpec",
     "GaussianCloud",
@@ -151,6 +154,7 @@ __all__ = [
     "add_ppisp_to_usdz",
     "default_uuid",
     "encode_usdz_metadata",
+    "export_usdz_tileset",
     "load_usdz_metadata",
     "make_default_metadata",
     "set_usdz_metadata",

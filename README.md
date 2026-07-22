@@ -4,6 +4,24 @@ A Python library for reading and writing 3D Gaussian Splatting data in [glTF](ht
 
 Documentation: https://tier4.github.io/3dgs_io/
 
+## Frame-explicit USDZ scenes
+
+Scene bundles use the breaking `splatsim.scene/v2`,
+`splatsim.rig_trajectories/v2`, and `splatsim.sequence_tracks/v2` schemas.
+Gaussians, rigs, and tracks share one right-handed Z-up ENU world frame;
+rigs use X-forward/Y-left/Z-up, quaternions are xyzw, and timestamps are
+strictly increasing u64 microseconds. Writers reject reflections, invalid
+rotations, and mismatched frame declarations.
+
+Export an embedded SPZ scene to a standalone Cesium 3D Tiles 1.1 tileset:
+
+```bash
+python -m 3dgs_io export-tiles scene.usdz output_tiles/
+```
+
+The API equivalent is `3dgs_io.export_usdz_tileset(...)`. Both paths retain
+the reconciled ECEF root anchor.
+
 ## USDZ scene-bundle manifest (`metadata.yaml`)
 
 Every USDZ produced by `3dgs_io.save_scene_usdz` writes a `metadata.yaml` at
