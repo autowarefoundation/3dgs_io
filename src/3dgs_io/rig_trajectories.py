@@ -51,6 +51,7 @@ from .cameras import Camera, CameraExtrinsics, CameraModel
 __all__ = [
     "RIG_TRAJECTORIES_SCHEMA",
     "LidarCalibration",
+    "LidarModel",
     "RigPose",
     "RigTrajectory",
     "dump_alpasim_rig_trajectories",
@@ -98,25 +99,109 @@ class RigPose:
         )
 
 
+# Required ``parameters`` keys per LiDAR-model ``type``. Unknown types fall
+# back to the bare data shape (``n_rows``, ``n_columns``), exactly like
+# :data:`_REQUIRED_INTRINSIC_KEYS` handles unknown camera types by falling
+# back to ``resolution``.
+_REQUIRED_LIDAR_INTRINSIC_KEYS: dict[str, tuple[str, ...]] = {
+    "spinning": (
+        "n_rows",
+        "n_columns",
+        "fps",
+        "min_range_m",
+        "max_range_m",
+    ),
+}
+
+
+@dataclass
+class LidarModel:
+    """Type-tagged LiDAR intrinsics (peer to :class:`CameraModel`).
+
+    ``parameters`` must contain the intrinsic keys required for the given
+    ``type``. For ``spinning`` LiDARs one of ``elevation_deg`` (per-beam
+    non-uniform elevation table, e.g. Hesai OT128) or ``elevation_fov_deg``
+    (``[lo, hi]`` uniform FOV, in degrees) must additionally be present —
+    the analogue of how an ``ftheta`` camera carries the actual polynomial
+    rather than just a lens name.
+
+    Unknown ``type`` values still require the bare data shape
+    (``n_rows``, ``n_columns``), exactly like :class:`CameraModel` requires
+    ``resolution`` for unknown camera types.
+    """
+
+    type: str
+    parameters: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parameters, dict):
+            raise ValueError(
+                f"lidar_model.parameters must be a dict; got {type(self.parameters).__name__}"
+            )
+        required = _REQUIRED_LIDAR_INTRINSIC_KEYS.get(self.type, ("n_rows", "n_columns"))
+        missing = [k for k in required if k not in self.parameters]
+        if missing:
+            raise ValueError(
+                f"lidar_model(type={self.type!r}) is missing required intrinsic "
+                f"key(s) {missing}; got keys {sorted(self.parameters)}"
+            )
+        if self.type == "spinning":
+            has_table = "elevation_deg" in self.parameters
+            has_fov = "elevation_fov_deg" in self.parameters
+            if not (has_table or has_fov):
+                raise ValueError(
+                    "lidar_model(type='spinning') must carry beam layout: either "
+                    "'elevation_deg' (per-beam table) or 'elevation_fov_deg' [lo, hi]"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"type": str(self.type), "parameters": dict(self.parameters)}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> LidarModel:
+        missing = [k for k in ("type", "parameters") if k not in d]
+        if missing:
+            raise ValueError(
+                f"lidar_model dict is missing required key(s) {missing}; got keys {sorted(d)}"
+            )
+        raw_params = d["parameters"]
+        if not isinstance(raw_params, dict):
+            raise ValueError(
+                f"lidar_model.parameters must be a dict; got {type(raw_params).__name__}"
+            )
+        return cls(type=str(d["type"]), parameters=dict(raw_params))
+
+
 @dataclass
 class LidarCalibration:
-    """LiDAR sensor calibration (name, sensor-to-rig extrinsics, logical name).
+    """LiDAR sensor calibration (name, sensor-to-rig extrinsics, optional intrinsics).
 
     Mirrors one entry in alpasim's ``rig_trajectories.json.lidar_calibrations``
     top-level dict::
 
-        {"lidar_top": {"T_sensor_rig": [[...]], "logical_sensor_name": "top"}}
+        {"lidar_top": {
+            "T_sensor_rig": [[...]],
+            "logical_sensor_name": "top",
+            "lidar_model": {"type": "spinning", "parameters": {...}}
+        }}
 
     LiDARs are attached to :attr:`RigTrajectory.lidars` by
     :func:`parse_alpasim_rig_trajectories` and emitted back by
     :func:`dump_alpasim_rig_trajectories`. Storage format for the transform
     is shared with cameras (:class:`CameraExtrinsics` is sensor-generic
     despite its name).
+
+    ``lidar_model`` is optional. When ``None`` the calibration is
+    extrinsics-only — sufficient for scene assembly and rig-relative
+    playback, but not enough to *simulate* the sensor. Producers that know
+    the sensor geometry (scan pattern, beam layout, range) should populate
+    it; consumers that don't yet consume intrinsics simply ignore the field.
     """
 
     name: str
     extrinsics: CameraExtrinsics
     logical_sensor_name: str | None = None
+    lidar_model: LidarModel | None = None
     unique_sensor_idx: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -127,6 +212,8 @@ class LidarCalibration:
         }
         if self.logical_sensor_name is not None:
             out["logical_sensor_name"] = str(self.logical_sensor_name)
+        if self.lidar_model is not None:
+            out["lidar_model"] = self.lidar_model.to_dict()
         if self.unique_sensor_idx is not None:
             out["unique_sensor_idx"] = int(self.unique_sensor_idx)
         if self.metadata:
@@ -135,12 +222,14 @@ class LidarCalibration:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> LidarCalibration:
+        model_raw = d.get("lidar_model")
         return cls(
             name=str(d["name"]),
             extrinsics=CameraExtrinsics.from_t_sensor_rig(d["T_sensor_rig"]),
             logical_sensor_name=(
                 str(d["logical_sensor_name"]) if d.get("logical_sensor_name") is not None else None
             ),
+            lidar_model=LidarModel.from_dict(model_raw) if model_raw is not None else None,
             unique_sensor_idx=(
                 int(d["unique_sensor_idx"]) if d.get("unique_sensor_idx") is not None else None
             ),
@@ -651,18 +740,27 @@ def _attach_alpasim_lidars_to_rig(
             continue
         logical = entry.get("logical_sensor_name")
         unique_idx = entry.get("unique_sensor_idx")
-        # Preserve any extra fields alpasim carries (e.g. intrinsics-like
-        # projection blocks) so a round-trip can echo them back.
+        model_raw = entry.get("lidar_model")
+        lidar_model = LidarModel.from_dict(model_raw) if model_raw is not None else None
+        # Preserve any *other* extras alpasim carries so a round-trip can
+        # echo them back. Known first-class fields are consumed above.
         extras = {
             k: v
             for k, v in entry.items()
-            if k not in ("T_sensor_rig", "logical_sensor_name", "unique_sensor_idx")
+            if k
+            not in (
+                "T_sensor_rig",
+                "logical_sensor_name",
+                "unique_sensor_idx",
+                "lidar_model",
+            )
         }
         lidars.append(
             LidarCalibration(
                 name=str(lidar_name),
                 extrinsics=CameraExtrinsics.from_t_sensor_rig(t_sensor_rig),
                 logical_sensor_name=str(logical) if logical is not None else None,
+                lidar_model=lidar_model,
                 unique_sensor_idx=int(unique_idx) if unique_idx is not None else None,
                 metadata=extras,
             )
@@ -762,13 +860,20 @@ def dump_alpasim_rig_trajectories(
                     else lidar.name
                 ),
             }
+            if lidar.lidar_model is not None:
+                l_entry["lidar_model"] = lidar.lidar_model.to_dict()
             if lidar.unique_sensor_idx is not None:
                 l_entry["unique_sensor_idx"] = lidar.unique_sensor_idx
             # Echo back any extra fields alpasim carried on the calibration
             # (e.g. projection block). Don't let extras shadow the fields
             # we canonicalise above.
             for k, v in lidar.metadata.items():
-                if k in ("T_sensor_rig", "logical_sensor_name", "unique_sensor_idx"):
+                if k in (
+                    "T_sensor_rig",
+                    "logical_sensor_name",
+                    "lidar_model",
+                    "unique_sensor_idx",
+                ):
                     continue
                 l_entry[k] = v
             lidar_calibrations[lidar.name] = l_entry

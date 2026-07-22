@@ -53,6 +53,7 @@ from .ppisp import (
 )
 from .rig_trajectories import (
     LidarCalibration,
+    LidarModel,
     RigPose,
     RigTrajectory,
     dump_alpasim_rig_trajectories,
@@ -131,6 +132,7 @@ __all__ = [
     "GlbMetadata",
     "GltfSaveOptions",
     "LidarCalibration",
+    "LidarModel",
     "Model",
     "Placement",
     "RigPose",

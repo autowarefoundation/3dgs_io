@@ -16,6 +16,7 @@ Camera = _mod.Camera
 CameraExtrinsics = _mod.CameraExtrinsics
 CameraModel = _mod.CameraModel
 LidarCalibration = _mod.LidarCalibration
+LidarModel = _mod.LidarModel
 RigPose = _mod.RigPose
 RigTrajectory = _mod.RigTrajectory
 dump_alpasim_rig_trajectories = _mod.dump_alpasim_rig_trajectories
@@ -747,3 +748,155 @@ def test_alpasim_lidar_round_trip_preserves_extrinsics_and_logical_name() -> Non
         np.array(round_tripped["T_sensor_rig"]),
         np.array(_translation_only_4x4(0.5, 0.0, 1.8)),
     )
+
+
+# ---------------------------------------------------------------------------
+# LidarModel (type-tagged LiDAR intrinsics)
+# ---------------------------------------------------------------------------
+
+
+def _spinning_params(elevation_deg: list[float] | None = None) -> dict[str, object]:
+    return {
+        "n_rows": 128,
+        "n_columns": 2048,
+        "fps": 10.0,
+        "min_range_m": 0.3,
+        "max_range_m": 120.0,
+        "elevation_deg": elevation_deg if elevation_deg is not None else [-25.0, 15.0],
+    }
+
+
+def test_lidar_model_spinning_accepts_elevation_table() -> None:
+    m = LidarModel(type="spinning", parameters=_spinning_params())
+    assert m.type == "spinning"
+    assert m.parameters["n_rows"] == 128
+
+
+def test_lidar_model_spinning_accepts_elevation_fov_deg() -> None:
+    params = _spinning_params()
+    del params["elevation_deg"]
+    params["elevation_fov_deg"] = [-25.0, 15.0]
+    LidarModel(type="spinning", parameters=params)  # must not raise
+
+
+def test_lidar_model_spinning_rejects_missing_beam_layout() -> None:
+    params = _spinning_params()
+    del params["elevation_deg"]
+    with pytest.raises(ValueError, match="beam layout"):
+        LidarModel(type="spinning", parameters=params)
+
+
+def test_lidar_model_spinning_rejects_missing_core_param() -> None:
+    params = _spinning_params()
+    del params["max_range_m"]
+    with pytest.raises(ValueError, match="max_range_m"):
+        LidarModel(type="spinning", parameters=params)
+
+
+def test_lidar_model_unknown_type_requires_bare_shape_only() -> None:
+    # Mirrors CameraModel's behaviour for unknown camera types: the bare
+    # data shape is enough. Beam layout is spinning-specific.
+    LidarModel(type="solid_state", parameters={"n_rows": 32, "n_columns": 1024})
+
+
+def test_lidar_model_unknown_type_rejects_missing_bare_shape() -> None:
+    with pytest.raises(ValueError, match=r"n_columns|n_rows"):
+        LidarModel(type="mystery", parameters={"n_rows": 32})
+
+
+def test_lidar_model_rejects_non_dict_parameters() -> None:
+    with pytest.raises(ValueError, match="must be a dict"):
+        LidarModel(type="spinning", parameters="not a dict")  # type: ignore[arg-type]
+
+
+def test_lidar_model_to_from_dict_round_trip() -> None:
+    original = LidarModel(type="spinning", parameters=_spinning_params())
+    restored = LidarModel.from_dict(original.to_dict())
+    assert restored.type == original.type
+    assert restored.parameters == original.parameters
+
+
+def test_lidar_model_from_dict_rejects_missing_top_level_keys() -> None:
+    with pytest.raises(ValueError, match="missing required key"):
+        LidarModel.from_dict({"type": "spinning"})
+
+
+def test_lidar_calibration_lidar_model_optional_by_default() -> None:
+    # Preserve existing behaviour: extrinsics-only calibrations still work,
+    # and their emitted dict does not include a 'lidar_model' key.
+    cal = LidarCalibration(
+        name="lidar_top",
+        extrinsics=CameraExtrinsics(translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0)),
+    )
+    assert cal.lidar_model is None
+    assert "lidar_model" not in cal.to_dict()
+
+
+def test_lidar_calibration_emits_lidar_model_when_set() -> None:
+    cal = LidarCalibration(
+        name="lidar_top",
+        extrinsics=CameraExtrinsics(translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0)),
+        lidar_model=LidarModel(type="spinning", parameters=_spinning_params()),
+    )
+    out = cal.to_dict()
+    assert out["lidar_model"]["type"] == "spinning"
+    assert out["lidar_model"]["parameters"]["n_rows"] == 128
+
+
+def test_dump_alpasim_emits_lidar_model_in_calibrations() -> None:
+    rigs = [
+        RigTrajectory(
+            rig_id="ego",
+            poses=[_pose(1_000_000)],
+            lidars=[
+                LidarCalibration(
+                    name="lidar_top",
+                    extrinsics=CameraExtrinsics(
+                        translation=(0.5, 0.0, 1.8), rotation=(0.0, 0.0, 0.0, 1.0)
+                    ),
+                    logical_sensor_name="top",
+                    lidar_model=LidarModel(type="spinning", parameters=_spinning_params()),
+                )
+            ],
+        )
+    ]
+    doc = dump_alpasim_rig_trajectories(rigs)
+    entry = doc["lidar_calibrations"]["lidar_top"]
+    assert entry["lidar_model"] == {
+        "type": "spinning",
+        "parameters": _spinning_params(),
+    }
+
+
+def test_alpasim_lidar_model_round_trip() -> None:
+    original = {
+        "world_to_nre": {"matrix": np.eye(4).tolist()},
+        "rig_trajectories": [
+            {
+                "sequence_id": "ego",
+                "T_rig_worlds": [np.eye(4).tolist()],
+                "T_rig_world_timestamps_us": [1_000_000],
+                "lidars_frame_timestamps_us": {"lidar_top": [[1_000_000, 1_100_000]]},
+            }
+        ],
+        "camera_calibrations": {},
+        "lidar_calibrations": {
+            "lidar_top": {
+                "T_sensor_rig": np.eye(4).tolist(),
+                "logical_sensor_name": "top",
+                "lidar_model": {
+                    "type": "spinning",
+                    "parameters": _spinning_params(),
+                },
+            }
+        },
+    }
+    rigs = parse_alpasim_rig_trajectories(original)
+    assert rigs[0].lidars[0].lidar_model is not None
+    assert rigs[0].lidars[0].lidar_model.type == "spinning"
+    # Round-trip via dump: the intrinsics must survive.
+    redumped = dump_alpasim_rig_trajectories(rigs)
+    assert redumped["lidar_calibrations"]["lidar_top"]["lidar_model"] == {
+        "type": "spinning",
+        "parameters": _spinning_params(),
+    }
