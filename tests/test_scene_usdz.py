@@ -155,15 +155,15 @@ def test_zip_entries_are_uncompressed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_root_transform_reconciled_for_enu_payload(tmp_path: Path) -> None:
+def test_usdz_has_one_row_major_ecef_anchor(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path, transform=_NONIDENT_TRANSFORM)
     out = tmp_path / "scene.usdz"
     res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
 
     out_tileset = json.loads(_read(out, "tileset.json"))
-    expected = _expected_enu_root(_NONIDENT_TRANSFORM)
-    assert out_tileset["root"]["transform"] == expected
-    assert res.root_transform == expected
+    expected = np.asarray(_expected_enu_root(_NONIDENT_TRANSFORM)).reshape(4, 4).T.tolist()
+    assert "transform" not in out_tileset["root"]
+    assert res.ecef_anchor == expected
 
 
 def test_root_transform_recorded_in_scene_json(tmp_path: Path) -> None:
@@ -360,9 +360,9 @@ def test_missing_root_transform_gets_enu_reconciliation(tmp_path: Path) -> None:
     res = save_scene_usdz(ts, out)
     identity = np.eye(4).T.ravel().tolist()
     expected = _expected_enu_root(identity)
-    assert res.root_transform == expected
+    assert res.ecef_anchor == np.asarray(expected).reshape(4, 4).T.tolist()
     out_tileset = json.loads(_read(out, "tileset.json"))
-    assert out_tileset["root"]["transform"] == expected
+    assert "transform" not in out_tileset["root"]
 
 
 def test_positions_stay_in_root_local_frame(tmp_path: Path) -> None:
@@ -681,7 +681,10 @@ def test_cli_with_tileset_input(tmp_path: Path, capsys: pytest.CaptureFixture[st
     summary = json.loads(capsys.readouterr().out)
     assert summary["out_path"].endswith("out.usdz")
     assert summary["n_gaussians"] > 0
-    assert summary["root_transform"] == _expected_enu_root(_NONIDENT_TRANSFORM)
+    assert (
+        summary["ecef_anchor"]
+        == np.asarray(_expected_enu_root(_NONIDENT_TRANSFORM)).reshape(4, 4).T.tolist()
+    )
 
 
 def test_cli_quiet_suppresses_summary(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

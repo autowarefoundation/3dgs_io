@@ -31,8 +31,8 @@ from typing import Any
 
 from .ppisp import Ppisp, parse_ppisp, serialize_ppisp
 from .rig_trajectories import (
-    dump_alpasim_rig_trajectories,
     load_rig_trajectories_doc,
+    serialize_rig_trajectories,
     update_camera_intrinsics,
 )
 from .usdz_metadata import (
@@ -44,15 +44,12 @@ from .usdz_metadata import (
 )
 
 __all__ = [
-    "AlpasimBundleResult",
     "EditUsdzResult",
     "IntrinsicsEditResult",
     "MetadataEditResult",
     "add_clipgt_to_usdz",
     "add_lanelet2_to_usdz",
     "add_ppisp_to_usdz",
-    "bundle_usdz_for_alpasim",
-    "convert_rig_trajectories_to_alpasim_schema",
     "set_usdz_metadata",
     "update_camera_intrinsics_in_usdz",
 ]
@@ -93,18 +90,6 @@ class MetadataEditResult:
 
     out_path: Path
     metadata: dict[str, Any]
-    added: list[str] = field(default_factory=list)
-    replaced: list[str] = field(default_factory=list)
-
-
-@dataclass
-class AlpasimBundleResult:
-    """Summary of a :func:`bundle_usdz_for_alpasim` invocation."""
-
-    out_path: Path
-    rig_schema_converted: bool
-    lanelet2_embedded: bool
-    metadata_written: bool
     added: list[str] = field(default_factory=list)
     replaced: list[str] = field(default_factory=list)
 
@@ -321,8 +306,7 @@ def update_camera_intrinsics_in_usdz(
     ``rig_trajectories`` extra). The file is loaded, the camera addressed by
     ``camera_name`` (and optionally ``rig_id``) is updated via
     :func:`3dgs_io.rig_trajectories.update_camera_intrinsics`, and the result
-    is written back in the flat alpasim layout (matching what
-    :func:`3dgs_io.save_scene_usdz` emits).
+    is written back in the same frame-explicit v2 layout.
 
     Parameters
     ----------
@@ -361,15 +345,7 @@ def update_camera_intrinsics_in_usdz(
     cam = update_camera_intrinsics(
         rigs, camera_name=camera_name, rig_id=rig_id, **intrinsic_updates
     )
-    # parse absorbs world_to_nre into the poses; forward the original matrix so
-    # dump unwinds it and a no-op intrinsic edit is a byte-level round trip.
-    original_w2n = (
-        rig_doc.get("world_to_nre", {}).get("matrix") if isinstance(rig_doc, dict) else None
-    )
-    original_twb = rig_doc.get("T_world_base") if isinstance(rig_doc, dict) else None
-    new_rig_doc = dump_alpasim_rig_trajectories(
-        rigs, world_to_nre=original_w2n, t_world_base=original_twb
-    )
+    new_rig_doc = serialize_rig_trajectories(rigs)
     new_rig_bytes = (json.dumps(new_rig_doc, indent=2) + "\n").encode("utf-8")
 
     _added, replaced = _repack_usdz(
@@ -472,179 +448,6 @@ def set_usdz_metadata(
     )
 
 
-def convert_rig_trajectories_to_alpasim_schema(
-    input_usdz: str | Path,
-    output_usdz: str | Path,
-    *,
-    world_to_nre: Any | None = None,
-    t_world_base: Any | None = None,
-) -> EditUsdzResult:
-    """Rewrite the USDZ's ``rig_trajectories.json`` in the legacy alpasim schema.
-
-    The splatsim ``rig_trajectories/v1`` schema (root-local NRE poses, per-rig
-    ``poses`` blocks) is converted into the flat legacy alpasim layout
-    (``world_to_nre`` + ``T_rig_worlds`` in the base frame, plus a flat
-    ``camera_calibrations`` dict). All other archive entries are copied
-    through unchanged.
-
-    Parameters
-    ----------
-    input_usdz, output_usdz:
-        Same semantics as :func:`add_lanelet2_to_usdz`; ``output_usdz`` may
-        equal ``input_usdz`` for atomic in-place edits.
-    world_to_nre:
-        Optional 4×4 base→root-local transform. Defaults to identity, which
-        is safe when the original USDZ already stores poses in the base
-        frame.
-    t_world_base:
-        Optional 4×4 world (ECEF) → base transform to embed under the
-        top-level ``T_world_base`` key. When omitted, falls back to whatever
-        is stored under each rig's ``metadata["T_world_base"]``.
-    """
-    input_usdz = Path(input_usdz).expanduser()
-    output_usdz = Path(output_usdz).expanduser()
-
-    if not input_usdz.is_file():
-        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
-
-    with zipfile.ZipFile(input_usdz, "r") as zin:
-        if _RIG_TRAJECTORIES_ARCHIVE_PATH not in zin.namelist():
-            raise ValueError(f"{input_usdz} does not contain {_RIG_TRAJECTORIES_ARCHIVE_PATH!r}")
-        rig_doc = json.loads(zin.read(_RIG_TRAJECTORIES_ARCHIVE_PATH).decode("utf-8-sig"))
-
-    rigs = load_rig_trajectories_doc(rig_doc)
-    alpasim_doc = dump_alpasim_rig_trajectories(
-        rigs, world_to_nre=world_to_nre, t_world_base=t_world_base
-    )
-    new_rig_bytes = (json.dumps(alpasim_doc, indent=2) + "\n").encode("utf-8")
-
-    added, replaced = _repack_usdz(
-        input_usdz,
-        output_usdz,
-        entries_to_write={_RIG_TRAJECTORIES_ARCHIVE_PATH: new_rig_bytes},
-    )
-    return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
-
-
-def bundle_usdz_for_alpasim(
-    input_usdz: str | Path,
-    output_usdz: str | Path,
-    *,
-    lanelet2_path: str | Path | None = None,
-    world_to_nre: Any | None = None,
-    t_world_base: Any | None = None,
-    uuid: str | None = None,
-    scene_id: str | None = None,
-    version_string: str | None = None,
-    extras: dict[str, Any] | None = None,
-) -> AlpasimBundleResult:
-    """One-shot preparation of a USDZ for the alpasim runtime.
-
-    Combines three edits in a single atomic repack:
-
-    1. Convert ``rig_trajectories.json`` from splatsim ``v1`` to the legacy
-       alpasim schema (always performed).
-    2. Optionally embed a lanelet2 ``.osm`` at ``map.osm`` and register it in
-       ``scene.json.extras.map_lanelet2``.
-    3. Write / refresh ``metadata.yaml`` at the archive root using the same
-       merge semantics as :func:`set_usdz_metadata`.
-
-    ``output_usdz`` may equal ``input_usdz`` for in-place edits.
-    """
-    input_usdz = Path(input_usdz).expanduser()
-    output_usdz = Path(output_usdz).expanduser()
-
-    if not input_usdz.is_file():
-        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
-
-    for name, value in (
-        ("uuid", uuid),
-        ("scene_id", scene_id),
-        ("version_string", version_string),
-    ):
-        if value is not None and (not isinstance(value, str) or not value):
-            raise ValueError(f"{name} override must be a non-empty string, got {value!r}")
-
-    lanelet2_bytes: bytes | None = None
-    if lanelet2_path is not None:
-        lanelet2_path = Path(lanelet2_path).expanduser()
-        if not lanelet2_path.is_file():
-            raise FileNotFoundError(f"lanelet2 file not found: {lanelet2_path}")
-        lanelet2_bytes = lanelet2_path.read_bytes()
-
-    with zipfile.ZipFile(input_usdz, "r") as zin:
-        names = zin.namelist()
-        if _RIG_TRAJECTORIES_ARCHIVE_PATH not in names:
-            raise ValueError(f"{input_usdz} does not contain {_RIG_TRAJECTORIES_ARCHIVE_PATH!r}")
-        rig_doc = json.loads(zin.read(_RIG_TRAJECTORIES_ARCHIVE_PATH).decode("utf-8-sig"))
-        scene_bytes_updated: bytes | None = None
-        if lanelet2_bytes is not None:
-            if "scene.json" not in names:
-                raise ValueError(f"{input_usdz} is not a splatsim scene USDZ (missing scene.json)")
-            scene_bytes_updated = _rewrite_scene_extras(
-                zin.read("scene.json"), _LANELET2_SCENE_KEY, _LANELET2_ARCHIVE_PATH
-            )
-        existing_metadata: UsdzMetadata | None = None
-        if USDZ_METADATA_ARCHIVE_PATH in names:
-            try:
-                existing_metadata = load_usdz_metadata(zin.read(USDZ_METADATA_ARCHIVE_PATH))
-            except (ValueError, json.JSONDecodeError) as exc:
-                _log.warning(
-                    "%s: existing %s could not be parsed (%s); regenerating from scratch.",
-                    input_usdz,
-                    USDZ_METADATA_ARCHIVE_PATH,
-                    exc,
-                )
-
-    rigs = load_rig_trajectories_doc(rig_doc)
-    alpasim_doc = dump_alpasim_rig_trajectories(
-        rigs, world_to_nre=world_to_nre, t_world_base=t_world_base
-    )
-    new_rig_bytes = (json.dumps(alpasim_doc, indent=2) + "\n").encode("utf-8")
-
-    merged_extras: dict[str, Any] = (
-        dict(existing_metadata.extras) if existing_metadata is not None else {}
-    )
-    if extras:
-        merged_extras.update(extras)
-    new_metadata = make_default_metadata(
-        out_path=output_usdz,
-        uuid=uuid or (existing_metadata.uuid if existing_metadata is not None else None),
-        scene_id=scene_id
-        or (existing_metadata.scene_id if existing_metadata is not None else None),
-        version_string=version_string
-        or (existing_metadata.version_string if existing_metadata is not None else None),
-        extras=merged_extras,
-    )
-    metadata_bytes = encode_usdz_metadata(new_metadata)
-
-    entries_to_write: dict[str, bytes] = {
-        _RIG_TRAJECTORIES_ARCHIVE_PATH: new_rig_bytes,
-        USDZ_METADATA_ARCHIVE_PATH: metadata_bytes,
-    }
-    if lanelet2_bytes is not None:
-        entries_to_write[_LANELET2_ARCHIVE_PATH] = lanelet2_bytes
-        assert scene_bytes_updated is not None
-        entries_to_write["scene.json"] = scene_bytes_updated
-
-    added, replaced = _repack_usdz(
-        input_usdz,
-        output_usdz,
-        entries_to_write=entries_to_write,
-    )
-    # scene.json is always a pre-existing replacement, not a user-facing edit.
-    replaced = [n for n in replaced if n != "scene.json"]
-
-    return AlpasimBundleResult(
-        out_path=output_usdz,
-        rig_schema_converted=True,
-        lanelet2_embedded=lanelet2_bytes is not None,
-        metadata_written=True,
-        added=added,
-        replaced=replaced,
-    )
-
-
 def _rewrite_scene_extras(scene_json_bytes: bytes, key: str, value: str) -> bytes:
     """Load ``scene.json``, set ``extras[key] = value``, return re-encoded bytes."""
     scene_doc = json.loads(scene_json_bytes.decode("utf-8-sig"))
@@ -717,7 +520,7 @@ def _write_stored(zf: zipfile.ZipFile, name: str, content: bytes) -> None:
 
 
 def _result_summary(
-    result: (EditUsdzResult | IntrinsicsEditResult | MetadataEditResult | AlpasimBundleResult),
+    result: EditUsdzResult | IntrinsicsEditResult | MetadataEditResult,
 ) -> dict[str, Any]:
     """Stringified summary used by the CLI."""
     d = asdict(result)

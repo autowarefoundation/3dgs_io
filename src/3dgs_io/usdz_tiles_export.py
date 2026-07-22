@@ -9,9 +9,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .frame_convention import validate_frame_convention, validate_rigid_transform
+from .frame_convention import RUB_TO_ENU, validate_frame_convention, validate_rigid_transform
 from .scene_usdz import _apply_transform_to_cloud, _concat_clouds, _walk_leaves
-from .spz_io import load_spz
+from .spz_io import load_spz_world
 from .tiles_export import TilesetSaveOptions, save_tileset
 
 
@@ -36,13 +36,11 @@ def export_usdz_tileset(
         root = tileset.get("root")
         if not isinstance(root, dict):
             raise ValueError("embedded tileset is missing its root tile")
-        root_transform = root.get("transform")
-        if root_transform is None:
-            root_transform = np.eye(4, dtype=np.float64).T.ravel().tolist()
-        if len(root_transform) != 16:
-            raise ValueError("embedded tileset root.transform must contain 16 values")
-        root_matrix = np.asarray(root_transform, dtype=np.float64).reshape(4, 4).T
-        validate_rigid_transform(root_matrix, where="embedded tileset root.transform")
+        if "transform" in root:
+            raise ValueError("scene USDZ tileset must not contain a Cesium root.transform")
+        root_matrix = validate_rigid_transform(
+            scene["world"]["ecef_anchor"], where="scene world.ecef_anchor"
+        )
 
         local_root = {key: value for key, value in root.items() if key != "transform"}
         leaves = list(_walk_leaves(local_root, np.eye(4, dtype=np.float64)))
@@ -56,15 +54,20 @@ def export_usdz_tileset(
                     raise ValueError(f"embedded tile content must be SPZ, got {uri!r}")
                 temp_path = Path(temp_dir) / f"chunk_{index:06d}.spz"
                 temp_path.write_bytes(archive.read(uri))
-                cloud = load_spz(temp_path)
+                cloud = load_spz_world(temp_path)
                 if not np.allclose(transform, np.eye(4)):
                     cloud = _apply_transform_to_cloud(cloud, transform)
                 clouds.append(cloud)
 
     cloud = clouds[0] if len(clouds) == 1 else _concat_clouds(clouds)
+    world_to_gltf = np.eye(4, dtype=np.float64)
+    world_to_gltf[:3, :3] = RUB_TO_ENU.T
+    cloud = _apply_transform_to_cloud(cloud, world_to_gltf)
+    gltf_to_world = np.linalg.inv(world_to_gltf)
+    cesium_root = root_matrix @ gltf_to_world
     return save_tileset(
         cloud,
         output_dir,
         options,
-        root_transform=np.asarray(root_transform, dtype=np.float64),
+        root_transform=cesium_root.T,
     )

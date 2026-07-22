@@ -132,28 +132,21 @@ def test_from_dict_null_parameters_raises_valueerror() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CameraExtrinsics — T_sensor_rig form
+# CameraExtrinsics — sensor-in-rig pose
 # ---------------------------------------------------------------------------
 
 
 def test_extrinsics_identity_round_trip() -> None:
     e = CameraExtrinsics(translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0))
     np.testing.assert_allclose(e.to_matrix(), np.eye(4))
-    t_sensor_rig = e.to_t_sensor_rig()
-    assert t_sensor_rig == [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
 
 
 def test_extrinsics_translation_only() -> None:
     e = CameraExtrinsics(translation=(5.0, 6.0, 7.0), rotation=(0.0, 0.0, 0.0, 1.0))
-    t = e.to_t_sensor_rig()
-    assert t[0][3] == 5.0
-    assert t[1][3] == 6.0
-    assert t[2][3] == 7.0
+    matrix = e.to_matrix()
+    assert matrix[0, 3] == 5.0
+    assert matrix[1, 3] == 6.0
+    assert matrix[2, 3] == 7.0
 
 
 def test_extrinsics_z_rotation_90deg_round_trip() -> None:
@@ -166,14 +159,14 @@ def test_extrinsics_z_rotation_90deg_round_trip() -> None:
     np.testing.assert_allclose(back.to_matrix(), m, atol=1e-10)
 
 
-def test_extrinsics_from_t_sensor_rig_helper() -> None:
+def test_extrinsics_from_matrix() -> None:
     mat = [
         [1.0, 0.0, 0.0, 10.0],
         [0.0, 1.0, 0.0, 20.0],
         [0.0, 0.0, 1.0, 30.0],
         [0.0, 0.0, 0.0, 1.0],
     ]
-    e = CameraExtrinsics.from_t_sensor_rig(mat)
+    e = CameraExtrinsics.from_matrix(np.asarray(mat))
     assert e.translation == (10.0, 20.0, 30.0)
     np.testing.assert_allclose(e.rotation, (0.0, 0.0, 0.0, 1.0), atol=1e-10)
 

@@ -9,7 +9,7 @@ Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
     default.usda                 # USDZ root stage (asset reference to tileset.json)
     metadata.yaml                # identity card (uuid / scene_id / version_string)
     scene.json                   # splatsim.scene/v2 bundle index
-    tileset.json                 # Cesium 3D Tiles v1.0 + EXT_3dgs_spz, root.transform preserved
+    tileset.json                 # local EXT_3dgs_spz index (no Cesium world transform)
     chunks/chunk_NNNNNN.spz      # Niantic SPZ tiles (spatially split)
     <user-supplied extras>       # verbatim files / dirs at user-chosen paths
 
@@ -51,7 +51,7 @@ from .frame_convention import FRAME_CONVENTION, RUB_TO_ENU, validate_rigid_trans
 from .gltf_io import load_gltf_with_metadata
 from .ppisp import Ppisp, serialize_ppisp
 from .rig_trajectories import RigTrajectory, serialize_rig_trajectories
-from .spz_io import save_spz
+from .spz_io import save_spz_world
 from .tiles_export import _assign_cell_keys
 from .tiles_io import _apply_rotation_to_quats
 from .tracks import Track, serialize_tracks
@@ -161,12 +161,12 @@ class SceneUsdzResult:
     sh_degree: int = 0
     n_chunks: int = 0
     extras: dict[str, str | None] = field(default_factory=dict)
-    root_transform: list[float] = field(default_factory=lambda: list(_IDENTITY_16))
+    ecef_anchor: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# tileset.json loader: produces (cloud_in_root_local_frame, root_transform).
+# Cesium input adapter: produces a cloud and its ECEF anchor.
 # ---------------------------------------------------------------------------
 
 
@@ -176,9 +176,8 @@ def _walk_leaves(
     """Walk a tile subtree and yield ``(content_uri, cumulative_transform)``
     for each leaf that holds tile content.
 
-    The root tile's own ``transform`` MUST be stripped by the caller — we
-    anchor the output's ``root.transform`` to the source's, so positions in
-    the resulting payload stay in root-local frame.
+    The root tile's own Cesium transform is stripped by the caller. Only
+    sub-root transforms are baked into payload values here.
     """
     local = tile.get("transform")
     if local is not None:
@@ -533,7 +532,6 @@ def _build_tileset(
     sub_clouds: list[spz.GaussianCloud],
     bounds: list[tuple[np.ndarray, np.ndarray]],
     options: SceneUsdzOptions,
-    root_transform: list[float],
     chunk_ext: list[dict[str, np.ndarray]] | None = None,
 ) -> dict[str, Any]:
     chunk_ext = chunk_ext or [{} for _ in sub_clouds]
@@ -568,7 +566,6 @@ def _build_tileset(
         "boundingVolume": {"box": _aabb_to_3dtiles_box(bbox_min_all, bbox_max_all)},
         "geometricError": float(options.geometric_error),
         "refine": "ADD",
-        "transform": root_transform,
         "children": children,
     }
     extensions_required = [_EXT_3DGS_SPZ]
@@ -642,7 +639,7 @@ def _compose_scene_json(
     arrays: _CloudArrays,
     options: SceneUsdzOptions,
     extras: dict[str, str | None],
-    root_transform: list[float],
+    ecef_anchor: list[list[float]],
     source_tileset: str,
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -676,7 +673,7 @@ def _compose_scene_json(
         },
         "world": {
             "frame_convention": FRAME_CONVENTION,
-            "ecef_anchor": np.array(root_transform, dtype=np.float64).reshape(4, 4).T.tolist(),
+            "ecef_anchor": ecef_anchor,
         },
         "gaussians": {**gaussians, "frame": "world"},
         "extras": extras,
@@ -706,10 +703,9 @@ def save_scene_usdz(
 ) -> SceneUsdzResult:
     """Pack a Cesium ``tileset.json`` (+ extras + tracks + rigs) into a USDZ.
 
-    The input tileset's ``root.transform`` (the world anchor — typically an
-    ECEF placement for Cesium) is preserved verbatim into the output
-    ``tileset.json``. Per-tile transforms below the root are baked into the
-    payload positions/rotations so the output stays a single flat tree.
+    The input Cesium anchor is converted once into the row-major
+    ``scene.json.world.ecef_anchor``. The embedded tileset has no world
+    transform; per-tile transforms are baked into ENU payload values.
 
     Parameters
     ----------
@@ -770,10 +766,10 @@ def save_scene_usdz(
     cloud = _apply_transform_to_cloud(cloud, source_to_world)
     root_matrix = source_root_matrix @ np.linalg.inv(source_to_world)
     validate_rigid_transform(root_matrix, where="tileset root.transform")
-    root_transform = root_matrix.T.ravel().tolist()
+    ecef_anchor = root_matrix.tolist()
     arrays = _filter_and_clamp(cloud, options, source_ext_attrs)
     sub_clouds, bounds, chunk_ext = _split_cloud_into_chunks(arrays, options)
-    tileset_doc = _build_tileset(sub_clouds, bounds, options, root_transform, chunk_ext)
+    tileset_doc = _build_tileset(sub_clouds, bounds, options, chunk_ext)
 
     extras_entries = _collect_extras_entries(extras)
     archive_paths = {arc for arc, _ in extras_entries}
@@ -814,7 +810,7 @@ def save_scene_usdz(
         arrays=arrays,
         options=options,
         extras=extras_meta,
-        root_transform=root_transform,
+        ecef_anchor=ecef_anchor,
         source_tileset=tileset_path.name,
     )
 
@@ -825,7 +821,7 @@ def save_scene_usdz(
         chunk_entries: list[tuple[str, Path]] = []
         for i, sub in enumerate(sub_clouds):
             cp = td_path / f"chunk_{i:06d}.spz"
-            save_spz(sub, cp)
+            save_spz_world(sub, cp)
             chunk_entries.append((f"chunks/chunk_{i:06d}.spz", cp))
 
         ext_chunk_entries: list[tuple[str, Path]] = []
@@ -860,7 +856,7 @@ def save_scene_usdz(
         sh_degree=arrays.sh_degree,
         n_chunks=len(sub_clouds),
         extras=extras_meta,
-        root_transform=root_transform,
+        ecef_anchor=ecef_anchor,
         metadata=metadata.to_dict(),
     )
 

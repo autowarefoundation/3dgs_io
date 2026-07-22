@@ -19,7 +19,7 @@ A :class:`Camera` is mounted on a sensor rig and lives under
 To compute a camera's pose in scene coordinates, compose the camera
 extrinsics with the rig's pose at the relevant timestamp::
 
-    T_sensor_scene = T_rig_scene @ T_sensor_rig
+    sensor_in_world = rig_in_world @ sensor_in_rig
 """
 
 from __future__ import annotations
@@ -325,17 +325,6 @@ class CameraExtrinsics:
             translation=(float(t[0]), float(t[1]), float(t[2])),
             rotation=(float(x), float(y), float(z), float(w)),
         )
-
-    # ------------ (de)serialisation ------------
-
-    def to_t_sensor_rig(self) -> list[list[float]]:
-        """Return the 4×4 as a nested list of Python floats (JSON-safe)."""
-        m = self.to_matrix()
-        return [[float(m[i, j]) for j in range(4)] for i in range(4)]
-
-    @classmethod
-    def from_t_sensor_rig(cls, mat: Any) -> CameraExtrinsics:
-        return cls.from_matrix(np.asarray(mat, dtype=np.float64))
 
 
 # ---------------------------------------------------------------------------
