@@ -28,6 +28,7 @@ EXT_GAUSSIAN_LIDAR_NAME = _mod.EXT_GAUSSIAN_LIDAR_NAME
 
 LIDAR_INTENSITY = "lidar_intensity_raw"
 LIDAR_RAYDROP = "lidar_raydrop_logit"
+LIDAR_MASK = "lidar_mask"
 
 
 def _make_cloud(rng: np.random.Generator, n: int, *, spread: float = 5.0) -> GaussianCloud:
@@ -70,6 +71,100 @@ def test_lidar_sidecar_round_trip() -> None:
         src_sig = _sigmoid(src)
         got_sig = _sigmoid(out[key])
         assert np.max(np.abs(src_sig - got_sig)) < 2.0 / 255.0
+
+
+def test_lidar_sidecar_omitting_mask_is_byte_identical() -> None:
+    """Encoding without a mask still writes exactly 2 channels (no behaviour change)."""
+    rng = np.random.default_rng(1)
+    n = 256
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+
+    payload = encode_lidar_sidecar({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
+
+    # 16-byte header + 2 bytes/point body — identical to the pre-mask format.
+    assert len(payload) == 16 + n * 2
+    out = decode_lidar_sidecar(payload)
+    assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP}
+    assert LIDAR_MASK not in out
+
+
+def test_lidar_sidecar_mask_round_trip() -> None:
+    """A 3-channel sidecar round-trips intensity, raydrop AND the mask exactly."""
+    rng = np.random.default_rng(2)
+    n = 512
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    mask = rng.integers(0, 2, size=n).astype(np.float32)  # exact {0, 1}
+
+    payload = encode_lidar_sidecar(
+        {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, LIDAR_MASK: mask},
+        count=n,
+    )
+
+    # 16-byte header + 3 bytes/point body.
+    assert len(payload) == 16 + n * 3
+
+    out = decode_lidar_sidecar(payload)
+    assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP, LIDAR_MASK}
+    assert out[LIDAR_MASK].shape == (n,)
+    # u8_linear over [0, 1] preserves {0, 1} exactly as {0.0, 1.0}.
+    np.testing.assert_array_equal(out[LIDAR_MASK], mask)
+    assert set(np.unique(out[LIDAR_MASK]).tolist()) <= {0.0, 1.0}
+
+
+def test_lidar_sidecar_all_ones_mask_round_trip() -> None:
+    """An explicit all-ones mask (all participate) round-trips to 1.0."""
+    rng = np.random.default_rng(3)
+    n = 64
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    mask = np.ones(n, dtype=np.float32)
+
+    payload = encode_lidar_sidecar(
+        {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, LIDAR_MASK: mask},
+        count=n,
+    )
+    out = decode_lidar_sidecar(payload)
+    np.testing.assert_array_equal(out[LIDAR_MASK], np.ones(n, dtype=np.float32))
+
+
+def test_old_reader_ignores_mask_channel() -> None:
+    """A new 3-channel sidecar decoded against only the first 2 specs is forward compatible.
+
+    Simulates an old reader (2 specs known) reading a new 3-channel sidecar: the
+    body-size check passes and only intensity/raydrop are returned.
+    """
+    import importlib
+
+    ext_mod = importlib.import_module("3dgs_io.ext_attributes")
+    rng = np.random.default_rng(4)
+    n = 100
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    mask = rng.integers(0, 2, size=n).astype(np.float32)
+
+    payload = encode_lidar_sidecar(
+        {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, LIDAR_MASK: mask},
+        count=n,
+    )
+    assert len(payload) == 16 + n * 3  # a genuine 3-channel sidecar
+
+    # Temporarily restrict the known specs to the first two (old reader).
+    original_specs = ext_mod.DEFAULT_LIDAR_SPECS
+    try:
+        ext_mod.DEFAULT_LIDAR_SPECS = original_specs[:2]
+        out = ext_mod.decode_lidar_sidecar(payload)
+    finally:
+        ext_mod.DEFAULT_LIDAR_SPECS = original_specs
+
+    assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP}
+
+
+def test_lidar_mask_key_exported() -> None:
+    assert _mod.LIDAR_MASK_KEY == LIDAR_MASK
+    assert _mod.LIDAR_INTENSITY_KEY == LIDAR_INTENSITY
+    assert _mod.LIDAR_RAYDROP_KEY == LIDAR_RAYDROP
 
 
 def test_lidar_sidecar_bad_magic() -> None:
