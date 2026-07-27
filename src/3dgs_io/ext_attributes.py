@@ -1,8 +1,8 @@
 """Per-Gaussian extension attributes (``EXT_gaussian_lidar``).
 
 Issue #26 needs to carry optional per-Gaussian scalars — currently
-``lidar_intensity_raw`` and ``lidar_raydrop_logit`` for LiDAR simulation —
-alongside each splat without touching the fixed-schema ``spz.GaussianCloud``
+``lidar_intensity_raw``, ``lidar_raydrop_logit`` and ``lidar_mask`` for LiDAR
+simulation — alongside each splat without touching the fixed-schema ``spz.GaussianCloud``
 or the SPZ on-disk format. The data rides as parallel ``(N,)`` arrays
 threaded through the same masks and reorderings as the gaussians, so
 ``attr[i] ↔ gaussian[i]`` always holds within a tile/chunk.
@@ -27,12 +27,36 @@ Sidecar binary layout
     bytes 12..15  channels    uint32 little-endian, channel count ``C``
     bytes 16..N   body        ``count * channels`` bytes, interleaved per point
 
-The current encoder writes ``C = 2`` channels in fixed order:
+The encoder writes channels in a fixed, append-only order:
 
 * channel 0: ``sigmoid(lidar_intensity_raw) * 255``  — ``uint8``
 * channel 1: ``sigmoid(lidar_raydrop_logit) * 255``  — ``uint8``
+* channel 2: ``lidar_mask``                          — ``uint8`` (optional)
 
-Both attributes survive the pipeline as their original float32 values
+``lidar_mask`` is an **optional, append-only** third channel:
+
+* ``lidar_mask[i] == 1`` → the Gaussian participates in LiDAR simulation
+  (near-field, geometrically faithful).
+* ``lidar_mask[i] == 0`` → the Gaussian is appearance-only (far-field, tuned
+  for RGB); consumers should hard-exclude it from the LiDAR geometry pass.
+
+It is quantized with ``u8_linear`` over ``[0, 1]``, which round-trips the
+values ``{0, 1}`` exactly (``0 → 0``, ``1 → 255`` on encode; ``0 → 0.0``,
+``255 → 1.0`` on decode); consumers threshold decoded values at ``0.5``.
+
+The channel is fully backward/forward compatible and needs **no** header
+``version`` bump: because :func:`decode_lidar_sidecar` reads ``channels`` from
+the header and clamps its decode loop to ``min(channels, len(DEFAULT_LIDAR_SPECS))``,
+
+* an old 2-channel reader reading a new 3-channel sidecar silently ignores the
+  mask channel, and
+* a new 3-channel reader reading an old 2-channel sidecar simply omits the
+  ``lidar_mask`` key (consumers treat its absence as "all participate").
+
+When a caller does not supply a mask, the encoder writes only the two required
+channels, so its output is byte-identical to the previous 2-channel format.
+
+Both scalar attributes survive the pipeline as their original float32 values
 inside ``EXT_gaussian_lidar`` glTF accessors; quantization is only applied
 on the final write-out to the per-chunk sidecar.
 """
@@ -48,6 +72,7 @@ EXT_GAUSSIAN_LIDAR_NAME = "EXT_gaussian_lidar"
 
 LIDAR_INTENSITY_KEY = "lidar_intensity_raw"
 LIDAR_RAYDROP_KEY = "lidar_raydrop_logit"
+LIDAR_MASK_KEY = "lidar_mask"
 
 _LIDAR_SIDECAR_MAGIC = b"L1DR"
 _LIDAR_SIDECAR_VERSION = 1
@@ -85,7 +110,16 @@ class ExtAttributeSpec:
 DEFAULT_LIDAR_SPECS: tuple[ExtAttributeSpec, ...] = (
     ExtAttributeSpec(name=LIDAR_INTENSITY_KEY, quantization="u8_sigmoid"),
     ExtAttributeSpec(name=LIDAR_RAYDROP_KEY, quantization="u8_sigmoid"),
+    # Append-only optional channel. ``u8_linear`` over [0, 1] round-trips the
+    # boolean values {0, 1} exactly. Omitted by the encoder when no mask is
+    # supplied, keeping the 2-channel output byte-identical to before.
+    ExtAttributeSpec(name=LIDAR_MASK_KEY, quantization="u8_linear", vmin=0.0, vmax=1.0),
 )
+
+# Channels that must always be present in a sidecar. Any spec in
+# ``DEFAULT_LIDAR_SPECS`` not listed here is optional (append-only) and is
+# written only when the caller supplies it.
+_REQUIRED_LIDAR_KEYS: frozenset[str] = frozenset({LIDAR_INTENSITY_KEY, LIDAR_RAYDROP_KEY})
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -102,24 +136,38 @@ def encode_lidar_sidecar(
     *,
     count: int,
 ) -> bytes:
-    """Encode the default 2-channel LiDAR sidecar for ``count`` points.
+    """Encode the LiDAR sidecar for ``count`` points.
 
-    Channels are written in fixed order: ``lidar_intensity_raw`` then
-    ``lidar_raydrop_logit``. Both channels are required — passing a dict
-    that is missing one of the keys raises ``KeyError``.
+    Channels are written in the fixed, append-only order defined by
+    :data:`DEFAULT_LIDAR_SPECS`: ``lidar_intensity_raw``, ``lidar_raydrop_logit``
+    then the optional ``lidar_mask``.
+
+    The two scalar channels (``lidar_intensity_raw`` / ``lidar_raydrop_logit``)
+    are required — passing a dict that is missing one of them raises
+    ``KeyError``. ``lidar_mask`` is **optional**: when it is omitted the encoder
+    writes only the two required channels, producing a byte-identical result to
+    the previous 2-channel format. When supplied, a third ``u8_linear`` channel
+    is appended (``1`` = participates in LiDAR simulation, ``0`` = appearance
+    only); its absence is interpreted downstream as "all participate", so a
+    caller wanting that behaviour explicitly may pass an all-ones array.
     """
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
 
-    body = np.zeros((count, 2), dtype=np.uint8)
-    for ch_idx, spec in enumerate(DEFAULT_LIDAR_SPECS):
-        try:
-            arr = ext_attributes[spec.name]
-        except KeyError:
-            raise KeyError(
-                f"ext attribute {spec.name!r} is required for the LiDAR sidecar"
-            ) from None
-        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+    # Select the channels to write, in spec order. Required channels must be
+    # present; optional (append-only) channels are written only when supplied.
+    active_specs: list[ExtAttributeSpec] = []
+    for spec in DEFAULT_LIDAR_SPECS:
+        if spec.name in ext_attributes:
+            active_specs.append(spec)
+        elif spec.name in _REQUIRED_LIDAR_KEYS:
+            raise KeyError(f"ext attribute {spec.name!r} is required for the LiDAR sidecar")
+        # else: optional channel not supplied -> drop the trailing channel.
+
+    channels = len(active_specs)
+    body = np.zeros((count, channels), dtype=np.uint8)
+    for ch_idx, spec in enumerate(active_specs):
+        arr = np.asarray(ext_attributes[spec.name], dtype=np.float32).reshape(-1)
         if arr.shape[0] != count:
             raise ValueError(
                 f"ext attribute {spec.name!r} has {arr.shape[0]} entries, expected {count}"
@@ -138,7 +186,7 @@ def encode_lidar_sidecar(
         _LIDAR_SIDECAR_MAGIC,
         _LIDAR_SIDECAR_VERSION,
         count,
-        len(DEFAULT_LIDAR_SPECS),
+        channels,
     )
     return header + body.tobytes()
 
@@ -149,6 +197,12 @@ def decode_lidar_sidecar(data: bytes) -> dict[str, np.ndarray]:
     Quantization is undone by the inverse of the encoder: ``sigmoid``-quantized
     values are returned as their *pre-sigmoid* logits (so the round trip
     preserves the original semantic field, modulo quantization error).
+
+    The number of returned keys matches the sidecar's channel count: a
+    2-channel sidecar yields ``{lidar_intensity_raw, lidar_raydrop_logit}`` and
+    omits ``lidar_mask`` (consumers treat its absence as "all participate"),
+    while a 3-channel sidecar additionally returns ``lidar_mask`` as ``{0.0,
+    1.0}`` floats (threshold at ``0.5``).
     """
     if len(data) < _LIDAR_SIDECAR_HEADER_SIZE:
         raise ValueError(f"sidecar too short ({len(data)} bytes)")

@@ -23,6 +23,9 @@ from .edit_usdz import (
 )
 from .ext_attributes import (
     EXT_GAUSSIAN_LIDAR_NAME,
+    LIDAR_INTENSITY_KEY,
+    LIDAR_MASK_KEY,
+    LIDAR_RAYDROP_KEY,
     ExtAttributeSpec,
     decode_lidar_sidecar,
     encode_lidar_sidecar,
@@ -120,6 +123,9 @@ __all__ = [
     "Export",
     "FRAME_CONVENTION",
     "EXT_GAUSSIAN_LIDAR_NAME",
+    "LIDAR_INTENSITY_KEY",
+    "LIDAR_MASK_KEY",
+    "LIDAR_RAYDROP_KEY",
     "ExtAttributeSpec",
     "GaussianCloud",
     "GlbMetadata",
