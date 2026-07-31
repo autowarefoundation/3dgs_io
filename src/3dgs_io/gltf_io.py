@@ -30,7 +30,9 @@ from ._gltf_common import (
 from .ext_attributes import (
     DEFAULT_LIDAR_SPECS,
     EXT_GAUSSIAN_LIDAR_NAME,
+    RAYDROP_SH_KEY,
     ExtAttributeSpec,
+    raydrop_sh_degree_from_coefs,
 )
 from .metadata import DatasetType as DatasetType  # noqa: F401 – re-export for backward compat
 from .metadata import GlbMetadata, parse_metadata, serialize_metadata
@@ -115,16 +117,46 @@ def _validate_ext_attributes(
     ext_attributes: dict[str, np.ndarray] | None,
     n: int,
 ) -> dict[str, np.ndarray]:
-    """Normalize ``ext_attributes`` to ``{name: (N,) float32}`` and validate shapes."""
+    """Normalize ``ext_attributes`` and validate shapes.
+
+    Scalar attributes are coerced to ``(N,) float32``. The view-dependent
+    ``raydrop_sh`` attribute is kept 2-D as ``(N, coefs) float32`` where
+    ``coefs == (deg+1)**2 - 1``; its degree is validated via
+    :func:`raydrop_sh_degree_from_coefs`.
+    """
     if ext_attributes is None:
         return {}
     out: dict[str, np.ndarray] = {}
     for name, arr in ext_attributes.items():
+        if name == RAYDROP_SH_KEY:
+            arr = np.ascontiguousarray(np.asarray(arr, dtype=np.float32))
+            if arr.ndim != 2 or arr.shape[0] != n:
+                raise ValueError(
+                    f"ext attribute {name!r} must have shape (N={n}, coefs), got {arr.shape}"
+                )
+            degree = raydrop_sh_degree_from_coefs(int(arr.shape[1]))
+            if degree <= 0:
+                raise ValueError(
+                    f"ext attribute {name!r} needs coefs >= 3 (degree >= 1), got {arr.shape[1]}"
+                )
+            out[name] = arr
+            continue
         arr = np.asarray(arr, dtype=np.float32).reshape(-1)
         if arr.shape[0] != n:
             raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
         out[name] = arr
     return out
+
+
+def _raydrop_sh_accessor_entry(arr: np.ndarray, accessor_index: int) -> dict[str, int]:
+    """Build the ``EXT_gaussian_lidar`` block entry for the flat ``raydrop_sh`` accessor.
+
+    ``raydrop_sh`` is stored losslessly as a single flat FLOAT SCALAR accessor of
+    ``N * coefs`` elements; the reader reshapes it back to ``(N, coefs)``. The SH
+    degree is intentionally not stored — it is a pure function of ``coefs`` and
+    unused by the reader.
+    """
+    return {"accessor": accessor_index, "coefs": int(arr.shape[1])}
 
 
 # ---------------------------------------------------------------------------
@@ -251,17 +283,32 @@ def _save_gltf_standard(
                 data_list.append((data, _FLOAT, "VEC3", {}))
                 coef_idx += 1
 
-    # EXT_gaussian_lidar accessors (one SCALAR uint8 normalized accessor per attribute)
+    # EXT_gaussian_lidar accessors (one SCALAR uint8 normalized accessor per
+    # scalar attribute). ``raydrop_sh`` is handled separately below as a 2-D
+    # attribute so it never routes through the scalar u8 quantizer.
     ext_name_to_accessor: dict[str, int] = {}
     for name, arr in ext_attributes.items():
+        if name == RAYDROP_SH_KEY:
+            continue
         spec = _spec_for(name)
         data = _quantize_ext(arr, spec)
         ext_name_to_accessor[name] = len(data_list)
         data_list.append((data, _UNSIGNED_BYTE, "SCALAR", {"normalized": True}))
 
+    # View-dependent raydrop SH: stored losslessly as a single flat FLOAT
+    # SCALAR accessor of ``N * coefs`` elements (glTF has no accessor type for an
+    # arbitrary coefficient count); the reader reshapes using ``coefs``.
+    raydrop_sh_entry: dict[str, int] | None = None
+    if RAYDROP_SH_KEY in ext_attributes:
+        sh_arr = ext_attributes[RAYDROP_SH_KEY]
+        raydrop_sh_entry = _raydrop_sh_accessor_entry(sh_arr, len(data_list))
+        # sh_arr is already contiguous float32 (validated); tobytes emits C-order.
+        data_list.append((sh_arr.tobytes(), _FLOAT, "SCALAR", {"count": n * sh_arr.shape[1]}))
+
     # Pack buffer
     buffer_data, offsets, lengths = _pack_buffer([d for d, _, _, _ in data_list])
     num_data = len(data_list)
+    n_ext_accessors = len(ext_name_to_accessor) + (1 if raydrop_sh_entry is not None else 0)
 
     # Build accessors
     accessors = []
@@ -289,11 +336,14 @@ def _save_gltf_standard(
             "scale": 3,
             "opacity": 4,
             # 5..(5+sh_count-1) are SH; ext attrs come after.
-            "sh": list(range(5, 5 + max(0, num_data - 5 - len(ext_name_to_accessor)))),
+            "sh": list(range(5, 5 + max(0, num_data - 5 - n_ext_accessors))),
         }
     }
-    if ext_name_to_accessor:
-        primitive_extensions[EXT_GAUSSIAN_LIDAR_NAME] = dict(ext_name_to_accessor)
+    if ext_name_to_accessor or raydrop_sh_entry is not None:
+        ext_block: dict[str, Any] = dict(ext_name_to_accessor)
+        if raydrop_sh_entry is not None:
+            ext_block[RAYDROP_SH_KEY] = raydrop_sh_entry
+        primitive_extensions[EXT_GAUSSIAN_LIDAR_NAME] = ext_block
         extensions_used.append(EXT_GAUSSIAN_LIDAR_NAME)
 
     gltf_dict: dict = {
@@ -350,10 +400,15 @@ def _save_gltf_spz(
     spz_bytes = _compress_to_spz_bytes(gc)
 
     # The buffer is the SPZ blob optionally followed by EXT_gaussian_lidar
-    # accessor payloads (4-byte aligned per bufferView).
+    # accessor payloads (4-byte aligned per bufferView). Scalar attributes are
+    # u8-quantized; ``raydrop_sh`` rides losslessly as flat float32.
     ext_chunks: list[tuple[str, bytes]] = []
     for name, arr in ext_attributes.items():
-        ext_chunks.append((name, _quantize_ext(arr, _spec_for(name))))
+        if name == RAYDROP_SH_KEY:
+            # arr is already contiguous float32 (validated); tobytes emits C-order.
+            ext_chunks.append((name, arr.tobytes()))
+        else:
+            ext_chunks.append((name, _quantize_ext(arr, _spec_for(name))))
 
     ext_bytes_packed, ext_offsets, ext_lengths = _pack_buffer([b for _, b in ext_chunks])
 
@@ -414,6 +469,7 @@ def _save_gltf_spz(
     # EXT_gaussian_lidar accessors: each backed by a real bufferView pointing
     # into the packed ext block. These are concrete (non-virtual) because
     # SPZ decompression does not produce them.
+    raydrop_sh_entry: dict[str, int] | None = None
     for idx, (name, _) in enumerate(ext_chunks):
         bv_idx = len(buffer_views)
         buffer_views.append(
@@ -423,16 +479,28 @@ def _save_gltf_spz(
                 "byteLength": ext_lengths[idx],
             }
         )
-        accessors.append(
-            {
-                "bufferView": bv_idx,
-                "componentType": _UNSIGNED_BYTE,
-                "count": n,
-                "type": "SCALAR",
-                "normalized": True,
-            }
-        )
-        ext_name_to_accessor[name] = acc_idx
+        if name == RAYDROP_SH_KEY:
+            coefs = int(ext_attributes[name].shape[1])
+            accessors.append(
+                {
+                    "bufferView": bv_idx,
+                    "componentType": _FLOAT,
+                    "count": n * coefs,
+                    "type": "SCALAR",
+                }
+            )
+            raydrop_sh_entry = _raydrop_sh_accessor_entry(ext_attributes[name], acc_idx)
+        else:
+            accessors.append(
+                {
+                    "bufferView": bv_idx,
+                    "componentType": _UNSIGNED_BYTE,
+                    "count": n,
+                    "type": "SCALAR",
+                    "normalized": True,
+                }
+            )
+            ext_name_to_accessor[name] = acc_idx
         acc_idx += 1
 
     # CesiumJS's loadPrimitive() only iterates gltfPrimitive.attributes to
@@ -481,8 +549,11 @@ def _save_gltf_spz(
     extensions_used = [_EXTENSION_NAME, _SPZ_EXTENSION_NAME]
     extensions_required = [_EXTENSION_NAME, _SPZ_EXTENSION_NAME]
     primitive_extensions: dict[str, Any] = {_EXTENSION_NAME: gs_ext}
-    if ext_name_to_accessor:
-        primitive_extensions[EXT_GAUSSIAN_LIDAR_NAME] = dict(ext_name_to_accessor)
+    if ext_name_to_accessor or raydrop_sh_entry is not None:
+        ext_block: dict[str, Any] = dict(ext_name_to_accessor)
+        if raydrop_sh_entry is not None:
+            ext_block[RAYDROP_SH_KEY] = raydrop_sh_entry
+        primitive_extensions[EXT_GAUSSIAN_LIDAR_NAME] = ext_block
         extensions_used.append(EXT_GAUSSIAN_LIDAR_NAME)
 
     gltf_dict: dict = {
@@ -576,8 +647,14 @@ def _parse_ext_attributes(
     accessors = gltf_dict["accessors"]
     buffer_views = gltf_dict["bufferViews"]
     out: dict[str, np.ndarray] = {}
-    for name, acc_idx in ext_block.items():
-        raw = _read_accessor(accessors[acc_idx], buffer_views, buffer_data)
+    for name, value in ext_block.items():
+        if name == RAYDROP_SH_KEY:
+            # Structured entry: {"accessor": idx, "degree": d, "coefs": C}.
+            coefs = int(value["coefs"])
+            raw = _read_accessor(accessors[value["accessor"]], buffer_views, buffer_data)
+            out[name] = np.asarray(raw, dtype=np.float32).reshape(-1, coefs)
+            continue
+        raw = _read_accessor(accessors[value], buffer_views, buffer_data)
         out[name] = _dequantize_ext(raw, _spec_for(name))
     return out
 

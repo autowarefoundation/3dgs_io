@@ -46,7 +46,13 @@ from typing import Any, NamedTuple
 import numpy as np
 import spz
 
-from .ext_attributes import EXT_GAUSSIAN_LIDAR_NAME, LIDAR_SIDECAR_SUFFIX, encode_lidar_sidecar
+from .ext_attributes import (
+    EXT_GAUSSIAN_LIDAR_NAME,
+    LIDAR_SIDECAR_SUFFIX,
+    RAYDROP_SH_KEY,
+    encode_lidar_sidecar,
+    raydrop_sh_degree_from_coefs,
+)
 from .frame_convention import FRAME_CONVENTION, RUB_TO_ENU, validate_rigid_transform
 from .gltf_io import load_gltf_with_metadata
 from .ppisp import Ppisp, serialize_ppisp
@@ -252,6 +258,14 @@ def _concat_clouds(clouds: list[spz.GaussianCloud]) -> spz.GaussianCloud:
     return out
 
 
+def _raydrop_sh_degree(ext: dict[str, np.ndarray]) -> int:
+    """SH degree implied by an ext dict's ``raydrop_sh`` array, or ``0`` if absent."""
+    sh = ext.get(RAYDROP_SH_KEY)
+    if sh is None:
+        return 0
+    return raydrop_sh_degree_from_coefs(int(np.asarray(sh).shape[1]))
+
+
 def _concat_ext_attrs(
     ext_per_leaf: list[dict[str, np.ndarray]],
     counts: list[int],
@@ -269,19 +283,31 @@ def _concat_ext_attrs(
         return {}
     out: dict[str, np.ndarray] = {}
     for key in keys:
+        # ``raydrop_sh`` is 2-D ``(count, coefs)``; scalar attrs are 1-D.
+        # The trailing coefficient count is fixed across leaves, so infer it
+        # from the first leaf that carries the key (used to zero-fill leaves
+        # that lack it).
+        trailing: tuple[int, ...] = ()
+        for ext in ext_per_leaf:
+            arr = ext.get(key)
+            if arr is not None:
+                trailing = np.asarray(arr).shape[1:]
+                break
         parts: list[np.ndarray] = []
         for ext, count in zip(ext_per_leaf, counts, strict=True):
             arr = ext.get(key)
             if arr is None:
-                parts.append(np.zeros(count, dtype=np.float32))
+                parts.append(np.zeros((count, *trailing), dtype=np.float32))
             else:
-                arr = np.asarray(arr, dtype=np.float32).reshape(-1)
-                if arr.shape[0] != count:
+                arr = np.asarray(arr, dtype=np.float32)
+                if arr.shape[0] != count or arr.shape[1:] != trailing:
                     raise ValueError(
-                        f"ext attribute {key!r} has {arr.shape[0]} entries, expected {count}"
+                        f"ext attribute {key!r} has shape {arr.shape}, "
+                        f"expected ({count}, *{trailing})"
                     )
                 parts.append(arr)
-        out[key] = np.concatenate(parts).astype(np.float32)
+        # Every part is already float32, so the concatenation is too.
+        out[key] = np.concatenate(parts, axis=0)
     return out
 
 
@@ -358,7 +384,9 @@ class _CloudArrays(NamedTuple):
     sh: np.ndarray | None  # (n, per_ch, 3) float32 or None
     sh_degree: int
     antialiased: bool
-    ext_attrs: dict[str, np.ndarray]  # {name: (n,) float32} — parallel to positions
+    # {name: (n,) float32} scalars — parallel to positions. The 2-D
+    # ``raydrop_sh`` key, when present, is ``(n, coefs) float32``.
+    ext_attrs: dict[str, np.ndarray]
 
     @property
     def n(self) -> int:
@@ -410,7 +438,9 @@ def _filter_and_clamp(
 
     ext_in: dict[str, np.ndarray] = {}
     for name, arr in (ext_attrs or {}).items():
-        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+        # Scalars are 1-D ``(n,)``; ``raydrop_sh`` is 2-D ``(n, coefs)``. Only the
+        # leading dimension is validated, so both flow through unchanged.
+        arr = np.asarray(arr, dtype=np.float32)
         if arr.shape[0] != n:
             raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
         ext_in[name] = arr
@@ -547,11 +577,15 @@ def _build_tileset(
             _EXT_3DGS_SPZ: {"format": "spz/1", "n_points": int(sub.num_points)},
         }
         if ext:
-            content_extensions[EXT_GAUSSIAN_LIDAR_NAME] = {
+            lidar_ext: dict[str, Any] = {
                 "uri": f"chunks/chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}",
                 "count": int(sub.num_points),
                 "attributes": sorted(ext.keys()),
             }
+            sh_degree = _raydrop_sh_degree(ext)
+            if sh_degree > 0:
+                lidar_ext["raydrop_sh_degree"] = sh_degree
+            content_extensions[EXT_GAUSSIAN_LIDAR_NAME] = lidar_ext
         children.append(
             {
                 "boundingVolume": {"box": _aabb_to_3dtiles_box(bmin, bmax)},
@@ -658,11 +692,15 @@ def _compose_scene_json(
         },
     }
     if arrays.ext_attrs:
-        gaussians["ext_attributes"] = {
+        ext_attributes_block: dict[str, Any] = {
             "extension": EXT_GAUSSIAN_LIDAR_NAME,
             "sidecar_suffix": LIDAR_SIDECAR_SUFFIX,
             "attributes": sorted(arrays.ext_attrs.keys()),
         }
+        sh_degree = _raydrop_sh_degree(arrays.ext_attrs)
+        if sh_degree > 0:
+            ext_attributes_block["raydrop_sh_degree"] = sh_degree
+        gaussians["ext_attributes"] = ext_attributes_block
     return {
         "schema": _SCENE_SCHEMA,
         "producer": {
