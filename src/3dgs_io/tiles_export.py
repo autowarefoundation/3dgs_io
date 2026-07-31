@@ -241,7 +241,9 @@ def _save_from_cloud(
     ext_attrs: dict[str, np.ndarray] = {}
     if ext_attributes is not None:
         for name, arr in ext_attributes.items():
-            arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+            # Scalars are 1-D ``(n,)``; ``raydrop_sh`` is 2-D ``(n, coefs)``. Only
+            # the leading dimension is validated, so both flow through unchanged.
+            arr = np.asarray(arr, dtype=np.float32)
             if arr.shape[0] != n:
                 raise ValueError(f"ext attribute {name!r} has {arr.shape[0]} entries, expected {n}")
             ext_attrs[name] = arr

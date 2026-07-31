@@ -24,11 +24,14 @@ save_tileset = _mod.save_tileset
 save_scene_usdz = _mod.save_scene_usdz
 encode_lidar_sidecar = _mod.encode_lidar_sidecar
 decode_lidar_sidecar = _mod.decode_lidar_sidecar
+raydrop_sh_coefs = _mod.raydrop_sh_coefs
+raydrop_sh_degree_from_coefs = _mod.raydrop_sh_degree_from_coefs
 EXT_GAUSSIAN_LIDAR_NAME = _mod.EXT_GAUSSIAN_LIDAR_NAME
 
 LIDAR_INTENSITY = "lidar_intensity_raw"
 LIDAR_RAYDROP = "lidar_raydrop_logit"
 LIDAR_MASK = "lidar_mask"
+RAYDROP_SH = "raydrop_sh"
 
 
 def _make_cloud(rng: np.random.Generator, n: int, *, spread: float = 5.0) -> GaussianCloud:
@@ -437,3 +440,149 @@ def test_save_tileset_ext_attribute_length_validation(tmp_path: Path) -> None:
             tmp_path,
             ext_attributes={LIDAR_INTENSITY: np.zeros(n + 1, dtype=np.float32)},
         )
+
+
+# ── raydrop_sh (view-dependent SH raydrop) ───────────────────────────────────
+
+
+def test_raydrop_sh_coefs_helpers() -> None:
+    # (deg+1)^2 - 1 excludes the DC term.
+    assert raydrop_sh_coefs(0) == 0
+    assert raydrop_sh_coefs(1) == 3
+    assert raydrop_sh_coefs(2) == 8
+    assert raydrop_sh_coefs(3) == 15
+    for deg in range(0, 6):
+        assert raydrop_sh_degree_from_coefs(raydrop_sh_coefs(deg)) == deg
+    with pytest.raises(ValueError, match="not \\(deg\\+1\\)"):
+        raydrop_sh_degree_from_coefs(5)  # 5 + 1 = 6 is not a perfect square
+
+
+def test_sidecar_scalar_only_is_version_1() -> None:
+    """Without raydrop_sh the sidecar stays byte-identical version 1."""
+    rng = np.random.default_rng(10)
+    n = 128
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    payload = encode_lidar_sidecar({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
+    assert len(payload) == 16 + n * 2
+    # version field (bytes 4..7) is 1.
+    assert int.from_bytes(payload[4:8], "little") == 1
+    out = decode_lidar_sidecar(payload)
+    assert RAYDROP_SH not in out
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_sidecar_raydrop_sh_round_trip(degree: int) -> None:
+    rng = np.random.default_rng(11)
+    n = 256
+    coefs = raydrop_sh_coefs(degree)
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    sh = rng.standard_normal((n, coefs)).astype(np.float32)
+
+    payload = encode_lidar_sidecar(
+        {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, RAYDROP_SH: sh}, count=n
+    )
+    # version 2, and body = 16-byte header + 2 uint8 channels + 8-byte SH header + float16 block.
+    assert int.from_bytes(payload[4:8], "little") == 2
+    assert len(payload) == 16 + n * 2 + 8 + n * coefs * 2
+
+    out = decode_lidar_sidecar(payload)
+    assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP, RAYDROP_SH}
+    assert out[RAYDROP_SH].shape == (n, coefs)
+    assert raydrop_sh_degree_from_coefs(out[RAYDROP_SH].shape[1]) == degree
+    # float16 half-precision round trip: exact once the source is cast to float16.
+    np.testing.assert_array_equal(out[RAYDROP_SH], sh.astype(np.float16).astype(np.float32))
+    # And close to the original float32 within half-precision resolution.
+    assert np.max(np.abs(out[RAYDROP_SH] - sh)) < 1e-2
+
+
+def test_sidecar_raydrop_sh_bad_coefs() -> None:
+    rng = np.random.default_rng(14)
+    n = 16
+    sh = rng.standard_normal((n, 5)).astype(np.float32)  # 5 is not (deg+1)^2 - 1
+    with pytest.raises(ValueError, match="not \\(deg\\+1\\)"):
+        encode_lidar_sidecar(
+            {
+                LIDAR_INTENSITY: np.zeros(n, np.float32),
+                LIDAR_RAYDROP: np.zeros(n, np.float32),
+                RAYDROP_SH: sh,
+            },
+            count=n,
+        )
+
+
+def test_unsupported_sidecar_version_rejected() -> None:
+    import struct
+
+    # Craft a version-3 header (unknown) with a plausible body.
+    header = struct.pack("<4sIII", b"L1DR", 3, 4, 2)
+    with pytest.raises(ValueError, match="unsupported sidecar version 3"):
+        decode_lidar_sidecar(header + b"\x00" * (4 * 2))
+
+
+@pytest.mark.parametrize("spz_compression", [False, True])
+def test_glb_raydrop_sh_round_trip(spz_compression: bool, tmp_path: Path) -> None:
+    rng = np.random.default_rng(20)
+    n = 60
+    gc = _make_cloud(rng, n)
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    sh = rng.standard_normal((n, 8)).astype(np.float32)  # degree 2
+
+    path = tmp_path / "sh.glb"
+    save_gltf(
+        gc,
+        path,
+        GltfSaveOptions(spz_compression=spz_compression),
+        ext_attributes={LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, RAYDROP_SH: sh},
+    )
+
+    _gc2, _meta, ext_attrs = load_gltf_with_metadata(path)
+    assert set(ext_attrs.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP, RAYDROP_SH}
+    assert ext_attrs[RAYDROP_SH].shape == (n, 8)
+    # glTF carries raydrop_sh losslessly as float32.
+    np.testing.assert_allclose(ext_attrs[RAYDROP_SH], sh, rtol=0, atol=0)
+
+
+def test_usdz_round_trip_writes_raydrop_sh(tmp_path: Path) -> None:
+    rng = np.random.default_rng(21)
+    n = 500
+    gc = _make_cloud(rng, n, spread=5.0)
+    intensity = rng.standard_normal(n).astype(np.float32)
+    raydrop = rng.standard_normal(n).astype(np.float32)
+    sh = rng.standard_normal((n, 8)).astype(np.float32)  # degree 2
+
+    ts_dir = tmp_path / "tileset"
+    save_tileset(
+        gc,
+        ts_dir,
+        TilesetSaveOptions(chunk_size=2.5, save_options=GltfSaveOptions(spz_compression=True)),
+        ext_attributes={LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, RAYDROP_SH: sh},
+    )
+
+    usdz_path = tmp_path / "scene.usdz"
+    result = save_scene_usdz(
+        ts_dir / "tileset.json",
+        usdz_path,
+        options=SceneUsdzOptions(chunk_size=3.0),
+    )
+
+    with zipfile.ZipFile(usdz_path) as zf:
+        scene = json.loads(zf.read("scene.json"))
+        ext_block = scene["gaussians"]["ext_attributes"]
+        assert RAYDROP_SH in ext_block["attributes"]
+        assert ext_block["raydrop_sh_degree"] == 2
+
+        tileset = json.loads(zf.read("tileset.json"))
+        for child in tileset["root"]["children"]:
+            lidar = child["content"]["extensions"][EXT_GAUSSIAN_LIDAR_NAME]
+            assert lidar["raydrop_sh_degree"] == 2
+
+        lidar_files = sorted(nm for nm in zf.namelist() if nm.endswith(".lidar"))
+        total = 0
+        for lidar_name in lidar_files:
+            out = decode_lidar_sidecar(zf.read(lidar_name))
+            assert out[RAYDROP_SH].shape[1] == 8
+            total += out[RAYDROP_SH].shape[0]
+        assert total == result.n_gaussians == n

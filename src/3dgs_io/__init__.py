@@ -26,9 +26,12 @@ from .ext_attributes import (
     LIDAR_INTENSITY_KEY,
     LIDAR_MASK_KEY,
     LIDAR_RAYDROP_KEY,
+    RAYDROP_SH_KEY,
     ExtAttributeSpec,
     decode_lidar_sidecar,
     encode_lidar_sidecar,
+    raydrop_sh_coefs,
+    raydrop_sh_degree_from_coefs,
 )
 from .frame_convention import FRAME_CONVENTION
 from .gltf_io import GltfSaveOptions, load_gltf, load_gltf_with_metadata, save_gltf
@@ -126,6 +129,7 @@ __all__ = [
     "LIDAR_INTENSITY_KEY",
     "LIDAR_MASK_KEY",
     "LIDAR_RAYDROP_KEY",
+    "RAYDROP_SH_KEY",
     "ExtAttributeSpec",
     "GaussianCloud",
     "GlbMetadata",
@@ -157,6 +161,8 @@ __all__ = [
     "update_camera_intrinsics_in_usdz",
     "decode_lidar_sidecar",
     "encode_lidar_sidecar",
+    "raydrop_sh_coefs",
+    "raydrop_sh_degree_from_coefs",
     "load_rig_trajectories_doc",
     "parse_ppisp",
     "parse_rig_trajectories",
