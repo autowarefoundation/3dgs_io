@@ -44,7 +44,7 @@ import logging
 import math
 import tempfile
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -52,6 +52,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import spz
 
+from ._geodesy import validate_anchor_against_lanelet2
 from .ext_attributes import (
     EXT_GAUSSIAN_LIDAR_NAME,
     RAYDROP_SH_KEY,
@@ -154,6 +155,12 @@ class SceneUsdzOptions:
     exposure: float = 1.6
     near_plane: float = 0.5
     far_plane: float = 300.0
+
+    validate_geo_anchor: bool = True
+    """Cross-check ``ecef_anchor`` against an embedded Lanelet2 ``map.osm``
+    (when one is bundled) and refuse to write a bundle whose anchor decodes
+    tens of kilometres away from the map. Skipped when no usable map nodes
+    are found."""
 
 
 @dataclass
@@ -391,6 +398,11 @@ class _CloudArrays(NamedTuple):
         return int(self.positions.shape[0])
 
 
+# Saturating opacity logit: sigmoid(±40) is exactly 1.0 / 0.0 in float32 and
+# the SPZ uint8 quantiser maps anything this large to 255 / 0 anyway.
+_ALPHA_LOGIT_LIMIT = 40.0
+
+
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
@@ -413,6 +425,11 @@ def _filter_and_clamp(
     rotations = np.array(gc.rotations, dtype=np.float32).reshape(n, 4)
     scales_log = np.array(gc.scales, dtype=np.float32).reshape(n, 3)
     alphas = np.array(gc.alphas, dtype=np.float32).reshape(n)
+    # SPZ stores opacity sigmoid-quantised to uint8, so a fully opaque
+    # gaussian (255) decodes to a +inf logit. That is a valid value — clamp
+    # ±inf to a saturating finite logit instead of letting the finite mask
+    # below drop the point (np.clip keeps NaN as NaN, which IS dropped).
+    alphas = np.clip(alphas, -_ALPHA_LOGIT_LIMIT, _ALPHA_LOGIT_LIMIT)
     colors = np.array(gc.colors, dtype=np.float32).reshape(n, 3)
     sh_flat = np.array(gc.sh, dtype=np.float32)
     per_ch = sh_flat.size // (n * 3) if sh_flat.size > 0 else 0
@@ -617,7 +634,7 @@ def _compose_scene_json(
     options: SceneUsdzOptions,
     extras: dict[str, str | None],
     ecef_anchor: list[list[float]],
-    source_tileset: str,
+    producer_source: Mapping[str, Any],
     chunk_index: list[dict[str, Any]],
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -652,7 +669,7 @@ def _compose_scene_json(
             "tool": _TOOL_NAME,
             "tool_version": _TOOL_VERSION,
             "created_at": created_at,
-            "source_tileset": source_tileset,
+            **producer_source,
         },
         "world": {
             "frame_convention": FRAME_CONVENTION,
@@ -735,13 +752,6 @@ def save_scene_usdz(
         Filtering, scale clamping, chunk size, and render defaults.
     """
     tileset_path = Path(tileset_path)
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if options is None:
-        options = SceneUsdzOptions()
-    if metadata is None:
-        metadata = make_default_metadata(out_path=out_path)
-    metadata_payload = encode_usdz_metadata(metadata)
 
     cloud, root_transform, source_ext_attrs = _load_from_tileset(tileset_path)
     source_root_matrix = np.array(root_transform, dtype=np.float64).reshape(4, 4).T
@@ -750,13 +760,68 @@ def save_scene_usdz(
     cloud = _apply_transform_to_cloud(cloud, source_to_world)
     root_matrix = source_root_matrix @ np.linalg.inv(source_to_world)
     validate_rigid_transform(root_matrix, where="tileset root.transform")
-    ecef_anchor = root_matrix.tolist()
-    arrays = _filter_and_clamp(cloud, options, source_ext_attrs)
+
+    return _save_bundle(
+        cloud=cloud,
+        ext_attrs=source_ext_attrs,
+        ecef_anchor=root_matrix.tolist(),
+        out_path=out_path,
+        options=options,
+        metadata=metadata,
+        producer_source={"source_tileset": tileset_path.name},
+        extras=extras,
+        tracks=tracks,
+        rig_trajectories=rig_trajectories,
+        ppisp=ppisp,
+    )
+
+
+def _save_bundle(
+    *,
+    cloud: spz.GaussianCloud,
+    ext_attrs: dict[str, np.ndarray],
+    ecef_anchor: list[list[float]],
+    out_path: str | Path,
+    options: SceneUsdzOptions | None,
+    metadata: UsdzMetadata | None,
+    producer_source: Mapping[str, Any],
+    extras: Mapping[str, str | Path] | None = None,
+    extra_payloads: Sequence[tuple[str, bytes]] = (),
+    tracks: list[Track] | None = None,
+    rig_trajectories: list[RigTrajectory] | None = None,
+    ppisp: Ppisp | None = None,
+) -> SceneUsdzResult:
+    """Core bundle writer shared by the tileset path and the scene-connect path.
+
+    ``cloud`` / ``ext_attrs`` are already in the Z-up ENU world frame implied
+    by ``ecef_anchor``. ``extra_payloads`` carries in-memory archive entries
+    (``(archive_path, bytes)``) written verbatim — used by connect to carry
+    extras straight from an input bundle without touching the filesystem.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if options is None:
+        options = SceneUsdzOptions()
+    if metadata is None:
+        metadata = make_default_metadata(out_path=out_path)
+    metadata_payload = encode_usdz_metadata(metadata)
+
+    arrays = _filter_and_clamp(cloud, options, ext_attrs)
     sub_clouds, bounds, chunk_ext = _split_cloud_into_chunks(arrays, options)
     chunk_index = _build_chunk_index(sub_clouds, bounds)
 
     extras_entries = _collect_extras_entries(extras)
+    payload_entries: list[tuple[str, bytes]] = []
+    for raw_arc, payload in extra_payloads:
+        arc = _normalise_arc_path(raw_arc)
+        if arc in _RESERVED_PATHS or any(arc.startswith(p) for p in _RESERVED_PREFIXES):
+            raise ValueError(f"extra payload {raw_arc!r} collides with a reserved path")
+        payload_entries.append((arc, payload))
     archive_paths = {arc for arc, _ in extras_entries}
+    dup = archive_paths & {arc for arc, _ in payload_entries}
+    if dup:
+        raise ValueError(f"extras and extra_payloads both provide {sorted(dup)}")
+    archive_paths |= {arc for arc, _ in payload_entries}
 
     tracks_payload: bytes | None = None
     if tracks is not None:
@@ -790,12 +855,18 @@ def save_scene_usdz(
         archive_paths.add("ppisp.json")
 
     extras_meta = _detect_known_extras(archive_paths)
+
+    if options.validate_geo_anchor:
+        map_osm = _find_map_osm(extras_entries, payload_entries)
+        if map_osm is not None:
+            validate_anchor_against_lanelet2(np.asarray(ecef_anchor, dtype=np.float64), map_osm)
+
     scene_doc = _compose_scene_json(
         arrays=arrays,
         options=options,
         extras=extras_meta,
         ecef_anchor=ecef_anchor,
-        source_tileset=tileset_path.name,
+        producer_source=producer_source,
         chunk_index=chunk_index,
     )
 
@@ -832,6 +903,8 @@ def save_scene_usdz(
                     zf.write(src, entry["uri"], compress_type=zipfile.ZIP_STORED)
             for arc, src in extras_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
+            for arc, payload in payload_entries:
+                _zip_write_bytes(zf, arc, payload)
 
     return SceneUsdzResult(
         out_path=out_path,
@@ -842,6 +915,20 @@ def save_scene_usdz(
         ecef_anchor=ecef_anchor,
         metadata=metadata.to_dict(),
     )
+
+
+def _find_map_osm(
+    extras_entries: list[tuple[str, Path]],
+    payload_entries: list[tuple[str, bytes]],
+) -> bytes | None:
+    """Return the bytes of the ``map.osm`` entry about to be bundled, if any."""
+    for arc, payload in payload_entries:
+        if arc == "map.osm":
+            return payload
+    for arc, src in extras_entries:
+        if arc == "map.osm":
+            return src.read_bytes()
+    return None
 
 
 def _zip_write_str(zf: zipfile.ZipFile, name: str, content: str) -> None:

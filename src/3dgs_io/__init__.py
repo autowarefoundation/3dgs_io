@@ -1,5 +1,10 @@
 from spz import GaussianCloud
 
+from ._geodesy import (
+    ecef_to_geodetic,
+    geodetic_to_ecef,
+    validate_anchor_against_lanelet2,
+)
 from .cameras import (
     Camera,
     CameraExtrinsics,
@@ -68,6 +73,11 @@ from .rig_trajectories import (
     parse_rig_trajectories,
     serialize_rig_trajectories,
     update_camera_intrinsics,
+)
+from .scene_connect import (
+    SceneBundle,
+    connect_scene_usdzs,
+    load_scene_bundle,
 )
 from .scene_usdz import (
     SceneUsdzOptions,
@@ -151,8 +161,14 @@ __all__ = [
     "Placement",
     "RigPose",
     "RigTrajectory",
+    "SceneBundle",
     "SceneUsdzOptions",
     "SceneUsdzResult",
+    "connect_scene_usdzs",
+    "ecef_to_geodetic",
+    "geodetic_to_ecef",
+    "load_scene_bundle",
+    "validate_anchor_against_lanelet2",
     "Track",
     "TrackFrame",
     "TrainingData",
