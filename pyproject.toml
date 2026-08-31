@@ -1,6 +1,6 @@
 [project]
 name = "3dgs-io"
-version = "2.0.0"
+version = "1.2.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
@@ -33,7 +33,7 @@ requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
 
 [tool.uv.sources]
-spz = { git = "https://github.com/nianticlabs/spz.git", rev="v3.0.0"}
+spz = { git = "https://github.com/nianticlabs/spz.git", rev="v2.1.0"}
 
 [dependency-groups]
 dev = [

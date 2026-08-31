@@ -6,18 +6,12 @@ same ECEF placement without leaving an implicit axis conversion to consumers.
 
 Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
 
-    default.usda                 # USDZ root stage (asset reference to scene.json)
+    default.usda                 # USDZ root stage (asset reference to tileset.json)
     metadata.yaml                # identity card (uuid / scene_id / version_string)
-    scene.json                   # splatsim.scene/v3 bundle index; carries the
-                                 # chunk list (uri / n_points / world-frame AABB)
-    chunks/chunk_NNNNNN.spz      # Niantic SPZ chunks (spatially split), stored
-                                 # directly in the alpasim ENU world frame;
-                                 # per-Gaussian LiDAR attrs ride inside each SPZ
-                                 # as an extension record (no sidecar files)
+    scene.json                   # splatsim.scene/v2 bundle index
+    tileset.json                 # local EXT_3dgs_spz index (no Cesium world transform)
+    chunks/chunk_NNNNNN.spz      # Niantic SPZ tiles (spatially split)
     <user-supplied extras>       # verbatim files / dirs at user-chosen paths
-
-The bundle itself contains no Cesium 3D Tiles structures; the Cesium
-``tileset.json`` format is accepted only as *input* to :func:`save_scene_usdz`.
 
 Recognised "well-known" extras paths get auto-recorded in ``scene.json``'s
 ``extras`` block so downstream tooling can resolve them without scanning:
@@ -54,9 +48,9 @@ import spz
 
 from .ext_attributes import (
     EXT_GAUSSIAN_LIDAR_NAME,
+    LIDAR_SIDECAR_SUFFIX,
     RAYDROP_SH_KEY,
-    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
-    embed_lidar_extension,
+    encode_lidar_sidecar,
     raydrop_sh_degree_from_coefs,
 )
 from .frame_convention import FRAME_CONVENTION, RUB_TO_ENU, validate_rigid_transform
@@ -84,10 +78,15 @@ _log = logging.getLogger(__name__)
 
 _TOOL_NAME = "3dgs_io.scene_usdz"
 _TOOL_VERSION = "0.1.0"
-_SCENE_SCHEMA = "splatsim.scene/v3"
+_SCENE_SCHEMA = "splatsim.scene/v2"
+
+# 3D Tiles tile-content extension key for spz payloads.
+_EXT_3DGS_SPZ = "EXT_3dgs_spz"
 
 # Archive entries owned by the writer; user extras must not collide.
-_RESERVED_PATHS = frozenset({"default.usda", "scene.json", USDZ_METADATA_ARCHIVE_PATH})
+_RESERVED_PATHS = frozenset(
+    {"default.usda", "scene.json", "tileset.json", USDZ_METADATA_ARCHIVE_PATH}
+)
 _RESERVED_PREFIXES: tuple[str, ...] = ("chunks/",)
 
 _IDENTITY_16: tuple[float, ...] = (
@@ -118,7 +117,8 @@ _DEFAULT_USDA = """#usda 1.0
 
 def Xform "World"
 {
-    custom asset sceneIndex = @./scene.json@
+    custom asset gaussianTileset = @./tileset.json@
+    custom asset sceneIndex      = @./scene.json@
 }
 """
 
@@ -154,6 +154,8 @@ class SceneUsdzOptions:
     exposure: float = 1.6
     near_plane: float = 0.5
     far_plane: float = 300.0
+
+    geometric_error: float = 100.0
 
 
 @dataclass
@@ -490,6 +492,26 @@ def _split_oversized_chunk(member_idx: np.ndarray, max_n: int) -> list[np.ndarra
     return [a for a in np.array_split(member_idx, n_splits) if a.size > 0]
 
 
+def _aabb_to_3dtiles_box(bbox_min: np.ndarray, bbox_max: np.ndarray) -> list[float]:
+    center = ((bbox_min + bbox_max) / 2).astype(np.float64)
+    half = ((bbox_max - bbox_min) / 2).astype(np.float64)
+    half = np.where(half > 0, half, 1e-6)
+    return [
+        float(center[0]),
+        float(center[1]),
+        float(center[2]),
+        float(half[0]),
+        0.0,
+        0.0,
+        0.0,
+        float(half[1]),
+        0.0,
+        0.0,
+        0.0,
+        float(half[2]),
+    ]
+
+
 def _split_cloud_into_chunks(
     arrays: _CloudArrays, options: SceneUsdzOptions
 ) -> tuple[
@@ -536,26 +558,61 @@ def _split_cloud_into_chunks(
     return chunks, bounds, chunk_ext
 
 
-def _build_chunk_index(
+def _build_tileset(
     sub_clouds: list[spz.GaussianCloud],
     bounds: list[tuple[np.ndarray, np.ndarray]],
-) -> list[dict[str, Any]]:
-    """Plain chunk index for ``scene.json``: URI, point count, world-frame AABB.
+    options: SceneUsdzOptions,
+    chunk_ext: list[dict[str, np.ndarray]] | None = None,
+) -> dict[str, Any]:
+    chunk_ext = chunk_ext or [{} for _ in sub_clouds]
+    has_any_ext = any(bool(e) for e in chunk_ext)
 
-    All values are in the alpasim ENU world frame — there is no Cesium
-    bounding-volume or geometric-error indirection.
-    """
-    entries: list[dict[str, Any]] = []
-    for i, (sub, (bmin, bmax)) in enumerate(zip(sub_clouds, bounds, strict=True)):
-        entries.append(
+    children: list[dict[str, Any]] = []
+    bbox_min_all = bounds[0][0].copy()
+    bbox_max_all = bounds[0][1].copy()
+    for i, (sub, (bmin, bmax), ext) in enumerate(zip(sub_clouds, bounds, chunk_ext, strict=True)):
+        bbox_min_all = np.minimum(bbox_min_all, bmin)
+        bbox_max_all = np.maximum(bbox_max_all, bmax)
+        content_extensions: dict[str, Any] = {
+            _EXT_3DGS_SPZ: {"format": "spz/1", "n_points": int(sub.num_points)},
+        }
+        if ext:
+            lidar_ext: dict[str, Any] = {
+                "uri": f"chunks/chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}",
+                "count": int(sub.num_points),
+                "attributes": sorted(ext.keys()),
+            }
+            sh_degree = _raydrop_sh_degree(ext)
+            if sh_degree > 0:
+                lidar_ext["raydrop_sh_degree"] = sh_degree
+            content_extensions[EXT_GAUSSIAN_LIDAR_NAME] = lidar_ext
+        children.append(
             {
-                "uri": f"chunks/chunk_{i:06d}.spz",
-                "n_points": int(sub.num_points),
-                "bbox_min": [float(v) for v in bmin],
-                "bbox_max": [float(v) for v in bmax],
+                "boundingVolume": {"box": _aabb_to_3dtiles_box(bmin, bmax)},
+                "geometricError": 0.0,
+                "content": {
+                    "uri": f"chunks/chunk_{i:06d}.spz",
+                    "extensions": content_extensions,
+                },
             }
         )
-    return entries
+    root: dict[str, Any] = {
+        "boundingVolume": {"box": _aabb_to_3dtiles_box(bbox_min_all, bbox_max_all)},
+        "geometricError": float(options.geometric_error),
+        "refine": "ADD",
+        "children": children,
+    }
+    extensions_required = [_EXT_3DGS_SPZ]
+    extensions_used = [_EXT_3DGS_SPZ]
+    if has_any_ext:
+        extensions_used.append(EXT_GAUSSIAN_LIDAR_NAME)
+    return {
+        "asset": {"version": "1.0", "tilesetVersion": "splatsim-spz/1.0"},
+        "extensionsRequired": extensions_required,
+        "extensionsUsed": extensions_used,
+        "geometricError": float(options.geometric_error),
+        "root": root,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +675,11 @@ def _compose_scene_json(
     extras: dict[str, str | None],
     ecef_anchor: list[list[float]],
     source_tileset: str,
-    chunk_index: list[dict[str, Any]],
 ) -> dict[str, Any]:
     created_at = _dt.datetime.now(tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     gaussians: dict[str, Any] = {
-        "chunk_format": "spz/ngsp-v4",
-        "chunks": chunk_index,
+        "tileset": "tileset.json",
+        "tile_content_format": "spz/1",
         "n_gaussians": arrays.n,
         "sh_degree": arrays.sh_degree,
         "filter": {
@@ -638,8 +694,7 @@ def _compose_scene_json(
     if arrays.ext_attrs:
         ext_attributes_block: dict[str, Any] = {
             "extension": EXT_GAUSSIAN_LIDAR_NAME,
-            "container": "spz_extension",
-            "spz_extension_type": SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
+            "sidecar_suffix": LIDAR_SIDECAR_SUFFIX,
             "attributes": sorted(arrays.ext_attrs.keys()),
         }
         sh_degree = _raydrop_sh_degree(arrays.ext_attrs)
@@ -687,9 +742,8 @@ def save_scene_usdz(
     """Pack a Cesium ``tileset.json`` (+ extras + tracks + rigs) into a USDZ.
 
     The input Cesium anchor is converted once into the row-major
-    ``scene.json.world.ecef_anchor``; per-tile transforms are baked into ENU
-    payload values. The output bundle carries no Cesium structures — chunks
-    are listed in ``scene.json.gaussians.chunks`` with world-frame AABBs.
+    ``scene.json.world.ecef_anchor``. The embedded tileset has no world
+    transform; per-tile transforms are baked into ENU payload values.
 
     Parameters
     ----------
@@ -704,7 +758,7 @@ def save_scene_usdz(
         Mapping of archive-relative path → file or directory on disk. Files
         are added verbatim; directories are recursively zipped under the key
         prefix. Reserved paths (``default.usda`` / ``scene.json`` /
-        ``chunks/*``) are rejected with ``ValueError``.
+        ``tileset.json`` / ``chunks/*``) are rejected with ``ValueError``.
     tracks:
         Optional list of dynamic-object :class:`Track` objects. When given
         they are serialised into ``sequence_tracks.json`` inside the archive
@@ -753,7 +807,7 @@ def save_scene_usdz(
     ecef_anchor = root_matrix.tolist()
     arrays = _filter_and_clamp(cloud, options, source_ext_attrs)
     sub_clouds, bounds, chunk_ext = _split_cloud_into_chunks(arrays, options)
-    chunk_index = _build_chunk_index(sub_clouds, bounds)
+    tileset_doc = _build_tileset(sub_clouds, bounds, options, chunk_ext)
 
     extras_entries = _collect_extras_entries(extras)
     archive_paths = {arc for arc, _ in extras_entries}
@@ -796,40 +850,41 @@ def save_scene_usdz(
         extras=extras_meta,
         ecef_anchor=ecef_anchor,
         source_tileset=tileset_path.name,
-        chunk_index=chunk_index,
     )
 
     # Materialise chunks to a tempdir, then assemble the USDZ from disk so
     # large extras (multi-GB CARLA trees, etc.) never get loaded into RAM.
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        chunk_paths: list[Path] = []
+        chunk_entries: list[tuple[str, Path]] = []
         for i, sub in enumerate(sub_clouds):
             cp = td_path / f"chunk_{i:06d}.spz"
             save_spz_world(sub, cp)
-            chunk_paths.append(cp)
+            chunk_entries.append((f"chunks/chunk_{i:06d}.spz", cp))
+
+        ext_chunk_entries: list[tuple[str, Path]] = []
+        for i, ext in enumerate(chunk_ext):
+            if not ext:
+                continue
+            sidecar = td_path / f"chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}"
+            sidecar.write_bytes(encode_lidar_sidecar(ext, count=int(sub_clouds[i].num_points)))
+            ext_chunk_entries.append((f"chunks/chunk_{i:06d}{LIDAR_SIDECAR_SUFFIX}", sidecar))
 
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
             _zip_write_bytes(zf, USDZ_METADATA_ARCHIVE_PATH, metadata_payload)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
+            _zip_write_str(zf, "tileset.json", json.dumps(tileset_doc, indent=2))
             if tracks_payload is not None:
                 _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
             if rig_trajectories_payload is not None:
                 _zip_write_bytes(zf, "rig_trajectories.json", rig_trajectories_payload)
             if ppisp_payload is not None:
                 _zip_write_bytes(zf, "ppisp.json", ppisp_payload)
-            for entry, src, ext in zip(chunk_index, chunk_paths, chunk_ext, strict=True):
-                if ext:
-                    # Splice the LiDAR extension in memory on the way into the
-                    # archive — one read of the chunk, no rewrite on disk.
-                    _zip_write_bytes(
-                        zf,
-                        entry["uri"],
-                        embed_lidar_extension(src.read_bytes(), ext, count=entry["n_points"]),
-                    )
-                else:
-                    zf.write(src, entry["uri"], compress_type=zipfile.ZIP_STORED)
+            for arc, src in chunk_entries:
+                zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
+            for arc, src in ext_chunk_entries:
+                zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
             for arc, src in extras_entries:
                 zf.write(src, arc, compress_type=zipfile.ZIP_STORED)
 

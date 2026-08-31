@@ -22,10 +22,8 @@ save_gltf = _mod.save_gltf
 load_gltf_with_metadata = _mod.load_gltf_with_metadata
 save_tileset = _mod.save_tileset
 save_scene_usdz = _mod.save_scene_usdz
-encode_lidar_extension = _mod.encode_lidar_extension
-decode_lidar_extension = _mod.decode_lidar_extension
-read_spz_extensions = _mod.read_spz_extensions
-extract_lidar_extension = _mod.extract_lidar_extension
+encode_lidar_sidecar = _mod.encode_lidar_sidecar
+decode_lidar_sidecar = _mod.decode_lidar_sidecar
 raydrop_sh_coefs = _mod.raydrop_sh_coefs
 raydrop_sh_degree_from_coefs = _mod.raydrop_sh_degree_from_coefs
 EXT_GAUSSIAN_LIDAR_NAME = _mod.EXT_GAUSSIAN_LIDAR_NAME
@@ -53,20 +51,20 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x.astype(np.float64)))
 
 
-# ── Payload encode/decode ────────────────────────────────────────────────────
+# ── Sidecar encode/decode ────────────────────────────────────────────────────
 
 
-def test_lidar_payload_round_trip() -> None:
+def test_lidar_sidecar_round_trip() -> None:
     rng = np.random.default_rng(0)
     n = 1024
     intensity = rng.standard_normal(n).astype(np.float32) * 2.0  # wide range
     raydrop = rng.standard_normal(n).astype(np.float32) * 2.0
-    payload = encode_lidar_extension({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
+    payload = encode_lidar_sidecar({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
 
     # 16-byte header + 2 bytes/point body
     assert len(payload) == 16 + n * 2
 
-    out = decode_lidar_extension(payload)
+    out = decode_lidar_sidecar(payload)
     assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP}
     assert out[LIDAR_INTENSITY].shape == (n,)
     assert out[LIDAR_RAYDROP].shape == (n,)
@@ -78,31 +76,31 @@ def test_lidar_payload_round_trip() -> None:
         assert np.max(np.abs(src_sig - got_sig)) < 2.0 / 255.0
 
 
-def test_lidar_payload_omitting_mask_is_byte_identical() -> None:
+def test_lidar_sidecar_omitting_mask_is_byte_identical() -> None:
     """Encoding without a mask still writes exactly 2 channels (no behaviour change)."""
     rng = np.random.default_rng(1)
     n = 256
     intensity = rng.standard_normal(n).astype(np.float32)
     raydrop = rng.standard_normal(n).astype(np.float32)
 
-    payload = encode_lidar_extension({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
+    payload = encode_lidar_sidecar({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
 
     # 16-byte header + 2 bytes/point body — identical to the pre-mask format.
     assert len(payload) == 16 + n * 2
-    out = decode_lidar_extension(payload)
+    out = decode_lidar_sidecar(payload)
     assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP}
     assert LIDAR_MASK not in out
 
 
-def test_lidar_payload_mask_round_trip() -> None:
-    """A 3-channel payload round-trips intensity, raydrop AND the mask exactly."""
+def test_lidar_sidecar_mask_round_trip() -> None:
+    """A 3-channel sidecar round-trips intensity, raydrop AND the mask exactly."""
     rng = np.random.default_rng(2)
     n = 512
     intensity = rng.standard_normal(n).astype(np.float32)
     raydrop = rng.standard_normal(n).astype(np.float32)
     mask = rng.integers(0, 2, size=n).astype(np.float32)  # exact {0, 1}
 
-    payload = encode_lidar_extension(
+    payload = encode_lidar_sidecar(
         {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, LIDAR_MASK: mask},
         count=n,
     )
@@ -110,7 +108,7 @@ def test_lidar_payload_mask_round_trip() -> None:
     # 16-byte header + 3 bytes/point body.
     assert len(payload) == 16 + n * 3
 
-    out = decode_lidar_extension(payload)
+    out = decode_lidar_sidecar(payload)
     assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP, LIDAR_MASK}
     assert out[LIDAR_MASK].shape == (n,)
     # u8_linear over [0, 1] preserves {0, 1} exactly as {0.0, 1.0}.
@@ -118,7 +116,7 @@ def test_lidar_payload_mask_round_trip() -> None:
     assert set(np.unique(out[LIDAR_MASK]).tolist()) <= {0.0, 1.0}
 
 
-def test_lidar_payload_all_ones_mask_round_trip() -> None:
+def test_lidar_sidecar_all_ones_mask_round_trip() -> None:
     """An explicit all-ones mask (all participate) round-trips to 1.0."""
     rng = np.random.default_rng(3)
     n = 64
@@ -126,18 +124,18 @@ def test_lidar_payload_all_ones_mask_round_trip() -> None:
     raydrop = rng.standard_normal(n).astype(np.float32)
     mask = np.ones(n, dtype=np.float32)
 
-    payload = encode_lidar_extension(
+    payload = encode_lidar_sidecar(
         {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, LIDAR_MASK: mask},
         count=n,
     )
-    out = decode_lidar_extension(payload)
+    out = decode_lidar_sidecar(payload)
     np.testing.assert_array_equal(out[LIDAR_MASK], np.ones(n, dtype=np.float32))
 
 
 def test_old_reader_ignores_mask_channel() -> None:
-    """A new 3-channel payload decoded against only the first 2 specs is forward compatible.
+    """A new 3-channel sidecar decoded against only the first 2 specs is forward compatible.
 
-    Simulates an old reader (2 specs known) reading a new 3-channel payload: the
+    Simulates an old reader (2 specs known) reading a new 3-channel sidecar: the
     body-size check passes and only intensity/raydrop are returned.
     """
     import importlib
@@ -149,17 +147,17 @@ def test_old_reader_ignores_mask_channel() -> None:
     raydrop = rng.standard_normal(n).astype(np.float32)
     mask = rng.integers(0, 2, size=n).astype(np.float32)
 
-    payload = encode_lidar_extension(
+    payload = encode_lidar_sidecar(
         {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, LIDAR_MASK: mask},
         count=n,
     )
-    assert len(payload) == 16 + n * 3  # a genuine 3-channel payload
+    assert len(payload) == 16 + n * 3  # a genuine 3-channel sidecar
 
     # Temporarily restrict the known specs to the first two (old reader).
     original_specs = ext_mod.DEFAULT_LIDAR_SPECS
     try:
         ext_mod.DEFAULT_LIDAR_SPECS = original_specs[:2]
-        out = ext_mod.decode_lidar_extension(payload)
+        out = ext_mod.decode_lidar_sidecar(payload)
     finally:
         ext_mod.DEFAULT_LIDAR_SPECS = original_specs
 
@@ -172,14 +170,14 @@ def test_lidar_mask_key_exported() -> None:
     assert _mod.LIDAR_RAYDROP_KEY == LIDAR_RAYDROP
 
 
-def test_lidar_payload_bad_magic() -> None:
-    with pytest.raises(ValueError, match="bad lidar extension payload magic"):
-        decode_lidar_extension(b"XXXX" + b"\x00" * 32)
+def test_lidar_sidecar_bad_magic() -> None:
+    with pytest.raises(ValueError, match="bad sidecar magic"):
+        decode_lidar_sidecar(b"XXXX" + b"\x00" * 32)
 
 
-def test_lidar_payload_too_short() -> None:
-    with pytest.raises(ValueError, match="payload too short"):
-        decode_lidar_extension(b"L1DR")
+def test_lidar_sidecar_too_short() -> None:
+    with pytest.raises(ValueError, match="sidecar too short"):
+        decode_lidar_sidecar(b"L1DR")
 
 
 # ── GLB round trip ──────────────────────────────────────────────────────────
@@ -286,7 +284,7 @@ def test_save_tileset_without_ext_omits_extension(tmp_path: Path) -> None:
 # ── USDZ round trip ─────────────────────────────────────────────────────────
 
 
-def test_usdz_round_trip_embeds_lidar_extension(tmp_path: Path) -> None:
+def test_usdz_round_trip_writes_sidecars(tmp_path: Path) -> None:
     rng = np.random.default_rng(0)
     n = 500
     gc = _make_cloud(rng, n, spread=5.0)
@@ -314,36 +312,29 @@ def test_usdz_round_trip_embeds_lidar_extension(tmp_path: Path) -> None:
     with zipfile.ZipFile(usdz_path) as zf:
         names = zf.namelist()
         spz_files = sorted(n for n in names if n.endswith(".spz"))
+        lidar_files = sorted(n for n in names if n.endswith(".lidar"))
         assert len(spz_files) == result.n_chunks
-        # No sidecar files: the payload rides inside each chunk SPZ.
-        assert not any(n.endswith(".lidar") for n in names)
+        assert len(lidar_files) == result.n_chunks
 
-        # No Cesium tileset in the bundle; the chunk index lives in scene.json.
-        assert "tileset.json" not in names
+        tileset = json.loads(zf.read("tileset.json"))
+        assert EXT_GAUSSIAN_LIDAR_NAME in tileset["extensionsUsed"]
+        for child in tileset["root"]["children"]:
+            assert EXT_GAUSSIAN_LIDAR_NAME in child["content"]["extensions"]
+
         scene = json.loads(zf.read("scene.json"))
-        chunks = scene["gaussians"]["chunks"]
-        assert [c["uri"] for c in chunks] == spz_files
-        assert all(c["n_points"] > 0 for c in chunks)
-        assert all(len(c["bbox_min"]) == 3 and len(c["bbox_max"]) == 3 for c in chunks)
+        assert "ext_attributes" in scene["gaussians"]
+        assert scene["gaussians"]["ext_attributes"]["extension"] == EXT_GAUSSIAN_LIDAR_NAME
 
-        ext_block = scene["gaussians"]["ext_attributes"]
-        assert ext_block["extension"] == EXT_GAUSSIAN_LIDAR_NAME
-        assert ext_block["container"] == "spz_extension"
-        # Pin the published wire format as a literal.
-        assert ext_block["spz_extension_type"] == "0x54340001"
-
-        # Embedded payload count matches SPZ point count for every chunk
-        for spz_name in spz_files:
-            raw = zf.read(spz_name)
-            ext_data = extract_lidar_extension(raw)
-            assert ext_data is not None
+        # Sidecar count matches SPZ point count for every chunk
+        for spz_name, lidar_name in zip(spz_files, lidar_files, strict=True):
+            ext_data = decode_lidar_sidecar(zf.read(lidar_name))
             assert LIDAR_INTENSITY in ext_data
             assert LIDAR_RAYDROP in ext_data
             # Decoded length should match the parsed SPZ point count.
             tmpdir = tmp_path / "_unzip"
             tmpdir.mkdir(exist_ok=True)
             target = tmpdir / os.path.basename(spz_name)
-            target.write_bytes(raw)
+            target.write_bytes(zf.read(spz_name))
             loaded = spz.load_spz(str(target), spz.UnpackOptions())
             assert ext_data[LIDAR_INTENSITY].shape == (loaded.num_points,)
 
@@ -378,16 +369,15 @@ def test_usdz_index_alignment_preserved(tmp_path: Path) -> None:
     matched = 0
     with zipfile.ZipFile(usdz_path) as zf:
         spz_files = sorted(n for n in zf.namelist() if n.endswith(".spz"))
+        lidar_files = sorted(n for n in zf.namelist() if n.endswith(".lidar"))
         unzip_dir = tmp_path / "_unzip2"
         unzip_dir.mkdir(exist_ok=True)
-        for spz_name in spz_files:
-            raw = zf.read(spz_name)
+        for spz_name, lidar_name in zip(spz_files, lidar_files, strict=True):
             sp = unzip_dir / os.path.basename(spz_name)
-            sp.write_bytes(raw)
+            sp.write_bytes(zf.read(spz_name))
             loaded = spz.load_spz(str(sp), spz.UnpackOptions())
             pos = np.asarray(loaded.positions, dtype=np.float32).reshape(-1, 3)
-            ext = extract_lidar_extension(raw)
-            assert ext is not None
+            ext = decode_lidar_sidecar(zf.read(lidar_name))
             for j in range(loaded.num_points):
                 d2 = np.sum((src_positions - pos[j]) ** 2, axis=1)
                 i = int(np.argmin(d2))
@@ -399,7 +389,7 @@ def test_usdz_index_alignment_preserved(tmp_path: Path) -> None:
 
 
 def test_usdz_without_ext_attributes_unchanged(tmp_path: Path) -> None:
-    """ext_attributes=None ⇒ no embedded records, no extension entries."""
+    """ext_attributes=None ⇒ no sidecars, no extension entries."""
     rng = np.random.default_rng(0)
     gc = _make_cloud(rng, 200, spread=3.0)
 
@@ -416,13 +406,10 @@ def test_usdz_without_ext_attributes_unchanged(tmp_path: Path) -> None:
     with zipfile.ZipFile(usdz_path) as zf:
         names = zf.namelist()
         assert not any(n.endswith(".lidar") for n in names)
-        for nm in names:
-            if nm.endswith(".spz"):
-                assert read_spz_extensions(zf.read(nm)) == {}
-        assert "tileset.json" not in names
+        tileset = json.loads(zf.read("tileset.json"))
+        assert EXT_GAUSSIAN_LIDAR_NAME not in tileset["extensionsUsed"]
         scene = json.loads(zf.read("scene.json"))
         assert "ext_attributes" not in scene["gaussians"]
-        assert scene["gaussians"]["chunks"]
 
 
 def test_save_tileset_rejects_ext_for_list_source(tmp_path: Path) -> None:
@@ -470,22 +457,22 @@ def test_raydrop_sh_coefs_helpers() -> None:
         raydrop_sh_degree_from_coefs(5)  # 5 + 1 = 6 is not a perfect square
 
 
-def test_payload_scalar_only_is_version_1() -> None:
-    """Without raydrop_sh the payload stays byte-identical version 1."""
+def test_sidecar_scalar_only_is_version_1() -> None:
+    """Without raydrop_sh the sidecar stays byte-identical version 1."""
     rng = np.random.default_rng(10)
     n = 128
     intensity = rng.standard_normal(n).astype(np.float32)
     raydrop = rng.standard_normal(n).astype(np.float32)
-    payload = encode_lidar_extension({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
+    payload = encode_lidar_sidecar({LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop}, count=n)
     assert len(payload) == 16 + n * 2
     # version field (bytes 4..7) is 1.
     assert int.from_bytes(payload[4:8], "little") == 1
-    out = decode_lidar_extension(payload)
+    out = decode_lidar_sidecar(payload)
     assert RAYDROP_SH not in out
 
 
 @pytest.mark.parametrize("degree", [1, 2, 3])
-def test_payload_raydrop_sh_round_trip(degree: int) -> None:
+def test_sidecar_raydrop_sh_round_trip(degree: int) -> None:
     rng = np.random.default_rng(11)
     n = 256
     coefs = raydrop_sh_coefs(degree)
@@ -493,14 +480,14 @@ def test_payload_raydrop_sh_round_trip(degree: int) -> None:
     raydrop = rng.standard_normal(n).astype(np.float32)
     sh = rng.standard_normal((n, coefs)).astype(np.float32)
 
-    payload = encode_lidar_extension(
+    payload = encode_lidar_sidecar(
         {LIDAR_INTENSITY: intensity, LIDAR_RAYDROP: raydrop, RAYDROP_SH: sh}, count=n
     )
     # version 2, and body = 16-byte header + 2 uint8 channels + 8-byte SH header + float16 block.
     assert int.from_bytes(payload[4:8], "little") == 2
     assert len(payload) == 16 + n * 2 + 8 + n * coefs * 2
 
-    out = decode_lidar_extension(payload)
+    out = decode_lidar_sidecar(payload)
     assert set(out.keys()) == {LIDAR_INTENSITY, LIDAR_RAYDROP, RAYDROP_SH}
     assert out[RAYDROP_SH].shape == (n, coefs)
     assert raydrop_sh_degree_from_coefs(out[RAYDROP_SH].shape[1]) == degree
@@ -510,12 +497,12 @@ def test_payload_raydrop_sh_round_trip(degree: int) -> None:
     assert np.max(np.abs(out[RAYDROP_SH] - sh)) < 1e-2
 
 
-def test_payload_raydrop_sh_bad_coefs() -> None:
+def test_sidecar_raydrop_sh_bad_coefs() -> None:
     rng = np.random.default_rng(14)
     n = 16
     sh = rng.standard_normal((n, 5)).astype(np.float32)  # 5 is not (deg+1)^2 - 1
     with pytest.raises(ValueError, match="not \\(deg\\+1\\)"):
-        encode_lidar_extension(
+        encode_lidar_sidecar(
             {
                 LIDAR_INTENSITY: np.zeros(n, np.float32),
                 LIDAR_RAYDROP: np.zeros(n, np.float32),
@@ -525,13 +512,13 @@ def test_payload_raydrop_sh_bad_coefs() -> None:
         )
 
 
-def test_unsupported_payload_version_rejected() -> None:
+def test_unsupported_sidecar_version_rejected() -> None:
     import struct
 
     # Craft a version-3 header (unknown) with a plausible body.
     header = struct.pack("<4sIII", b"L1DR", 3, 4, 2)
-    with pytest.raises(ValueError, match="unsupported lidar extension payload version 3"):
-        decode_lidar_extension(header + b"\x00" * (4 * 2))
+    with pytest.raises(ValueError, match="unsupported sidecar version 3"):
+        decode_lidar_sidecar(header + b"\x00" * (4 * 2))
 
 
 @pytest.mark.parametrize("spz_compression", [False, True])
@@ -587,12 +574,15 @@ def test_usdz_round_trip_writes_raydrop_sh(tmp_path: Path) -> None:
         assert RAYDROP_SH in ext_block["attributes"]
         assert ext_block["raydrop_sh_degree"] == 2
 
-        spz_files = sorted(nm for nm in zf.namelist() if nm.endswith(".spz"))
-        assert [c["uri"] for c in scene["gaussians"]["chunks"]] == spz_files
+        tileset = json.loads(zf.read("tileset.json"))
+        for child in tileset["root"]["children"]:
+            lidar = child["content"]["extensions"][EXT_GAUSSIAN_LIDAR_NAME]
+            assert lidar["raydrop_sh_degree"] == 2
+
+        lidar_files = sorted(nm for nm in zf.namelist() if nm.endswith(".lidar"))
         total = 0
-        for spz_name in spz_files:
-            out = extract_lidar_extension(zf.read(spz_name))
-            assert out is not None
+        for lidar_name in lidar_files:
+            out = decode_lidar_sidecar(zf.read(lidar_name))
             assert out[RAYDROP_SH].shape[1] == 8
             total += out[RAYDROP_SH].shape[0]
         assert total == result.n_gaussians == n

@@ -2,34 +2,24 @@
 
 Issue #26 needs to carry optional per-Gaussian scalars — currently
 ``lidar_intensity_raw``, ``lidar_raydrop_logit`` and ``lidar_mask`` for LiDAR
-simulation — alongside each splat without touching the fixed-schema ``spz.GaussianCloud``.
-The data rides as parallel ``(N,)`` arrays threaded through the same masks
-and reorderings as the gaussians, so ``attr[i] ↔ gaussian[i]`` always holds
-within a tile/chunk.
-
-In scene USDZ bundles the encoded payload is embedded **inside** each
-``chunks/chunk_NNNNNN.spz`` as an SPZ (NGSP v4) extension record of type
-:data:`SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR` — there are no sidecar files.
-Readers built without that extension type skip the record and still load the
-core Gaussian data; the payload itself is recovered with
-:func:`extract_lidar_extension`.
+simulation — alongside each splat without touching the fixed-schema ``spz.GaussianCloud``
+or the SPZ on-disk format. The data rides as parallel ``(N,)`` arrays
+threaded through the same masks and reorderings as the gaussians, so
+``attr[i] ↔ gaussian[i]`` always holds within a tile/chunk.
 
 This module defines:
 
 * :data:`EXT_GAUSSIAN_LIDAR_NAME` — the glTF / tileset extension key
   (``"EXT_gaussian_lidar"``).
-* :data:`SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR` — the SPZ extension record type
-  (vendor ``0x5434`` "T4", extension ``0x0001``).
 * :class:`ExtAttributeSpec` — per-attribute quantization metadata.
-* :func:`encode_lidar_extension` / :func:`decode_lidar_extension` — the
-  binary payload format carried by the SPZ extension record.
-* :func:`embed_lidar_extension` / :func:`extract_lidar_extension` — the
-  paired codec + record type, operating directly on SPZ streams.
+* :func:`encode_lidar_sidecar` / :func:`decode_lidar_sidecar` — the binary
+  sidecar format written next to each ``chunks/chunk_NNNNNN.spz`` in the
+  final USDZ.
 
-Payload binary layout
+Sidecar binary layout
 ---------------------
 
-The extension record payload is small and self-describing::
+``chunks/chunk_NNNNNN.lidar`` is a small, self-describing binary file::
 
     bytes  0..3   magic       ``"L1DR"``
     bytes  4..7   version     uint32 little-endian, ``1`` (scalar) or ``2`` (+SH)
@@ -56,12 +46,12 @@ values ``{0, 1}`` exactly (``0 → 0``, ``1 → 255`` on encode; ``0 → 0.0``,
 ``255 → 1.0`` on decode); consumers threshold decoded values at ``0.5``.
 
 The channel is fully backward/forward compatible and needs **no** header
-``version`` bump: because :func:`decode_lidar_extension` reads ``channels`` from
+``version`` bump: because :func:`decode_lidar_sidecar` reads ``channels`` from
 the header and clamps its decode loop to ``min(channels, len(DEFAULT_LIDAR_SPECS))``,
 
-* an old 2-channel reader reading a new 3-channel payload silently ignores the
+* an old 2-channel reader reading a new 3-channel sidecar silently ignores the
   mask channel, and
-* a new 3-channel reader reading an old 2-channel payload simply omits the
+* a new 3-channel reader reading an old 2-channel sidecar simply omits the
   ``lidar_mask`` key (consumers treat its absence as "all participate").
 
 When a caller does not supply a mask, the encoder writes only the two required
@@ -69,7 +59,7 @@ channels, so its output is byte-identical to the previous 2-channel format.
 
 Both scalar attributes survive the pipeline as their original float32 values
 inside ``EXT_gaussian_lidar`` glTF accessors; quantization is only applied
-on the final write-out to the per-chunk payload.
+on the final write-out to the per-chunk sidecar.
 
 View-dependent raydrop (SH) trailing block — version 2
 ------------------------------------------------------
@@ -86,9 +76,9 @@ probability at the sensor ray direction (exactly like colour SH)::
     sh_body    count * sh_coefs * 2 bytes, ``float16`` little-endian, row-major
 
 The block is written **only** when a caller supplies ``raydrop_sh`` with a
-positive degree; otherwise the encoder emits a version-1 payload that is
+positive degree; otherwise the encoder emits a version-1 sidecar that is
 byte-identical to the previous format. A version-1 reader that encounters a
-version-2 payload raises ``unsupported payload version`` — consumers unable to
+version-2 sidecar raises ``unsupported sidecar version`` — consumers unable to
 evaluate view-dependent raydrop cannot use the data anyway, so the version gate
 fails loudly rather than silently dropping the SH bands.
 
@@ -105,8 +95,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .spz_io import append_spz_extension, read_spz_extensions
-
 EXT_GAUSSIAN_LIDAR_NAME = "EXT_gaussian_lidar"
 
 LIDAR_INTENSITY_KEY = "lidar_intensity_raw"
@@ -117,21 +105,16 @@ LIDAR_MASK_KEY = "lidar_mask"
 # ``lidar_raydrop_logit``; ``raydrop_sh`` carries bands ``1..deg`` only.
 RAYDROP_SH_KEY = "raydrop_sh"
 
-# SPZ extension record type carrying this payload inside chunk .spz files:
-# vendor ID 0x5434 ("T4", TIER IV) in the high 16 bits, extension ID 0x0001.
-SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR = 0x54340001
-# Wire form published in scene.json's ``spz_extension_type`` field.
-SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX = "0x54340001"
-
-_LIDAR_PAYLOAD_MAGIC = b"L1DR"
+_LIDAR_SIDECAR_MAGIC = b"L1DR"
 # Version 1: scalar uint8 channels only. Version 2: identical uint8 channels
 # followed by a self-describing float16 ``raydrop_sh`` trailing block.
-_LIDAR_PAYLOAD_VERSION = 1
-_LIDAR_PAYLOAD_VERSION_SH = 2
-_LIDAR_PAYLOAD_HEADER_FMT = "<4sIII"  # magic, version, count, channels
-_LIDAR_PAYLOAD_HEADER_SIZE = struct.calcsize(_LIDAR_PAYLOAD_HEADER_FMT)
-_LIDAR_PAYLOAD_SH_HEADER_FMT = "<II"  # raydrop_sh_degree, raydrop_sh_coefs (=(deg+1)^2-1)
-_LIDAR_PAYLOAD_SH_HEADER_SIZE = struct.calcsize(_LIDAR_PAYLOAD_SH_HEADER_FMT)
+_LIDAR_SIDECAR_VERSION = 1
+_LIDAR_SIDECAR_VERSION_SH = 2
+_LIDAR_SIDECAR_HEADER_FMT = "<4sIII"  # magic, version, count, channels
+_LIDAR_SIDECAR_HEADER_SIZE = struct.calcsize(_LIDAR_SIDECAR_HEADER_FMT)
+_LIDAR_SIDECAR_SH_HEADER_FMT = "<II"  # raydrop_sh_degree, raydrop_sh_coefs (=(deg+1)^2-1)
+_LIDAR_SIDECAR_SH_HEADER_SIZE = struct.calcsize(_LIDAR_SIDECAR_SH_HEADER_FMT)
+LIDAR_SIDECAR_SUFFIX = ".lidar"
 
 
 def raydrop_sh_coefs(degree: int) -> int:
@@ -170,13 +153,13 @@ class ExtAttributeSpec:
     name:
         Attribute key, e.g. ``"lidar_intensity_raw"``.
     quantization:
-        Quantization mode applied when writing the per-chunk payload:
+        Quantization mode applied when writing the per-chunk sidecar:
 
         * ``"u8_sigmoid"`` — apply ``sigmoid`` then scale to ``uint8 [0..255]``.
           Inverse is ``logit(x/255)`` after divide.
         * ``"u8_linear"`` — clamp to ``[vmin, vmax]``, scale to
           ``uint8 [0..255]``.
-        * ``"f32"`` — no quantization (debug; not used in default payload).
+        * ``"f32"`` — no quantization (debug; not used in default sidecar).
     vmin, vmax:
         Range for ``"u8_linear"``; ignored otherwise.
     """
@@ -196,7 +179,7 @@ DEFAULT_LIDAR_SPECS: tuple[ExtAttributeSpec, ...] = (
     ExtAttributeSpec(name=LIDAR_MASK_KEY, quantization="u8_linear", vmin=0.0, vmax=1.0),
 )
 
-# Channels that must always be present in a payload. Any spec in
+# Channels that must always be present in a sidecar. Any spec in
 # ``DEFAULT_LIDAR_SPECS`` not listed here is optional (append-only) and is
 # written only when the caller supplies it.
 _REQUIRED_LIDAR_KEYS: frozenset[str] = frozenset({LIDAR_INTENSITY_KEY, LIDAR_RAYDROP_KEY})
@@ -211,12 +194,12 @@ def _logit(x: np.ndarray) -> np.ndarray:
     return np.log(x / (1.0 - x))
 
 
-def encode_lidar_extension(
+def encode_lidar_sidecar(
     ext_attributes: dict[str, np.ndarray],
     *,
     count: int,
 ) -> bytes:
-    """Encode the LiDAR extension payload for ``count`` points.
+    """Encode the LiDAR sidecar for ``count`` points.
 
     Channels are written in the fixed, append-only order defined by
     :data:`DEFAULT_LIDAR_SPECS`: ``lidar_intensity_raw``, ``lidar_raydrop_logit``
@@ -235,8 +218,8 @@ def encode_lidar_extension(
     (``raydrop_sh``) entry of ``ext_attributes``: a ``(count, coefs)`` array of
     the *higher-order* SH bands where ``coefs == (deg+1)**2 - 1`` (the DC term
     stays in the ``lidar_raydrop_logit`` channel). When present with a positive
-    degree the encoder emits a version-2 payload with a trailing ``float16`` SH
-    block; otherwise the output is a byte-identical version-1 payload.
+    degree the encoder emits a version-2 sidecar with a trailing ``float16`` SH
+    block; otherwise the output is a byte-identical version-1 sidecar.
     """
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
@@ -253,9 +236,7 @@ def encode_lidar_extension(
         if spec.name in scalars:
             active_specs.append(spec)
         elif spec.name in _REQUIRED_LIDAR_KEYS:
-            raise KeyError(
-                f"ext attribute {spec.name!r} is required for the LiDAR extension payload"
-            )
+            raise KeyError(f"ext attribute {spec.name!r} is required for the LiDAR sidecar")
         # else: optional channel not supplied -> drop the trailing channel.
 
     channels = len(active_specs)
@@ -275,7 +256,7 @@ def encode_lidar_extension(
             raise ValueError(f"unsupported quantization {spec.quantization!r}")
         body[:, ch_idx] = q
 
-    version = _LIDAR_PAYLOAD_VERSION
+    version = _LIDAR_SIDECAR_VERSION
     sh_block = b""
     if raydrop_sh is not None:
         sh = np.asarray(raydrop_sh)
@@ -288,15 +269,15 @@ def encode_lidar_extension(
                 "raydrop_sh must carry at least the degree-1 bands (coefs >= 3); "
                 f"got coefs={coefs}. Use the scalar lidar_raydrop_logit channel for degree 0."
             )
-        version = _LIDAR_PAYLOAD_VERSION_SH
-        sh_header = struct.pack(_LIDAR_PAYLOAD_SH_HEADER_FMT, degree, coefs)
+        version = _LIDAR_SIDECAR_VERSION_SH
+        sh_header = struct.pack(_LIDAR_SIDECAR_SH_HEADER_FMT, degree, coefs)
         # A single float16 copy; ``tobytes`` always emits C-order regardless of
         # the source layout, so no separate contiguity pass is needed.
         sh_block = sh_header + np.asarray(sh, dtype=np.float16).tobytes()
 
     header = struct.pack(
-        _LIDAR_PAYLOAD_HEADER_FMT,
-        _LIDAR_PAYLOAD_MAGIC,
+        _LIDAR_SIDECAR_HEADER_FMT,
+        _LIDAR_SIDECAR_MAGIC,
         version,
         count,
         channels,
@@ -304,42 +285,41 @@ def encode_lidar_extension(
     return header + body.tobytes() + sh_block
 
 
-def decode_lidar_extension(data: bytes) -> dict[str, np.ndarray]:
-    """Decode a LiDAR extension payload back to a dict of ``{name: float32 (N,)}``.
+def decode_lidar_sidecar(data: bytes) -> dict[str, np.ndarray]:
+    """Decode a LiDAR sidecar back to a dict of ``{name: float32 (N,)}``.
 
     Quantization is undone by the inverse of the encoder: ``sigmoid``-quantized
     values are returned as their *pre-sigmoid* logits (so the round trip
     preserves the original semantic field, modulo quantization error).
 
-    The number of returned keys matches the payload's channel count: a
-    2-channel payload yields ``{lidar_intensity_raw, lidar_raydrop_logit}`` and
+    The number of returned keys matches the sidecar's channel count: a
+    2-channel sidecar yields ``{lidar_intensity_raw, lidar_raydrop_logit}`` and
     omits ``lidar_mask`` (consumers treat its absence as "all participate"),
-    while a 3-channel payload additionally returns ``lidar_mask`` as ``{0.0,
+    while a 3-channel sidecar additionally returns ``lidar_mask`` as ``{0.0,
     1.0}`` floats (threshold at ``0.5``).
 
-    A version-2 payload additionally returns ``raydrop_sh`` as a
+    A version-2 sidecar additionally returns ``raydrop_sh`` as a
     ``(count, coefs)`` float32 array of the higher-order SH raydrop bands (the
     degree is recoverable via :func:`raydrop_sh_degree_from_coefs`); the DC term
     remains in ``lidar_raydrop_logit``.
     """
-    if len(data) < _LIDAR_PAYLOAD_HEADER_SIZE:
-        raise ValueError(f"lidar extension payload too short ({len(data)} bytes)")
+    if len(data) < _LIDAR_SIDECAR_HEADER_SIZE:
+        raise ValueError(f"sidecar too short ({len(data)} bytes)")
 
     magic, version, count, channels = struct.unpack(
-        _LIDAR_PAYLOAD_HEADER_FMT, data[:_LIDAR_PAYLOAD_HEADER_SIZE]
+        _LIDAR_SIDECAR_HEADER_FMT, data[:_LIDAR_SIDECAR_HEADER_SIZE]
     )
-    if magic != _LIDAR_PAYLOAD_MAGIC:
-        raise ValueError(f"bad lidar extension payload magic {magic!r}")
-    if version not in (_LIDAR_PAYLOAD_VERSION, _LIDAR_PAYLOAD_VERSION_SH):
-        raise ValueError(f"unsupported lidar extension payload version {version}")
+    if magic != _LIDAR_SIDECAR_MAGIC:
+        raise ValueError(f"bad sidecar magic {magic!r}")
+    if version not in (_LIDAR_SIDECAR_VERSION, _LIDAR_SIDECAR_VERSION_SH):
+        raise ValueError(f"unsupported sidecar version {version}")
 
     expected_body = count * channels
-    offset = _LIDAR_PAYLOAD_HEADER_SIZE
+    offset = _LIDAR_SIDECAR_HEADER_SIZE
     body = data[offset : offset + expected_body]
     if len(body) != expected_body:
         raise ValueError(
-            f"lidar extension payload body size mismatch: "
-            f"header says {expected_body} bytes, got {len(body)}"
+            f"sidecar body size mismatch: header says {expected_body} bytes, got {len(body)}"
         )
     offset += expected_body
 
@@ -355,13 +335,13 @@ def decode_lidar_extension(data: bytes) -> dict[str, np.ndarray]:
         else:
             raise ValueError(f"unsupported quantization {spec.quantization!r}")
 
-    if version == _LIDAR_PAYLOAD_VERSION_SH:
-        if len(data) - offset < _LIDAR_PAYLOAD_SH_HEADER_SIZE:
-            raise ValueError("lidar extension payload version 2 is missing its raydrop_sh header")
+    if version == _LIDAR_SIDECAR_VERSION_SH:
+        if len(data) - offset < _LIDAR_SIDECAR_SH_HEADER_SIZE:
+            raise ValueError("sidecar version 2 is missing its raydrop_sh header")
         degree, coefs = struct.unpack(
-            _LIDAR_PAYLOAD_SH_HEADER_FMT, data[offset : offset + _LIDAR_PAYLOAD_SH_HEADER_SIZE]
+            _LIDAR_SIDECAR_SH_HEADER_FMT, data[offset : offset + _LIDAR_SIDECAR_SH_HEADER_SIZE]
         )
-        offset += _LIDAR_PAYLOAD_SH_HEADER_SIZE
+        offset += _LIDAR_SIDECAR_SH_HEADER_SIZE
         if raydrop_sh_coefs(degree) != coefs:
             raise ValueError(
                 f"raydrop_sh header inconsistent: degree={degree} implies "
@@ -378,32 +358,8 @@ def decode_lidar_extension(data: bytes) -> dict[str, np.ndarray]:
         )
     elif offset != len(data):
         raise ValueError(
-            f"lidar extension payload body size mismatch: header says {expected_body} bytes, "
-            f"got {len(data) - _LIDAR_PAYLOAD_HEADER_SIZE}"
+            f"sidecar body size mismatch: header says {expected_body} bytes, "
+            f"got {len(data) - _LIDAR_SIDECAR_HEADER_SIZE}"
         )
 
     return out
-
-
-def embed_lidar_extension(
-    spz_bytes: bytes,
-    ext_attributes: dict[str, np.ndarray],
-    *,
-    count: int,
-) -> bytes:
-    """Return ``spz_bytes`` with the LiDAR payload embedded as its extension record.
-
-    Pairs :func:`encode_lidar_extension` with
-    :data:`SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR` so writers cannot mismatch
-    payload codec and record type.
-    """
-    payload = encode_lidar_extension(ext_attributes, count=count)
-    return append_spz_extension(spz_bytes, SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR, payload)
-
-
-def extract_lidar_extension(spz_bytes: bytes) -> dict[str, np.ndarray] | None:
-    """Decode the LiDAR extension record from an SPZ stream, or ``None`` if absent."""
-    payload = read_spz_extensions(spz_bytes).get(SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR)
-    if payload is None:
-        return None
-    return decode_lidar_extension(payload)
