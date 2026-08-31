@@ -36,6 +36,7 @@ from .ext_attributes import (
 )
 from .metadata import DatasetType as DatasetType  # noqa: F401 – re-export for backward compat
 from .metadata import GlbMetadata, parse_metadata, serialize_metadata
+from .spz_io import is_ngsp_stream
 
 _EXTENSION_NAME = "KHR_gaussian_splatting"
 _SPZ_EXTENSION_NAME = "KHR_gaussian_splatting_compression_spz_2"
@@ -594,18 +595,21 @@ def _compress_to_spz_bytes(gc: spz.GaussianCloud) -> bytes:
         # Do NOT set from_coord — CesiumJS's @spz-loader/core WASM
         # decoder outputs raw positions without any coordinate conversion,
         # so positions must be stored as-is in the input coordinate space.
+        # Pin the legacy gzip format — CesiumJS's @spz-loader/core expects
+        # gzip-compressed SPZ data, not NGSP v4 (zstd) bytes, which spz >= 3
+        # writes by default.
+        opts.version = 3
         spz.save_spz(gc, opts, str(path))
-        # Keep gzip wrapper — CesiumJS's @spz-loader/core expects
-        # gzip-compressed SPZ data, not raw NGSP bytes.
         return path.read_bytes()
 
 
 def _decompress_from_spz_bytes(data: bytes) -> spz.GaussianCloud:
-    # spz.load_spz() expects gzip-wrapped data (.spz file format).
     # The KHR_gaussian_splatting_compression_spz_2 spec stores raw SPZ bytes,
-    # but legacy files may contain gzip-wrapped SPZ bytes.  Detect and handle both.
+    # but legacy files may contain gzip-wrapped SPZ bytes, and newer producers
+    # may embed NGSP v4 (zstd) streams. spz.load_spz() handles gzip and NGSP
+    # natively; only a bare (un-gzipped) legacy stream needs re-wrapping.
     _GZIP_MAGIC = b"\x1f\x8b"
-    if not data[:2] == _GZIP_MAGIC:
+    if data[:2] != _GZIP_MAGIC and not is_ngsp_stream(data):
         data = gzip.compress(data)
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "temp.spz"

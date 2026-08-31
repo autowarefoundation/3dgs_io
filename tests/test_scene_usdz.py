@@ -2,9 +2,9 @@
 
 `save_scene_usdz` reads a Cesium 3D Tiles tileset.json (which carries the
 world-anchoring root.transform), loads the referenced glTF tile content(s),
-and packs everything plus user-supplied sidecars into one self-contained
+and packs everything plus user-supplied extras into one self-contained
 `ZIP_STORED` USDZ archive. The source tileset's root.transform is preserved
-verbatim into the output's tileset.json.
+as `scene.json`'s `world.ecef_anchor`.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ def _read(usdz: Path, name: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-def test_writes_default_usda_scene_tileset_and_chunks(tmp_path: Path) -> None:
+def test_writes_default_usda_scene_index_and_chunks(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
     res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
@@ -134,7 +134,8 @@ def test_writes_default_usda_scene_tileset_and_chunks(tmp_path: Path) -> None:
     names = _names(out)
     assert names[0] == "default.usda", "default.usda must come first per USDZ spec"
     assert "scene.json" in names
-    assert "tileset.json" in names
+    # The bundle carries no Cesium tileset; scene.json is the only index.
+    assert "tileset.json" not in names
     assert any(n.startswith("chunks/chunk_") and n.endswith(".spz") for n in names)
     assert res.n_chunks > 0
     assert res.n_gaussians > 0
@@ -160,9 +161,7 @@ def test_usdz_has_one_row_major_ecef_anchor(tmp_path: Path) -> None:
     out = tmp_path / "scene.usdz"
     res = save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
 
-    out_tileset = json.loads(_read(out, "tileset.json"))
     expected = np.asarray(_expected_enu_root(_NONIDENT_TRANSFORM)).reshape(4, 4).T.tolist()
-    assert "transform" not in out_tileset["root"]
     assert res.ecef_anchor == expected
 
 
@@ -361,8 +360,6 @@ def test_missing_root_transform_gets_enu_reconciliation(tmp_path: Path) -> None:
     identity = np.eye(4).T.ravel().tolist()
     expected = _expected_enu_root(identity)
     assert res.ecef_anchor == np.asarray(expected).reshape(4, 4).T.tolist()
-    out_tileset = json.loads(_read(out, "tileset.json"))
-    assert "transform" not in out_tileset["root"]
 
 
 def test_positions_stay_in_root_local_frame(tmp_path: Path) -> None:
@@ -390,7 +387,7 @@ def test_positions_stay_in_root_local_frame(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scene.json / tileset.json contents
+# scene.json contents
 # ---------------------------------------------------------------------------
 
 
@@ -399,12 +396,12 @@ def test_scene_json_schema(tmp_path: Path) -> None:
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
     scene = json.loads(_read(out, "scene.json"))
-    assert scene["schema"] == "splatsim.scene/v2"
+    assert scene["schema"] == "splatsim.scene/v3"
     assert scene["producer"]["source_tileset"] == "tileset.json"
     assert scene["world"]["frame_convention"] == FRAME_CONVENTION
     assert "ecef_anchor" in scene["world"]
     assert scene["gaussians"]["frame"] == "world"
-    assert scene["gaussians"]["tileset"] == "tileset.json"
+    assert scene["gaussians"]["chunk_format"] == "spz/ngsp-v4"
     assert scene["gaussians"]["sh_degree"] == 3
     assert scene["gaussians"]["n_gaussians"] > 0
     assert scene["extras"] == {
@@ -419,20 +416,22 @@ def test_scene_json_schema(tmp_path: Path) -> None:
     }
 
 
-def test_tileset_uses_ext_3dgs_spz(tmp_path: Path) -> None:
+def test_scene_json_chunk_index(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path)
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, options=SceneUsdzOptions(chunk_size=8.0))
-    out_ts = json.loads(_read(out, "tileset.json"))
-    assert out_ts["asset"]["tilesetVersion"] == "splatsim-spz/1.0"
-    assert "EXT_3dgs_spz" in out_ts["extensionsRequired"]
-    children = out_ts["root"]["children"]
-    assert children
-    for c in children:
-        assert c["content"]["uri"].startswith("chunks/chunk_")
-        ext = c["content"]["extensions"]["EXT_3dgs_spz"]
-        assert ext["format"] == "spz/1"
-        assert ext["n_points"] > 0
+    scene = json.loads(_read(out, "scene.json"))
+    chunks = scene["gaussians"]["chunks"]
+    assert chunks
+    assert sum(c["n_points"] for c in chunks) == scene["gaussians"]["n_gaussians"]
+    names = set(_names(out))
+    for c in chunks:
+        assert c["uri"].startswith("chunks/chunk_") and c["uri"].endswith(".spz")
+        assert c["uri"] in names
+        assert c["n_points"] > 0
+        bmin, bmax = c["bbox_min"], c["bbox_max"]
+        assert len(bmin) == 3 and len(bmax) == 3
+        assert all(lo <= hi for lo, hi in zip(bmin, bmax, strict=True))
 
 
 # ---------------------------------------------------------------------------
