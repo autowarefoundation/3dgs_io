@@ -47,7 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m 3dgs_io",
         description=(
-            "Pack a Cesium 3D Tiles tileset.json (+ optional sidecar files) "
+            "Pack a Cesium 3D Tiles tileset.json (+ optional extra files) "
             "into a single self-contained USDZ scene bundle. The source "
             "tileset's root.transform (world anchor) is preserved into the "
             "output."
@@ -123,7 +123,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exposure", type=float, default=1.6)
     p.add_argument("--near-plane", type=float, default=0.5)
     p.add_argument("--far-plane", type=float, default=300.0)
-    p.add_argument("--geometric-error", type=float, default=100.0)
 
     p.add_argument(
         "--uuid",
@@ -166,7 +165,6 @@ def _options_from_args(args: argparse.Namespace) -> SceneUsdzOptions:
         exposure=args.exposure,
         near_plane=args.near_plane,
         far_plane=args.far_plane,
-        geometric_error=args.geometric_error,
     )
 
 
