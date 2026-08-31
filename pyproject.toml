@@ -1,6 +1,6 @@
 [project]
 name = "3dgs-io"
-version = "2.0.0"
+version = "1.2.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
@@ -34,6 +34,12 @@ build-backend = "uv_build"
 
 [tool.uv.sources]
 spz = { git = "https://github.com/nianticlabs/spz.git", rev="v3.0.0"}
+
+# Force spz's CMake down the FetchContent path for zstd. Distro zstd CMake
+# configs (e.g. Ubuntu 24.04) expose a non-PIC libzstd.a that spz prefers,
+# which cannot be linked into the Python shared module.
+[tool.uv.extra-build-variables]
+spz = { CMAKE_ARGS = "-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE" }
 
 [dependency-groups]
 dev = [
