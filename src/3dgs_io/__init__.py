@@ -27,9 +27,13 @@ from .ext_attributes import (
     LIDAR_MASK_KEY,
     LIDAR_RAYDROP_KEY,
     RAYDROP_SH_KEY,
+    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR,
+    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
     ExtAttributeSpec,
-    decode_lidar_sidecar,
-    encode_lidar_sidecar,
+    decode_lidar_extension,
+    embed_lidar_extension,
+    encode_lidar_extension,
+    extract_lidar_extension,
     raydrop_sh_coefs,
     raydrop_sh_degree_from_coefs,
 )
@@ -70,7 +74,14 @@ from .scene_usdz import (
     SceneUsdzResult,
     save_scene_usdz,
 )
-from .spz_io import load_ply, load_spz, save_ply, save_spz
+from .spz_io import (
+    append_spz_extension,
+    load_ply,
+    load_spz,
+    read_spz_extensions,
+    save_ply,
+    save_spz,
+)
 from .tiles_export import TilesetSaveOptions, compute_bounding_volume, save_tileset
 from .tiles_io import (
     BoundingVolume,
@@ -97,8 +108,6 @@ from .usdz_metadata import (
     load_usdz_metadata,
     make_default_metadata,
 )
-from .usdz_tiles_export import export_usdz_tileset
-from .viewer import launch_viewer
 
 __all__ = [
     "BoundingVolume",
@@ -130,6 +139,8 @@ __all__ = [
     "LIDAR_MASK_KEY",
     "LIDAR_RAYDROP_KEY",
     "RAYDROP_SH_KEY",
+    "SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR",
+    "SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX",
     "ExtAttributeSpec",
     "GaussianCloud",
     "GlbMetadata",
@@ -154,13 +165,14 @@ __all__ = [
     "add_ppisp_to_usdz",
     "default_uuid",
     "encode_usdz_metadata",
-    "export_usdz_tileset",
     "load_usdz_metadata",
     "make_default_metadata",
     "set_usdz_metadata",
     "update_camera_intrinsics_in_usdz",
-    "decode_lidar_sidecar",
-    "encode_lidar_sidecar",
+    "decode_lidar_extension",
+    "embed_lidar_extension",
+    "encode_lidar_extension",
+    "extract_lidar_extension",
     "raydrop_sh_coefs",
     "raydrop_sh_degree_from_coefs",
     "load_rig_trajectories_doc",
@@ -181,10 +193,11 @@ __all__ = [
     "save_spz",
     "load_ply",
     "save_ply",
+    "append_spz_extension",
+    "read_spz_extensions",
     "Tile3DContent",
     "TilesetSaveOptions",
     "load_tileset",
     "merge_tileset",
     "save_tileset",
-    "launch_viewer",
 ]

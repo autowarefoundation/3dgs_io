@@ -44,4 +44,3 @@ Or with `uv <https://docs.astral.sh/uv/>`_:
    api/lidar_2dgs
    api/metadata
    api/usdz_metadata
-   api/viewer

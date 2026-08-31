@@ -6,21 +6,25 @@ Documentation: https://tier4.github.io/3dgs_io/
 
 ## Frame-explicit USDZ scenes
 
-Scene bundles use the breaking `splatsim.scene/v2`,
+Scene bundles use the breaking `splatsim.scene/v3`,
 `splatsim.rig_trajectories/v2`, and `splatsim.sequence_tracks/v2` schemas.
+Since `splatsim.scene/v3`:
+
+- Per-Gaussian LiDAR attributes (`EXT_gaussian_lidar`) are embedded inside
+  each `chunks/chunk_NNNNNN.spz` as an SPZ extension record (type
+  `0x54340001`) instead of `.lidar` sidecar files; chunks are NGSP v4 SPZ
+  (requires spz >= 3.0.0 to read).
+- Bundles contain no Cesium 3D Tiles structures. The chunk list lives in
+  `scene.json.gaussians.chunks` (`uri` / `n_points` / world-frame
+  `bbox_min`/`bbox_max`), and chunk SPZ values are stored directly in the
+  alpasim ENU world frame. The Cesium `tileset.json` format is accepted only
+  as *input* to `save_scene_usdz`; the Cesium tileset export
+  (`export_usdz_tileset`) and the bundled viewer were removed.
+
 Gaussians, rigs, and tracks share one right-handed Z-up ENU world frame;
 rigs use X-forward/Y-left/Z-up, quaternions are xyzw, and timestamps are
 strictly increasing u64 microseconds. Writers reject reflections, invalid
 rotations, and mismatched frame declarations.
-
-Export an embedded SPZ scene to a standalone Cesium 3D Tiles 1.1 tileset:
-
-```bash
-python -m 3dgs_io export-tiles scene.usdz output_tiles/
-```
-
-The API equivalent is `3dgs_io.export_usdz_tileset(...)`. Both paths retain
-the reconciled ECEF root anchor.
 
 ## USDZ scene-bundle manifest (`metadata.yaml`)
 
