@@ -15,6 +15,7 @@ import importlib
 import json
 import math
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +42,14 @@ load_actor_asset_dir = _mod.load_actor_asset_dir
 parse_actor_assets = _mod.parse_actor_assets
 rotate_sh_about_z = _mod.rotate_sh_about_z
 save_actor_asset_dir = _mod.save_actor_asset_dir
-save_gltf = _mod.save_gltf
 save_scene_usdz = _mod.save_scene_usdz
 serialize_actor_assets = _mod.serialize_actor_assets
 validate_instances_against_tracks = _mod.validate_instances_against_tracks
 
 CAR_SIZE = (4.5, 1.9, 1.5)
+
+#: The ``make_minimal_tileset_with_glb`` conftest fixture, as a callable.
+MakeTileset = Callable[[Path], Path]
 
 
 # ---------------------------------------------------------------------------
@@ -132,27 +135,6 @@ def _track(track_id: str = "100", size: tuple[float, float, float] = CAR_SIZE) -
     )
 
 
-def _make_tileset(tmp_path: Path) -> Path:
-    rng = np.random.default_rng(3)
-    cloud = _cloud(rng.uniform(-20.0, 20.0, size=(200, 3)), seed=3)
-    save_gltf(cloud, tmp_path / "model.glb")
-    doc = {
-        "asset": {"version": "1.1", "generator": "test"},
-        "geometricError": 100.0,
-        "root": {
-            "boundingVolume": {
-                "box": [0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0]
-            },
-            "geometricError": 0,
-            "refine": "ADD",
-            "content": {"uri": "model.glb"},
-        },
-    }
-    tp = tmp_path / "tileset.json"
-    tp.write_text(json.dumps(doc))
-    return tp
-
-
 def _asset(**overrides: object) -> ActorAsset:
     kwargs: dict = {
         "asset_id": "sedan_0007",
@@ -190,32 +172,31 @@ def test_uri_defaults_to_the_canonical_archive_path() -> None:
     assert _asset().uri == "actor_assets/sedan_0007/asset.spz"
 
 
-def test_parse_rejects_a_foreign_schema() -> None:
-    doc = serialize_actor_assets(ActorAssetBank(assets=[_asset()]))
-    doc["schema"] = "splatsim.actor_assets/v2"
-    with pytest.raises(ValueError, match="unexpected actor_assets schema"):
-        parse_actor_assets(doc)
-
-
-def test_parse_rejects_a_non_object_frame() -> None:
-    doc = serialize_actor_assets(ActorAssetBank(assets=[_asset()]))
-    doc["frame"] = "world"
-    with pytest.raises(ValueError, match="frame must be 'object'"):
-        parse_actor_assets(doc)
-
-
-def test_parse_rejects_a_different_object_frame_convention() -> None:
-    doc = serialize_actor_assets(ActorAssetBank(assets=[_asset()]))
-    doc["object_frame"] = {**doc["object_frame"], "forward": "+y"}
-    with pytest.raises(ValueError, match="unsupported object_frame"):
-        parse_actor_assets(doc)
-
-
-def test_parse_rejects_a_unit_normalised_bank() -> None:
-    """NuRec-style unit-scale assets must declare themselves, not slip through."""
-    doc = serialize_actor_assets(ActorAssetBank(assets=[_asset()]))
-    doc["object_frame"] = {**doc["object_frame"], "scale": "normalized"}
-    with pytest.raises(ValueError, match="unsupported object_frame"):
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        pytest.param(
+            {"schema": "splatsim.actor_assets/v2"},
+            "unexpected actor_assets schema",
+            id="foreign-schema",
+        ),
+        pytest.param({"frame": "world"}, "frame must be 'object'", id="world-frame"),
+        pytest.param(
+            {"object_frame": {**_actor.OBJECT_FRAME_CONVENTION, "forward": "+y"}},
+            "unsupported object_frame",
+            id="rotated-object-frame",
+        ),
+        # A NuRec-style unit-scale bank must declare itself, not slip through.
+        pytest.param(
+            {"object_frame": {**_actor.OBJECT_FRAME_CONVENTION, "scale": "normalized"}},
+            "unsupported object_frame",
+            id="unit-normalised",
+        ),
+    ],
+)
+def test_parse_rejects_a_foreign_contract(mutate: dict, match: str) -> None:
+    doc = serialize_actor_assets(ActorAssetBank(assets=[_asset()])) | mutate
+    with pytest.raises(ValueError, match=match):
         parse_actor_assets(doc)
 
 
@@ -230,35 +211,31 @@ def test_asset_id_must_be_a_safe_path_component(bad_id: str) -> None:
         _asset(asset_id=bad_id)
 
 
-def test_asset_rejects_an_unsupported_motion_model() -> None:
-    with pytest.raises(ValueError, match="unsupported motion model"):
-        _asset(motion="deformable")
-
-
-def test_asset_rejects_a_non_positive_size() -> None:
-    with pytest.raises(ValueError, match="size must be positive"):
-        _asset(size=(4.5, 0.0, 1.5))
-
-
-def test_asset_rejects_an_inverted_bbox() -> None:
-    with pytest.raises(ValueError, match="min .* above max"):
-        _asset(bbox_min=(1.0, -0.95, -0.75), bbox_max=(-1.0, 0.95, 0.75))
-
-
-def test_asset_rejects_gaussians_still_in_world_coordinates() -> None:
-    """The classic bug: the cloud was never brought into the object frame."""
-    with pytest.raises(ValueError, match="does not contain the object-local origin"):
-        _asset(bbox_min=(111.0, -59.0, 1.1), bbox_max=(116.0, -57.0, 2.6))
-
-
-def test_asset_rejects_a_hand_edited_uri() -> None:
-    with pytest.raises(ValueError, match="uri must be"):
-        _asset(uri="actor_assets/somewhere/else.spz")
-
-
-def test_asset_rejects_an_out_of_range_sh_degree() -> None:
-    with pytest.raises(ValueError, match="sh_degree must be in 0..3"):
-        _asset(sh_degree=4)
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        pytest.param({"motion": "deformable"}, "unsupported motion model", id="motion"),
+        pytest.param({"size": (4.5, 0.0, 1.5)}, "size must be positive", id="flat-size"),
+        pytest.param(
+            {"bbox_min": (1.0, -0.95, -0.75), "bbox_max": (-1.0, 0.95, 0.75)},
+            "min .* above max",
+            id="inverted-bbox",
+        ),
+        # The classic bug: the cloud was never brought into the object frame.
+        pytest.param(
+            {"bbox_min": (111.0, -59.0, 1.1), "bbox_max": (116.0, -57.0, 2.6)},
+            "does not contain the object-local origin",
+            id="world-coordinates",
+        ),
+        pytest.param(
+            {"uri": "actor_assets/somewhere/else.spz"}, "uri must be", id="hand-edited-uri"
+        ),
+        pytest.param({"sh_degree": 4}, "sh_degree must be in 0..3", id="sh-degree"),
+    ],
+)
+def test_asset_rejects_an_invalid_record(overrides: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        _asset(**overrides)
 
 
 def test_instance_rejects_an_unknown_fit_mode() -> None:
@@ -371,6 +348,20 @@ def test_decode_rejects_a_payload_that_disagrees_with_the_index() -> None:
         decode_actor_asset(asset, payload)
 
 
+def test_verify_rejects_a_payload_whose_sh_degree_disagrees() -> None:
+    asset, payload = encode_actor_asset(_source(n=40, sh_degree=3))
+    asset.sh_degree = 0
+    with pytest.raises(ValueError, match="index says 0"):
+        _actor.verify_actor_payload(asset, payload)
+
+
+def test_verify_rejects_an_undeclared_extension_record() -> None:
+    asset, payload = encode_actor_asset(_source(n=40, with_lidar=True))
+    asset.ext_attributes = None
+    with pytest.raises(ValueError, match="index does not declare"):
+        _actor.verify_actor_payload(asset, payload)
+
+
 def test_build_bank_rejects_duplicate_sources() -> None:
     with pytest.raises(ValueError, match="duplicate asset_id"):
         build_actor_asset_bank([_source(), _source()])
@@ -379,6 +370,27 @@ def test_build_bank_rejects_duplicate_sources() -> None:
 # ---------------------------------------------------------------------------
 # Standalone bank directories
 # ---------------------------------------------------------------------------
+
+
+def test_resolve_is_a_no_op_without_actor_arguments() -> None:
+    """Writers pass their kwargs straight through, including the absent case."""
+    bank, payloads = _actor.resolve_actor_asset_bank(None, None)
+    assert bank is None
+    assert payloads == {}
+
+
+def test_resolve_lets_explicit_instances_override_a_bank_directory(tmp_path: Path) -> None:
+    bank, payloads = build_actor_asset_bank(
+        [_source()], [ActorInstance(track_id="100", asset_id="sedan_0007")]
+    )
+    save_actor_asset_dir(tmp_path / "bank", bank, payloads)
+
+    resolved, resolved_payloads = _actor.resolve_actor_asset_bank(
+        tmp_path / "bank", [ActorInstance(track_id="200", asset_id="sedan_0007")]
+    )
+    assert resolved is not None
+    assert [i.track_id for i in resolved.instances] == ["200"]
+    assert resolved_payloads == payloads
 
 
 def test_bank_directory_round_trip(tmp_path: Path) -> None:
@@ -420,16 +432,22 @@ def _world_car(
     return _cloud(pts, seed=11, sh_degree=sh_degree), local, rot, t
 
 
-def test_extract_moves_the_box_centre_onto_the_object_origin() -> None:
-    cloud, local, rot, t = _world_car(37.0, (113.6, -58.5, 1.92))
-    source = extract_actor_asset(
+def _extract(cloud: spz.GaussianCloud, rot: Rotation, t: np.ndarray, **kwargs: object):
+    """`extract_actor_asset` with the boilerplate the tests never vary."""
+    kwargs.setdefault("size", CAR_SIZE)
+    return extract_actor_asset(
         cloud,
         asset_id="sedan_0007",
         class_name="automobile",
-        size=CAR_SIZE,
         translation=tuple(t),
         rotation=tuple(rot.as_quat()),
+        **kwargs,  # ty: ignore[missing-argument]
     )
+
+
+def test_extract_moves_the_box_centre_onto_the_object_origin() -> None:
+    cloud, local, rot, t = _world_car(37.0, (113.6, -58.5, 1.92))
+    source = _extract(cloud, rot, t)
     assert source.cloud.num_points == len(local)
     got = np.asarray(source.cloud.positions, dtype=np.float64).reshape(-1, 3)
     np.testing.assert_allclose(got, local, atol=1e-5)
@@ -440,14 +458,7 @@ def test_extract_moves_the_box_centre_onto_the_object_origin() -> None:
 
 def test_extract_reproduces_the_world_cloud_when_instanced_back() -> None:
     cloud, _local, rot, t = _world_car(-104.0, (5.0, -7.0, 0.8))
-    source = extract_actor_asset(
-        cloud,
-        asset_id="sedan_0007",
-        class_name="automobile",
-        size=CAR_SIZE,
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-    )
+    source = _extract(cloud, rot, t)
     n = source.cloud.num_points
     local = np.asarray(source.cloud.positions, dtype=np.float64).reshape(n, 3)
     world_again = rot.apply(local) + t
@@ -465,14 +476,7 @@ def test_extract_reproduces_the_world_cloud_when_instanced_back() -> None:
 
 def test_extract_leaves_appearance_parameters_untouched() -> None:
     cloud, local, rot, t = _world_car(0.0, (0.0, 0.0, 0.0))
-    source = extract_actor_asset(
-        cloud,
-        asset_id="sedan_0007",
-        class_name="automobile",
-        size=CAR_SIZE,
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-    )
+    source = _extract(cloud, rot, t)
     n = len(local)
     for name in ("colors", "scales", "alphas"):
         np.testing.assert_array_equal(
@@ -485,15 +489,7 @@ def test_extract_keeps_ext_attributes_aligned_with_their_gaussians() -> None:
     cloud, local, rot, t = _world_car(15.0, (2.0, 3.0, 0.7))
     total = cloud.num_points
     intensity = np.arange(total, dtype=np.float32)
-    source = extract_actor_asset(
-        cloud,
-        asset_id="sedan_0007",
-        class_name="automobile",
-        size=CAR_SIZE,
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-        ext_attrs={"lidar_intensity_raw": intensity},
-    )
+    source = _extract(cloud, rot, t, ext_attrs={"lidar_intensity_raw": intensity})
     # The car's gaussians are the first block of the cloud, so the selected
     # attribute values are exactly their indices.
     np.testing.assert_array_equal(
@@ -503,23 +499,8 @@ def test_extract_keeps_ext_attributes_aligned_with_their_gaussians() -> None:
 
 def test_extract_margin_widens_the_selection() -> None:
     cloud, local, rot, t = _world_car(0.0, (0.0, 0.0, 0.0))
-    tight = extract_actor_asset(
-        cloud,
-        asset_id="a",
-        class_name="automobile",
-        size=(1.0, 1.0, 1.0),
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-    )
-    wide = extract_actor_asset(
-        cloud,
-        asset_id="a",
-        class_name="automobile",
-        size=(1.0, 1.0, 1.0),
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-        margin=2.0,
-    )
+    tight = _extract(cloud, rot, t, size=(1.0, 1.0, 1.0))
+    wide = _extract(cloud, rot, t, size=(1.0, 1.0, 1.0), margin=2.0)
     assert wide.cloud.num_points > tight.cloud.num_points
     assert wide.cloud.num_points <= len(local)
 
@@ -527,14 +508,7 @@ def test_extract_margin_widens_the_selection() -> None:
 def test_extract_reports_an_empty_box() -> None:
     cloud, _local, rot, _t = _world_car(0.0, (0.0, 0.0, 0.0))
     with pytest.raises(ValueError, match="no gaussians inside the box"):
-        extract_actor_asset(
-            cloud,
-            asset_id="a",
-            class_name="automobile",
-            size=CAR_SIZE,
-            translation=(500.0, 500.0, 500.0),
-            rotation=tuple(rot.as_quat()),
-        )
+        _extract(cloud, rot, np.array([500.0, 500.0, 500.0]))
 
 
 # ---------------------------------------------------------------------------
@@ -603,14 +577,7 @@ def test_sh_z_rotation_is_exact(yaw_deg: float) -> None:
 def test_extract_rotates_sh_into_the_object_frame() -> None:
     yaw_deg = 41.0
     cloud, local, rot, t = _world_car(yaw_deg, (4.0, 1.0, 0.75), sh_degree=3)
-    source = extract_actor_asset(
-        cloud,
-        asset_id="sedan_0007",
-        class_name="automobile",
-        size=CAR_SIZE,
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-    )
+    source = _extract(cloud, rot, t)
     assert source.cloud.sh_degree == 3
     got = np.asarray(source.cloud.sh, dtype=np.float64).reshape(len(local), 15, 3)
     world = np.asarray(cloud.sh, dtype=np.float64).reshape(-1, 15, 3)[: len(local)]
@@ -626,45 +593,32 @@ def test_extract_rotates_sh_into_the_object_frame() -> None:
 
 def test_extract_can_drop_view_dependent_bands() -> None:
     cloud, _local, rot, t = _world_car(41.0, (4.0, 1.0, 0.75), sh_degree=3)
-    source = extract_actor_asset(
-        cloud,
-        asset_id="a",
-        class_name="automobile",
-        size=CAR_SIZE,
-        translation=tuple(t),
-        rotation=tuple(rot.as_quat()),
-        sh_policy="drop",
-    )
+    source = _extract(cloud, rot, t, sh_policy="drop")
     assert source.cloud.sh_degree == 0
     assert np.asarray(source.cloud.sh).size == 0
+
+
+def test_extract_can_keep_object_aligned_sh_verbatim() -> None:
+    """``keep`` is for callers whose SH is already in the object frame."""
+    cloud, local, rot, t = _world_car(41.0, (4.0, 1.0, 0.75), sh_degree=3)
+    source = _extract(cloud, rot, t, sh_policy="keep")
+    np.testing.assert_array_equal(
+        np.asarray(source.cloud.sh, dtype=np.float32).reshape(len(local), 15, 3),
+        np.asarray(cloud.sh, dtype=np.float32).reshape(-1, 15, 3)[: len(local)],
+    )
 
 
 def test_extract_refuses_to_fake_a_non_yaw_sh_rotation() -> None:
     cloud, _local, _rot, t = _world_car(0.0, (0.0, 0.0, 0.0), sh_degree=3)
     tilted = Rotation.from_euler("zyx", [0.3, 0.4, 0.0])
     with pytest.raises(ValueError, match="yaw-only SH rotation cannot express"):
-        extract_actor_asset(
-            cloud,
-            asset_id="a",
-            class_name="automobile",
-            size=(20.0, 20.0, 20.0),
-            translation=tuple(t),
-            rotation=tuple(tilted.as_quat()),
-        )
+        _extract(cloud, tilted, t, size=(20.0, 20.0, 20.0))
 
 
 def test_extract_rejects_an_unknown_sh_policy() -> None:
     cloud, _local, rot, t = _world_car(0.0, (0.0, 0.0, 0.0))
     with pytest.raises(ValueError, match="unknown sh_policy"):
-        extract_actor_asset(
-            cloud,
-            asset_id="a",
-            class_name="automobile",
-            size=CAR_SIZE,
-            translation=tuple(t),
-            rotation=tuple(rot.as_quat()),
-            sh_policy="spin",
-        )
+        _extract(cloud, rot, t, sh_policy="spin")
 
 
 # ---------------------------------------------------------------------------
@@ -672,8 +626,10 @@ def test_extract_rejects_an_unknown_sh_policy() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_scene_usdz_carries_the_bank_and_its_payloads(tmp_path: Path) -> None:
-    ts = _make_tileset(tmp_path)
+def test_scene_usdz_carries_the_bank_and_its_payloads(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
     result = save_scene_usdz(
         ts,
@@ -700,8 +656,10 @@ def test_scene_usdz_carries_the_bank_and_its_payloads(tmp_path: Path) -> None:
         assert sorted(ext) == ["lidar_intensity_raw", "lidar_raydrop_logit"]
 
 
-def test_scene_usdz_rejects_a_binding_without_its_track(tmp_path: Path) -> None:
-    ts = _make_tileset(tmp_path)
+def test_scene_usdz_rejects_a_binding_without_its_track(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
     with pytest.raises(ValueError, match="not among the bundle's sequence tracks"):
         save_scene_usdz(
             ts,
@@ -712,8 +670,10 @@ def test_scene_usdz_rejects_a_binding_without_its_track(tmp_path: Path) -> None:
         )
 
 
-def test_scene_usdz_reserves_the_actor_asset_paths(tmp_path: Path) -> None:
-    ts = _make_tileset(tmp_path)
+def test_scene_usdz_reserves_the_actor_asset_paths(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    ts = make_minimal_tileset_with_glb(tmp_path)
     junk = tmp_path / "junk.bin"
     junk.write_bytes(b"\x00")
     for key in ("actor_assets.json", "actor_assets/sedan_0007/asset.spz"):
@@ -721,14 +681,16 @@ def test_scene_usdz_reserves_the_actor_asset_paths(tmp_path: Path) -> None:
             save_scene_usdz(ts, tmp_path / "scene.usdz", extras={key: junk})
 
 
-def test_scene_usdz_accepts_a_bank_directory(tmp_path: Path) -> None:
+def test_scene_usdz_accepts_a_bank_directory(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
     bank, payloads = build_actor_asset_bank(
         [_source()], [ActorInstance(track_id="100", asset_id="sedan_0007")]
     )
     bank_dir = tmp_path / "bank"
     save_actor_asset_dir(bank_dir, bank, payloads)
 
-    ts = _make_tileset(tmp_path)
+    ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, tracks=[_track("100")], actor_assets=bank_dir)
     with zipfile.ZipFile(out) as zf:
@@ -741,15 +703,17 @@ def test_scene_usdz_accepts_a_bank_directory(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _bundle_with_tracks(tmp_path: Path) -> Path:
-    ts = _make_tileset(tmp_path)
+def _bundle_with_tracks(tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset) -> Path:
+    ts = make_minimal_tileset_with_glb(tmp_path)
     out = tmp_path / "scene.usdz"
     save_scene_usdz(ts, out, tracks=[_track("100")])
     return out
 
 
-def test_add_actor_assets_to_an_existing_bundle(tmp_path: Path) -> None:
-    src = _bundle_with_tracks(tmp_path)
+def test_add_actor_assets_to_an_existing_bundle(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    src = _bundle_with_tracks(tmp_path, make_minimal_tileset_with_glb)
     out = tmp_path / "scene_with_actors.usdz"
     result = add_actor_assets_to_usdz(
         src,
@@ -764,8 +728,10 @@ def test_add_actor_assets_to_an_existing_bundle(tmp_path: Path) -> None:
         assert "chunks/chunk_000000.spz" in zf.namelist()
 
 
-def test_replacing_a_bank_drops_the_payloads_it_no_longer_defines(tmp_path: Path) -> None:
-    src = _bundle_with_tracks(tmp_path)
+def test_replacing_a_bank_drops_the_payloads_it_no_longer_defines(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    src = _bundle_with_tracks(tmp_path, make_minimal_tileset_with_glb)
     first = tmp_path / "a.usdz"
     add_actor_assets_to_usdz(
         src,
@@ -787,8 +753,10 @@ def test_replacing_a_bank_drops_the_payloads_it_no_longer_defines(tmp_path: Path
     assert "actor_assets/sedan_0007/asset.spz" not in names
 
 
-def test_add_actor_assets_can_refuse_to_overwrite(tmp_path: Path) -> None:
-    src = _bundle_with_tracks(tmp_path)
+def test_add_actor_assets_can_refuse_to_overwrite(
+    tmp_path: Path, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    src = _bundle_with_tracks(tmp_path, make_minimal_tileset_with_glb)
     first = tmp_path / "a.usdz"
     add_actor_assets_to_usdz(
         src, first, [_source()], actor_instances=[ActorInstance("100", "sedan_0007")]
@@ -803,8 +771,10 @@ def test_add_actor_assets_can_refuse_to_overwrite(tmp_path: Path) -> None:
         )
 
 
-def test_edit_cli_actor_assets_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    src = _bundle_with_tracks(tmp_path)
+def test_edit_cli_actor_assets_subcommand(
+    tmp_path: Path, capsys: pytest.CaptureFixture, make_minimal_tileset_with_glb: MakeTileset
+) -> None:
+    src = _bundle_with_tracks(tmp_path, make_minimal_tileset_with_glb)
     bank, payloads = build_actor_asset_bank(
         [_source()], [ActorInstance(track_id="100", asset_id="sedan_0007")]
     )

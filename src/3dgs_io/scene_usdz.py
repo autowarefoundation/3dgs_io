@@ -63,17 +63,13 @@ from .actor_assets import (
     ActorAssetBank,
     ActorAssetSource,
     ActorInstance,
-    build_actor_asset_bank,
-    load_actor_asset_dir,
-    serialize_actor_assets,
+    encode_actor_assets_doc,
+    resolve_actor_asset_bank,
     validate_instances_against_tracks,
 )
 from .ext_attributes import (
-    EXT_GAUSSIAN_LIDAR_NAME,
-    RAYDROP_SH_KEY,
-    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
     embed_lidar_extension,
-    raydrop_sh_degree_from_coefs,
+    ext_attributes_index_block,
 )
 from .frame_convention import FRAME_CONVENTION, RUB_TO_ENU, validate_rigid_transform
 from .gltf_io import load_gltf_with_metadata
@@ -280,14 +276,6 @@ def _concat_clouds(clouds: list[spz.GaussianCloud]) -> spz.GaussianCloud:
     out.alphas = np.concatenate([np.array(c.alphas, dtype=np.float32) for c in clouds])
     out.sh = np.concatenate([np.array(c.sh, dtype=np.float32) for c in clouds])
     return out
-
-
-def _raydrop_sh_degree(ext: dict[str, np.ndarray]) -> int:
-    """SH degree implied by an ext dict's ``raydrop_sh`` array, or ``0`` if absent."""
-    sh = ext.get(RAYDROP_SH_KEY)
-    if sh is None:
-        return 0
-    return raydrop_sh_degree_from_coefs(int(np.asarray(sh).shape[1]))
 
 
 def _concat_ext_attrs(
@@ -671,16 +659,8 @@ def _compose_scene_json(
             ),
         },
     }
-    if arrays.ext_attrs:
-        ext_attributes_block: dict[str, Any] = {
-            "extension": EXT_GAUSSIAN_LIDAR_NAME,
-            "container": "spz_extension",
-            "spz_extension_type": SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
-            "attributes": sorted(arrays.ext_attrs.keys()),
-        }
-        sh_degree = _raydrop_sh_degree(arrays.ext_attrs)
-        if sh_degree > 0:
-            ext_attributes_block["raydrop_sh_degree"] = sh_degree
+    ext_attributes_block = ext_attributes_index_block(arrays.ext_attrs)
+    if ext_attributes_block is not None:
         gaussians["ext_attributes"] = ext_attributes_block
     return {
         "schema": _SCENE_SCHEMA,
@@ -800,16 +780,7 @@ def save_scene_usdz(
     root_matrix = source_root_matrix @ np.linalg.inv(source_to_world)
     validate_rigid_transform(root_matrix, where="tileset root.transform")
 
-    actor_bank: ActorAssetBank | None = None
-    actor_payloads: dict[str, bytes] | None = None
-    if isinstance(actor_assets, (str, Path)):
-        actor_bank, actor_payloads = load_actor_asset_dir(actor_assets)
-        if actor_instances is not None:
-            actor_bank = ActorAssetBank(assets=actor_bank.assets, instances=list(actor_instances))
-    elif actor_assets is not None or actor_instances is not None:
-        actor_bank, actor_payloads = build_actor_asset_bank(
-            list(actor_assets or []), list(actor_instances or [])
-        )
+    actor_bank, actor_payloads = resolve_actor_asset_bank(actor_assets, actor_instances)
 
     return _save_bundle(
         cloud=cloud,
@@ -881,58 +852,43 @@ def _save_bundle(
         raise ValueError(f"extras and extra_payloads both provide {sorted(dup)}")
     archive_paths |= {arc for arc, _ in payload_entries}
 
-    tracks_payload: bytes | None = None
+    # Optional sidecar documents. ``sequence_tracks.json`` / ``rig_trajectories.json``
+    # / ``ppisp.json`` are deliberately NOT reserved paths — a caller may supply
+    # them ready-made through ``extras`` instead — so passing both is ambiguous
+    # and rejected here. (``actor_assets.json`` IS reserved, so it needs no such
+    # check; ``_collect_extras_entries`` rejects it long before this point.)
+    sidecar_entries: list[tuple[str, bytes]] = []
+
+    def _add_sidecar(arc: str, kwarg: str, doc: dict[str, Any]) -> None:
+        if arc in archive_paths:
+            raise ValueError(
+                f"{kwarg}=... was passed but {arc!r} is also present in extras; pick one of the two"
+            )
+        sidecar_entries.append((arc, json.dumps(doc, indent=2).encode("utf-8")))
+        archive_paths.add(arc)
+
     if tracks is not None:
-        if "sequence_tracks.json" in archive_paths:
-            raise ValueError(
-                "tracks=... was passed but 'sequence_tracks.json' is also present in "
-                "extras; pick one of the two"
-            )
-        tracks_payload = json.dumps(serialize_tracks(tracks), indent=2).encode("utf-8")
-        archive_paths.add("sequence_tracks.json")
-
-    rig_trajectories_payload: bytes | None = None
+        _add_sidecar("sequence_tracks.json", "tracks", serialize_tracks(tracks))
     if rig_trajectories:
-        if "rig_trajectories.json" in archive_paths:
-            raise ValueError(
-                "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
-                "present in extras; pick one of the two"
-            )
-        rig_doc = serialize_rig_trajectories(rig_trajectories)
-        rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
-        archive_paths.add("rig_trajectories.json")
-
-    ppisp_payload: bytes | None = None
+        _add_sidecar(
+            "rig_trajectories.json",
+            "rig_trajectories",
+            serialize_rig_trajectories(rig_trajectories),
+        )
     if ppisp is not None:
-        if "ppisp.json" in archive_paths:
-            raise ValueError(
-                "ppisp=... was passed but 'ppisp.json' is also present in "
-                "extras; pick one of the two"
-            )
-        ppisp_payload = json.dumps(serialize_ppisp(ppisp), indent=2).encode("utf-8")
-        archive_paths.add("ppisp.json")
-
-    actor_entries: list[tuple[str, bytes]] = []
-    actor_doc_payload: bytes | None = None
+        _add_sidecar("ppisp.json", "ppisp", serialize_ppisp(ppisp))
     if actor_bank is not None:
-        if ACTOR_ASSETS_ARCHIVE_PATH in archive_paths:
-            raise ValueError(
-                f"actor_assets=... was passed but {ACTOR_ASSETS_ARCHIVE_PATH!r} is also "
-                "present in extras; pick one of the two"
-            )
         # Bindings are only meaningful against the tracks that ship with the
         # bundle, so resolve them here rather than leaving a dangling
         # track_id for the renderer to trip over.
         validate_instances_against_tracks(actor_bank, tracks or [])
-        payloads = dict(actor_payloads or {})
+        sidecar_entries.append((ACTOR_ASSETS_ARCHIVE_PATH, encode_actor_assets_doc(actor_bank)))
         for asset in actor_bank.assets:
-            payload = payloads.get(asset.asset_id)
+            payload = (actor_payloads or {}).get(asset.asset_id)
             if payload is None:
                 raise ValueError(f"no SPZ payload supplied for actor asset {asset.asset_id!r}")
-            actor_entries.append((str(asset.uri), payload))
-        actor_doc_payload = json.dumps(serialize_actor_assets(actor_bank), indent=2).encode("utf-8")
-        archive_paths.add(ACTOR_ASSETS_ARCHIVE_PATH)
-        archive_paths.update(arc for arc, _ in actor_entries)
+            sidecar_entries.append((str(asset.uri), payload))
+        archive_paths.update(arc for arc, _ in sidecar_entries)
 
     extras_meta = _detect_known_extras(archive_paths)
 
@@ -964,15 +920,7 @@ def _save_bundle(
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
             _zip_write_bytes(zf, USDZ_METADATA_ARCHIVE_PATH, metadata_payload)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
-            if tracks_payload is not None:
-                _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
-            if rig_trajectories_payload is not None:
-                _zip_write_bytes(zf, "rig_trajectories.json", rig_trajectories_payload)
-            if ppisp_payload is not None:
-                _zip_write_bytes(zf, "ppisp.json", ppisp_payload)
-            if actor_doc_payload is not None:
-                _zip_write_bytes(zf, ACTOR_ASSETS_ARCHIVE_PATH, actor_doc_payload)
-            for arc, payload in actor_entries:
+            for arc, payload in sidecar_entries:
                 _zip_write_bytes(zf, arc, payload)
             for entry, src, ext in zip(chunk_index, chunk_paths, chunk_ext, strict=True):
                 if ext:

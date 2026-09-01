@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
 import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -61,7 +60,7 @@ from .scene_usdz import (
     _concat_ext_attrs,
     _save_bundle,
 )
-from .spz_io import load_spz_world
+from .spz_io import load_spz_world_bytes
 from .tracks import Track, TrackFrame, parse_tracks
 from .usdz_metadata import (
     USDZ_METADATA_ARCHIVE_PATH,
@@ -131,11 +130,7 @@ class SceneBundle:
 
 def _load_chunk_cloud(zf: zipfile.ZipFile, name: str) -> tuple[spz.GaussianCloud, bytes]:
     data = zf.read(name)
-    with tempfile.NamedTemporaryFile(suffix=".spz") as tmp:
-        tmp.write(data)
-        tmp.flush()
-        cloud = load_spz_world(tmp.name)
-    return cloud, data
+    return load_spz_world_bytes(data), data
 
 
 def _load_chunks_v3(
@@ -404,6 +399,8 @@ def _merge_actor_banks(
             payload = bundle.actor_payloads[asset.asset_id]
             new_id = asset.asset_id
             if new_id in payloads and payloads[new_id] != payload:
+                # '_' not '/' as _merge_tracks uses: an asset_id is an archive
+                # path component and _ASSET_ID_RE forbids separators.
                 new_id = f"scene{scene_idx}_{asset.asset_id}"
                 suffix = 1
                 while new_id in payloads:

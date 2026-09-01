@@ -64,11 +64,16 @@ def _translate(x: float, y: float, z: float) -> np.ndarray:
     return m
 
 
-def _make_cloud(n: int, seed: int) -> spz.GaussianCloud:
+def _make_cloud(n: int, seed: int, *, extent: tuple[float, float, float] | None = None):
+    """A random cloud in a ±20 m cube, or inside ``extent`` when given."""
     rng = np.random.default_rng(seed)
     gc = spz.GaussianCloud()
     gc.antialiased = False
-    gc.positions = rng.uniform(-20.0, 20.0, size=n * 3).astype(np.float32)
+    if extent is None:
+        gc.positions = rng.uniform(-20.0, 20.0, size=n * 3).astype(np.float32)
+    else:
+        box = (rng.random((n, 3)) - 0.5) * np.array(extent)
+        gc.positions = box.astype(np.float32).reshape(-1)
     quats = rng.standard_normal((n, 4)).astype(np.float32)
     quats /= np.linalg.norm(quats, axis=1, keepdims=True)
     gc.rotations = quats.reshape(-1)
@@ -510,23 +515,11 @@ def test_cli_connects_two_bundles(tmp_path: Path, capsys: pytest.CaptureFixture[
 
 def _actor_source(asset_id: str, seed: int) -> ActorAssetSource:
     """A small car-shaped cloud already in the object-local frame."""
-    rng = np.random.default_rng(seed)
-    n = 60
-    gc = spz.GaussianCloud()
-    gc.antialiased = False
-    gc.positions = (
-        ((rng.random((n, 3)) - 0.5) * np.array([4.5, 1.9, 1.5])).astype(np.float32).reshape(-1)
-    )
-    quats = rng.standard_normal((n, 4))
-    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
-    gc.rotations = quats.astype(np.float32).reshape(-1)
-    gc.scales = rng.uniform(-3.0, 0.0, size=n * 3).astype(np.float32)
-    gc.alphas = rng.standard_normal(n).astype(np.float32)
-    gc.colors = rng.uniform(0.0, 1.0, size=n * 3).astype(np.float32)
-    gc.sh_degree = 0
-    gc.sh = np.zeros(0, dtype=np.float32)
     return ActorAssetSource(
-        asset_id=asset_id, cloud=gc, class_name="automobile", size=(4.5, 1.9, 1.5)
+        asset_id=asset_id,
+        cloud=_make_cloud(60, seed, extent=(4.5, 1.9, 1.5)),
+        class_name="automobile",
+        size=(4.5, 1.9, 1.5),
     )
 
 

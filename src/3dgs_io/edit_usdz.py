@@ -35,12 +35,10 @@ from typing import Any
 from .actor_assets import (
     ACTOR_ASSETS_ARCHIVE_PATH,
     ACTOR_ASSETS_PREFIX,
-    ActorAssetBank,
     ActorAssetSource,
     ActorInstance,
-    build_actor_asset_bank,
-    load_actor_asset_dir,
-    serialize_actor_assets,
+    encode_actor_assets_doc,
+    resolve_actor_asset_bank,
     validate_instances_against_tracks,
 )
 from .ppisp import Ppisp, parse_ppisp, serialize_ppisp
@@ -353,15 +351,8 @@ def add_actor_assets_to_usdz(
     if not input_usdz.is_file():
         raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
 
-    bank: ActorAssetBank
-    payloads: dict[str, bytes]
-    if isinstance(actor_assets, (str, Path)):
-        bank, payloads = load_actor_asset_dir(actor_assets)
-        if actor_instances is not None:
-            bank = ActorAssetBank(assets=bank.assets, instances=list(actor_instances))
-    else:
-        bank, payloads = build_actor_asset_bank(list(actor_assets), actor_instances)
-    if not bank.assets:
+    bank, payloads = resolve_actor_asset_bank(actor_assets, actor_instances)
+    if bank is None or not bank.assets:
         raise ValueError("actor_assets is empty; nothing to add")
 
     with zipfile.ZipFile(input_usdz, "r") as zin:
@@ -386,9 +377,7 @@ def add_actor_assets_to_usdz(
 
     entries: dict[str, bytes] = {
         "scene.json": scene_bytes,
-        ACTOR_ASSETS_ARCHIVE_PATH: (
-            json.dumps(serialize_actor_assets(bank), indent=2) + "\n"
-        ).encode("utf-8"),
+        ACTOR_ASSETS_ARCHIVE_PATH: encode_actor_assets_doc(bank),
     }
     for asset in bank.assets:
         entries[str(asset.uri)] = payloads[asset.asset_id]
@@ -597,13 +586,16 @@ def _repack_usdz(
 
     with zipfile.ZipFile(input_usdz, "r") as zin:
         names = zin.namelist()
-        replaced = sorted(n for n in entries_to_write if n in names)
-        added = sorted(n for n in entries_to_write if n not in names)
-        removed = sorted(
+        # Sets, not lists: a bank retrofit writes one entry per asset, so the
+        # membership tests below run over every archive entry.
+        existing = set(names)
+        replaced = sorted(n for n in entries_to_write if n in existing)
+        added = sorted(n for n in entries_to_write if n not in existing)
+        removed = {
             n
             for n in names
             if drop_prefixes and n not in entries_to_write and n.startswith(drop_prefixes)
-        )
+        }
 
         with tempfile.NamedTemporaryFile(
             "wb",
@@ -633,7 +625,7 @@ def _repack_usdz(
             tmp_path.unlink(missing_ok=True)
             raise
 
-    return added, replaced, removed
+    return added, replaced, sorted(removed)
 
 
 def _write_stored(zf: zipfile.ZipFile, name: str, content: bytes) -> None:

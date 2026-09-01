@@ -140,7 +140,6 @@ import json
 import logging
 import math
 import re
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -150,14 +149,17 @@ import spz
 from scipy.spatial.transform import Rotation
 
 from .ext_attributes import (
-    EXT_GAUSSIAN_LIDAR_NAME,
-    RAYDROP_SH_KEY,
-    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
+    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR,
     embed_lidar_extension,
+    ext_attributes_index_block,
     extract_lidar_extension,
-    raydrop_sh_degree_from_coefs,
 )
-from .spz_io import load_spz_world, save_spz_world
+from .spz_io import (
+    _parse_ngsp_header,
+    load_spz_world_bytes,
+    read_spz_extensions,
+    save_spz_world_bytes,
+)
 from .tracks import Track
 
 __all__ = [
@@ -172,7 +174,6 @@ __all__ = [
     "ActorAssetBank",
     "ActorAssetSource",
     "ActorInstance",
-    "asset_archive_uri",
     "build_actor_asset_bank",
     "decode_actor_asset",
     "encode_actor_asset",
@@ -181,9 +182,11 @@ __all__ = [
     "parse_actor_assets",
     "rotate_sh_about_z",
     "save_actor_asset_dir",
+    "encode_actor_assets_doc",
+    "resolve_actor_asset_bank",
     "serialize_actor_assets",
     "validate_instances_against_tracks",
-    "validate_object_frame",
+    "verify_actor_payload",
 ]
 
 _log = logging.getLogger(__name__)
@@ -242,7 +245,7 @@ _MAX_SH_DEGREE = 3
 _MAX_NON_YAW_RAD = math.radians(2.0)
 
 
-def validate_object_frame(value: Any) -> None:
+def _validate_object_frame(value: Any) -> None:
     """Reject documents whose object-frame contract differs from ours."""
     if value != OBJECT_FRAME_CONVENTION:
         raise ValueError(
@@ -251,7 +254,7 @@ def validate_object_frame(value: Any) -> None:
         )
 
 
-def asset_archive_uri(asset_id: str) -> str:
+def _asset_archive_uri(asset_id: str) -> str:
     """Archive path of ``asset_id``'s SPZ payload."""
     return f"{ACTOR_ASSETS_PREFIX}{asset_id}/asset.spz"
 
@@ -294,7 +297,7 @@ class ActorAsset:
     sh_degree: int = 0
     motion: str = "rigid"
     uri: str | None = None
-    """Archive path of the SPZ payload. Defaults to :func:`asset_archive_uri`."""
+    """Archive path of the SPZ payload. Always ``actor_assets/<asset_id>/asset.spz``."""
     ext_attributes: dict[str, Any] | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -334,7 +337,7 @@ class ActorAsset:
                 f"asset {self.asset_id!r}: sh_degree must be in 0..{_MAX_SH_DEGREE}, "
                 f"got {self.sh_degree}"
             )
-        expected_uri = asset_archive_uri(self.asset_id)
+        expected_uri = _asset_archive_uri(self.asset_id)
         if self.uri is None:
             self.uri = expected_uri
         elif self.uri != expected_uri:
@@ -495,6 +498,16 @@ def serialize_actor_assets(bank: ActorAssetBank) -> dict[str, Any]:
     }
 
 
+def encode_actor_assets_doc(bank: ActorAssetBank) -> bytes:
+    """Serialise a bank to the exact bytes written to ``actor_assets.json``.
+
+    Every writer goes through here so a bank packed into a bundle, retrofitted
+    onto one, or dumped to a directory is byte-identical — otherwise archives
+    that hold the same bank stop comparing equal.
+    """
+    return (json.dumps(serialize_actor_assets(bank), indent=2) + "\n").encode("utf-8")
+
+
 def parse_actor_assets(doc: dict[str, Any]) -> ActorAssetBank:
     """Inverse of :func:`serialize_actor_assets`."""
     schema = doc.get("schema")
@@ -504,7 +517,7 @@ def parse_actor_assets(doc: dict[str, Any]) -> ActorAssetBank:
         )
     if doc.get("frame") != _FRAME:
         raise ValueError(f"actor_assets frame must be {_FRAME!r}")
-    validate_object_frame(doc.get("object_frame"))
+    _validate_object_frame(doc.get("object_frame"))
     raw_assets = doc.get("assets")
     if not isinstance(raw_assets, list):
         raise ValueError("actor_assets document is missing the 'assets' list")
@@ -562,24 +575,6 @@ def _positions(cloud: spz.GaussianCloud) -> np.ndarray:
     return np.asarray(cloud.positions, dtype=np.float64).reshape(cloud.num_points, 3)
 
 
-def _ext_attributes_block(ext_attrs: dict[str, np.ndarray]) -> dict[str, Any] | None:
-    """The ``ext_attributes`` index block, shaped exactly like the background's."""
-    if not ext_attrs:
-        return None
-    block: dict[str, Any] = {
-        "extension": EXT_GAUSSIAN_LIDAR_NAME,
-        "container": "spz_extension",
-        "spz_extension_type": SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
-        "attributes": sorted(ext_attrs.keys()),
-    }
-    sh = ext_attrs.get(RAYDROP_SH_KEY)
-    if sh is not None:
-        degree = raydrop_sh_degree_from_coefs(int(np.asarray(sh).shape[1]))
-        if degree > 0:
-            block["raydrop_sh_degree"] = degree
-    return block
-
-
 def encode_actor_asset(source: ActorAssetSource) -> tuple[ActorAsset, bytes]:
     """Encode one source into its index record and its SPZ payload bytes.
 
@@ -596,24 +591,23 @@ def encode_actor_asset(source: ActorAssetSource) -> tuple[ActorAsset, bytes]:
                 f"asset {source.asset_id!r}: ext attribute {name!r} has "
                 f"{len(np.asarray(arr))} entries for {n} gaussians"
             )
+    # ``ActorAsset.__post_init__`` validates/normalises the vectors (with a
+    # message that names the asset), so pass them through raw.
     positions = _positions(cloud)
     asset = ActorAsset(
         asset_id=source.asset_id,
         class_name=source.class_name,
-        size=_as_vec3(source.size, where=f"asset {source.asset_id!r} size"),
-        bbox_min=_as_vec3(positions.min(axis=0), where="bbox_min"),
-        bbox_max=_as_vec3(positions.max(axis=0), where="bbox_max"),
+        size=source.size,
+        bbox_min=positions.min(axis=0),
+        bbox_max=positions.max(axis=0),
         n_points=n,
         sh_degree=int(cloud.sh_degree),
         motion=source.motion,
-        ext_attributes=_ext_attributes_block(source.ext_attrs),
+        ext_attributes=ext_attributes_index_block(source.ext_attrs),
         provenance=dict(source.provenance),
         metadata=dict(source.metadata),
     )
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "asset.spz"
-        save_spz_world(cloud, path)
-        payload = path.read_bytes()
+    payload = save_spz_world_bytes(cloud)
     if source.ext_attrs:
         payload = embed_lidar_extension(payload, source.ext_attrs, count=n)
     return asset, payload
@@ -628,13 +622,69 @@ def build_actor_asset_bank(
     payloads: dict[str, bytes] = {}
     for source in sources:
         asset, payload = encode_actor_asset(source)
-        if asset.asset_id in payloads:
-            raise ValueError(f"duplicate asset_id: {asset.asset_id!r}")
         assets.append(asset)
         payloads[asset.asset_id] = payload
     bank = ActorAssetBank(assets=assets, instances=list(instances or []))
-    _validate_bank(bank)
+    _validate_bank(bank)  # owns the duplicate-asset_id invariant
     return bank, payloads
+
+
+def verify_actor_payload(asset: ActorAsset, payload: bytes) -> None:
+    """Check an SPZ payload against the index record that names it.
+
+    Reads only the NGSP plaintext header and extension zone, so this stays
+    O(1) in the Gaussian count — the packing paths carry payloads through
+    byte-for-byte and must not pay a full decompress to sanity-check them.
+    """
+    _magic, _version, n_points, sh_degree, *_rest = _parse_ngsp_header(payload)
+    if n_points != asset.n_points:
+        raise ValueError(
+            f"asset {asset.asset_id!r}: payload has {n_points} points, index says {asset.n_points}"
+        )
+    if sh_degree != asset.sh_degree:
+        raise ValueError(
+            f"asset {asset.asset_id!r}: payload has sh_degree {sh_degree}, "
+            f"index says {asset.sh_degree}"
+        )
+    declares_ext = asset.ext_attributes is not None
+    has_ext = SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR in read_spz_extensions(payload)
+    if declares_ext and not has_ext:
+        raise ValueError(
+            f"asset {asset.asset_id!r}: index declares ext_attributes but the "
+            "SPZ payload carries no extension record"
+        )
+    if has_ext and not declares_ext:
+        raise ValueError(
+            f"asset {asset.asset_id!r}: SPZ payload carries an extension record "
+            "the index does not declare"
+        )
+
+
+def resolve_actor_asset_bank(
+    actor_assets: list[ActorAssetSource] | str | Path | None,
+    actor_instances: list[ActorInstance] | None = None,
+) -> tuple[ActorAssetBank | None, dict[str, bytes]]:
+    """Normalise the two ways a caller supplies a bank into ``(bank, payloads)``.
+
+    ``actor_assets`` is either a list of in-memory :class:`ActorAssetSource`
+    clouds to encode, or a standalone bank directory whose payloads are carried
+    through byte-for-byte. Explicit ``actor_instances`` always win: for a
+    directory they replace the bindings recorded there. Returns ``(None, {})``
+    when neither argument is given, so writers can pass their kwargs straight
+    in.
+
+    Both the build path (:func:`~3dgs_io.save_scene_usdz`) and the retrofit
+    path (:func:`~3dgs_io.add_actor_assets_to_usdz`) resolve through here so
+    the override rule has exactly one definition.
+    """
+    if isinstance(actor_assets, (str, Path)):
+        bank, payloads = load_actor_asset_dir(actor_assets)
+        if actor_instances is not None:
+            bank = ActorAssetBank(assets=bank.assets, instances=list(actor_instances))
+        return bank, payloads
+    if actor_assets is None and actor_instances is None:
+        return None, {}
+    return build_actor_asset_bank(list(actor_assets or []), list(actor_instances or []))
 
 
 def decode_actor_asset(
@@ -642,19 +692,12 @@ def decode_actor_asset(
     payload: bytes,
 ) -> tuple[spz.GaussianCloud, dict[str, np.ndarray]]:
     """Decode one asset payload into its cloud and per-Gaussian ext attributes."""
-    with tempfile.TemporaryDirectory() as td:
-        path = Path(td) / "asset.spz"
-        path.write_bytes(payload)
-        cloud = load_spz_world(path)
-    if cloud.num_points != asset.n_points:
-        raise ValueError(
-            f"asset {asset.asset_id!r}: payload has {cloud.num_points} points, "
-            f"index says {asset.n_points}"
-        )
+    verify_actor_payload(asset, payload)
+    cloud = load_spz_world_bytes(payload)
     ext: dict[str, np.ndarray] = {}
     if asset.ext_attributes is not None:
         decoded = extract_lidar_extension(payload)
-        if decoded is None:
+        if decoded is None:  # pragma: no cover - verify_actor_payload rejects this
             raise ValueError(
                 f"asset {asset.asset_id!r}: index declares ext_attributes but the "
                 "SPZ payload carries no extension record"
@@ -689,8 +732,10 @@ def load_actor_asset_dir(directory: str | Path) -> tuple[ActorAssetBank, dict[st
                 f"asset {asset.asset_id!r}: payload {asset.uri} missing from {directory}"
             )
         payload = payload_path.read_bytes()
-        # Cheap integrity gate: the index must describe the payload it names.
-        decode_actor_asset(asset, payload)
+        # Header-only gate: the index must describe the payload it names. The
+        # callers that pack a bank do so byte-for-byte, so decompressing every
+        # cloud here would be pure waste.
+        verify_actor_payload(asset, payload)
         payloads[asset.asset_id] = payload
     return bank, payloads
 
@@ -707,7 +752,7 @@ def save_actor_asset_dir(
         raise ValueError(f"no payload supplied for asset(s) {missing}")
     directory.mkdir(parents=True, exist_ok=True)
     doc_path = directory / ACTOR_ASSETS_ARCHIVE_PATH
-    doc_path.write_text(json.dumps(serialize_actor_assets(bank), indent=2) + "\n", encoding="utf-8")
+    doc_path.write_bytes(encode_actor_assets_doc(bank))
     for asset in bank.assets:
         payload_path = directory / str(asset.uri)
         payload_path.parent.mkdir(parents=True, exist_ok=True)
@@ -733,9 +778,11 @@ def rotate_sh_about_z(sh: np.ndarray, angle_rad: float) -> np.ndarray:
     coefficients evaluate at ``d`` to what the input evaluated at
     ``R_z(angle_rad) @ d``.
     """
-    src = np.asarray(sh, dtype=np.float64)
+    src = np.asarray(sh)
+    if math.sin(angle_rad) == 0.0 and math.cos(angle_rad) == 1.0:
+        return src  # identity yaw: nothing mixes, so don't copy the bands
+    out = src.astype(np.float64)
     coefs = int(src.shape[1])
-    out = src.copy()
     for degree in range(1, _MAX_SH_DEGREE + 1):
         base = degree * degree - 1  # coefficients of bands 1..degree-1
         if base + 2 * degree >= coefs:
@@ -802,32 +849,34 @@ def extract_actor_asset(
     if np.any(half <= 0.0):
         raise ValueError(f"asset {asset_id!r}: size must be positive, got {size}")
 
-    local = rot.inv().apply(_positions(cloud) - centre)
-    inside = np.all(np.abs(local) <= half, axis=1)
-    count = int(inside.sum())
-    if count == 0:
+    # A world cloud is tens of millions of gaussians and a car is a few
+    # thousand, so narrow with a cheap float32 sphere test before promoting
+    # anything: the exact oriented-box test then runs on the candidates only.
+    positions = np.asarray(cloud.positions, dtype=np.float32).reshape(n, 3)
+    radius = float(np.linalg.norm(half))
+    near = np.flatnonzero(np.all(np.abs(positions - centre.astype(np.float32)) <= radius, axis=1))
+    local = rot.inv().apply(positions[near].astype(np.float64) - centre)
+    keep = np.all(np.abs(local) <= half, axis=1)
+    inside = near[keep]
+    if inside.size == 0:
         raise ValueError(
             f"asset {asset_id!r}: no gaussians inside the box at {tuple(centre)} "
             f"(size {size}, margin {margin})"
         )
 
+    def _take(values: Any, width: int) -> np.ndarray:
+        """Select this asset's gaussians out of a parallel per-point array."""
+        return np.asarray(values, dtype=np.float32).reshape(n, width)[inside].reshape(-1)
+
     quats = np.asarray(cloud.rotations, dtype=np.float64).reshape(n, 4)[inside]
 
     out = spz.GaussianCloud()
     out.antialiased = cloud.antialiased
-    out.positions = np.ascontiguousarray(local[inside], dtype=np.float32).reshape(-1)
-    out.rotations = np.ascontiguousarray(
-        (rot.inv() * Rotation.from_quat(quats)).as_quat(), dtype=np.float32
-    ).reshape(-1)
-    out.scales = np.ascontiguousarray(
-        np.asarray(cloud.scales, dtype=np.float32).reshape(n, 3)[inside]
-    ).reshape(-1)
-    out.colors = np.ascontiguousarray(
-        np.asarray(cloud.colors, dtype=np.float32).reshape(n, 3)[inside]
-    ).reshape(-1)
-    out.alphas = np.ascontiguousarray(
-        np.asarray(cloud.alphas, dtype=np.float32).reshape(n)[inside]
-    ).reshape(-1)
+    out.positions = local[keep].astype(np.float32).reshape(-1)
+    out.rotations = (rot.inv() * Rotation.from_quat(quats)).as_quat().astype(np.float32).reshape(-1)
+    out.scales = _take(cloud.scales, 3)
+    out.colors = _take(cloud.colors, 3)
+    out.alphas = _take(cloud.alphas, 1)
 
     sh_flat = np.asarray(cloud.sh, dtype=np.float32)
     degree = int(cloud.sh_degree)
