@@ -34,6 +34,9 @@ load_scene_bundle = _mod.load_scene_bundle
 save_gltf = _mod.save_gltf
 save_scene_usdz = _mod.save_scene_usdz
 extract_lidar_extension = _mod.extract_lidar_extension
+ActorAssetSource = _mod.ActorAssetSource
+ActorInstance = _mod.ActorInstance
+parse_actor_assets = _mod.parse_actor_assets
 
 RUB_TO_ENU = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
 
@@ -97,6 +100,8 @@ def _make_scene_usdz(
     rig_id: str = "ego",
     tracks: list[Track] | None = None,
     map_osm: str | None = None,
+    actor_assets: list | None = None,
+    actor_instances: list | None = None,
 ) -> tuple[Path, np.ndarray]:
     """Build one scene USDZ; returns ``(path, expected_world_positions)``."""
     scene_dir = tmp_path / name
@@ -153,6 +158,8 @@ def _make_scene_usdz(
         extras=extras,
         rig_trajectories=rigs,
         tracks=tracks,
+        actor_assets=actor_assets,
+        actor_instances=actor_instances,
     )
     positions = np.array(cloud.positions, dtype=np.float64).reshape(n, 3)
     expected_world = positions @ RUB_TO_ENU.T
@@ -494,3 +501,160 @@ def test_cli_connects_two_bundles(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert out.exists()
     summary = json.loads(capsys.readouterr().out)
     assert summary["n_gaussians"] == 400
+
+
+# ---------------------------------------------------------------------------
+# Actor assets
+# ---------------------------------------------------------------------------
+
+
+def _actor_source(asset_id: str, seed: int) -> ActorAssetSource:
+    """A small car-shaped cloud already in the object-local frame."""
+    rng = np.random.default_rng(seed)
+    n = 60
+    gc = spz.GaussianCloud()
+    gc.antialiased = False
+    gc.positions = (
+        ((rng.random((n, 3)) - 0.5) * np.array([4.5, 1.9, 1.5])).astype(np.float32).reshape(-1)
+    )
+    quats = rng.standard_normal((n, 4))
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+    gc.rotations = quats.astype(np.float32).reshape(-1)
+    gc.scales = rng.uniform(-3.0, 0.0, size=n * 3).astype(np.float32)
+    gc.alphas = rng.standard_normal(n).astype(np.float32)
+    gc.colors = rng.uniform(0.0, 1.0, size=n * 3).astype(np.float32)
+    gc.sh_degree = 0
+    gc.sh = np.zeros(0, dtype=np.float32)
+    return ActorAssetSource(
+        asset_id=asset_id, cloud=gc, class_name="automobile", size=(4.5, 1.9, 1.5)
+    )
+
+
+def _actor_track(track_id: str) -> Track:
+    return Track(
+        track_id=track_id,
+        class_name="automobile",
+        size=(4.5, 1.9, 1.5),
+        frames=[
+            TrackFrame(timestamp_us=1_000, translation=(1.0, 0.0, 0.8), rotation=(0, 0, 0, 1)),
+            TrackFrame(timestamp_us=2_000, translation=(2.0, 0.0, 0.8), rotation=(0, 0, 0, 1)),
+        ],
+    )
+
+
+def _connected_bank(out: Path):
+    with zipfile.ZipFile(out) as zf:
+        return parse_actor_assets(json.loads(zf.read("actor_assets.json"))), zf.namelist()
+
+
+def test_connect_merges_actor_banks_from_every_input(tmp_path: Path) -> None:
+    """Without merging, only the reference bundle's actors would survive."""
+    anchor_a = _enu_anchor(_LAT0, _LON0, _H0)
+    anchor_b = anchor_a @ _translate(70.0, 10.0, 0.0)
+    usdz_a, _ = _make_scene_usdz(
+        tmp_path,
+        "a",
+        anchor_a,
+        seed=1,
+        tracks=[_actor_track("100")],
+        actor_assets=[_actor_source("sedan_0007", 1)],
+        actor_instances=[ActorInstance(track_id="100", asset_id="sedan_0007")],
+    )
+    usdz_b, _ = _make_scene_usdz(
+        tmp_path,
+        "b",
+        anchor_b,
+        seed=2,
+        tracks=[_actor_track("200")],
+        actor_assets=[_actor_source("truck_0001", 2)],
+        actor_instances=[ActorInstance(track_id="200", asset_id="truck_0001")],
+    )
+    out = tmp_path / "connected.usdz"
+    connect_scene_usdzs([usdz_a, usdz_b], out)
+
+    bank, names = _connected_bank(out)
+    assert sorted(a.asset_id for a in bank.assets) == ["sedan_0007", "truck_0001"]
+    assert "actor_assets/sedan_0007/asset.spz" in names
+    assert "actor_assets/truck_0001/asset.spz" in names
+    assert {i.track_id: i.asset_id for i in bank.instances} == {
+        "100": "sedan_0007",
+        "200": "truck_0001",
+    }
+
+
+def test_connect_namespaces_colliding_asset_ids_and_follows_track_renames(
+    tmp_path: Path,
+) -> None:
+    anchor_a = _enu_anchor(_LAT0, _LON0, _H0)
+    anchor_b = anchor_a @ _translate(70.0, 10.0, 0.0)
+    # Same ids on both sides, different payloads: both must survive, distinctly.
+    usdz_a, _ = _make_scene_usdz(
+        tmp_path,
+        "a",
+        anchor_a,
+        seed=1,
+        tracks=[_actor_track("100")],
+        actor_assets=[_actor_source("sedan_0007", 1)],
+        actor_instances=[ActorInstance(track_id="100", asset_id="sedan_0007")],
+    )
+    usdz_b, _ = _make_scene_usdz(
+        tmp_path,
+        "b",
+        anchor_b,
+        seed=2,
+        tracks=[_actor_track("100")],
+        actor_assets=[_actor_source("sedan_0007", 99)],
+        actor_instances=[ActorInstance(track_id="100", asset_id="sedan_0007")],
+    )
+    out = tmp_path / "connected.usdz"
+    connect_scene_usdzs([usdz_a, usdz_b], out)
+
+    bank, names = _connected_bank(out)
+    assert sorted(a.asset_id for a in bank.assets) == ["scene1_sedan_0007", "sedan_0007"]
+    assert "actor_assets/scene1_sedan_0007/asset.spz" in names
+    # Track "100" collided too and became "scene1/100"; its binding followed.
+    assert {i.track_id: i.asset_id for i in bank.instances} == {
+        "100": "sedan_0007",
+        "scene1/100": "scene1_sedan_0007",
+    }
+
+
+def test_connect_deduplicates_byte_identical_assets(tmp_path: Path) -> None:
+    anchor_a = _enu_anchor(_LAT0, _LON0, _H0)
+    anchor_b = anchor_a @ _translate(70.0, 10.0, 0.0)
+    shared = _actor_source("sedan_0007", 1)
+    usdz_a, _ = _make_scene_usdz(
+        tmp_path,
+        "a",
+        anchor_a,
+        seed=1,
+        tracks=[_actor_track("100")],
+        actor_assets=[shared],
+        actor_instances=[ActorInstance(track_id="100", asset_id="sedan_0007")],
+    )
+    usdz_b, _ = _make_scene_usdz(
+        tmp_path,
+        "b",
+        anchor_b,
+        seed=2,
+        tracks=[_actor_track("200")],
+        actor_assets=[_actor_source("sedan_0007", 1)],
+        actor_instances=[ActorInstance(track_id="200", asset_id="sedan_0007")],
+    )
+    out = tmp_path / "connected.usdz"
+    connect_scene_usdzs([usdz_a, usdz_b], out)
+
+    bank, _names = _connected_bank(out)
+    assert [a.asset_id for a in bank.assets] == ["sedan_0007"]
+    assert {i.track_id for i in bank.instances} == {"100", "200"}
+
+
+def test_connect_without_actors_writes_no_bank(tmp_path: Path) -> None:
+    anchor_a = _enu_anchor(_LAT0, _LON0, _H0)
+    anchor_b = anchor_a @ _translate(70.0, 10.0, 0.0)
+    usdz_a, _ = _make_scene_usdz(tmp_path, "a", anchor_a, seed=1)
+    usdz_b, _ = _make_scene_usdz(tmp_path, "b", anchor_b, seed=2)
+    out = tmp_path / "connected.usdz"
+    connect_scene_usdzs([usdz_a, usdz_b], out)
+    with zipfile.ZipFile(out) as zf:
+        assert "actor_assets.json" not in zf.namelist()

@@ -14,6 +14,16 @@ Subcommands
             --output   path/to/scene_with_map.usdz                     \\
             --lanelet2 path/to/map.osm
 
+``actor-assets``
+    Embed a rigid dynamic-object asset bank (``actor_assets.json`` plus
+    ``actor_assets/<asset_id>/asset.spz`` payloads) and record it under
+    ``scene.json.extras.actor_assets``::
+
+        python -m 3dgs_io.edit_usdz_cli actor-assets                   \\
+            --input        path/to/scene.usdz                          \\
+            --output       path/to/scene_with_actors.usdz              \\
+            --actor-assets path/to/actor_asset_bank_dir
+
 ``intrinsics``
     Rewrite a camera's intrinsics inside the ``rig_trajectories.json``
     embedded in the USDZ (splatsim schema on output)::
@@ -65,6 +75,7 @@ from typing import Any
 
 from .edit_usdz import (
     _result_summary,
+    add_actor_assets_to_usdz,
     add_clipgt_to_usdz,
     add_lanelet2_to_usdz,
     add_ppisp_to_usdz,
@@ -228,6 +239,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fail if the input archive already contains ppisp.json",
     )
 
+    actors = sub.add_parser(
+        "actor-assets",
+        help="Embed a rigid dynamic-object (actor) asset bank into the USDZ",
+        description=(
+            "Embed a splatsim.actor_assets/v1 bank directory as actor_assets.json "
+            "plus actor_assets/<asset_id>/asset.spz payloads, and record it in "
+            "scene.json.extras.actor_assets. Bindings are cross-checked against "
+            "the archive's sequence_tracks.json."
+        ),
+    )
+    _add_common_io_args(actors)
+    actors.add_argument(
+        "--actor-assets",
+        dest="actor_assets_dir",
+        type=Path,
+        required=True,
+        metavar="DIR",
+        help=(
+            "Path to a bank directory containing actor_assets.json and its "
+            "actor_assets/<asset_id>/asset.spz payloads."
+        ),
+    )
+    actors.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Fail if the input archive already contains actor_assets.json",
+    )
+
     intr = sub.add_parser(
         "intrinsics",
         help="Rewrite a camera's intrinsics inside the USDZ's rig_trajectories.json",
@@ -354,6 +393,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.input,
                 args.output,
                 args.ppisp_path,
+                overwrite=not args.no_overwrite,
+            )
+        except (FileNotFoundError, FileExistsError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    elif args.command == "actor-assets":
+        try:
+            result = add_actor_assets_to_usdz(
+                args.input,
+                args.output,
+                args.actor_assets_dir,
                 overwrite=not args.no_overwrite,
             )
         except (FileNotFoundError, FileExistsError, ValueError) as exc:

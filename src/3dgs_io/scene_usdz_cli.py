@@ -107,6 +107,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "ppisp.json in the output USDZ."
         ),
     )
+    p.add_argument(
+        "--actor-assets",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Path to a splatsim.actor_assets/v1 bank directory (an "
+            "actor_assets.json plus actor_assets/<asset_id>/asset.spz payloads) "
+            "describing rigid dynamic-object assets and their track bindings. "
+            "Embedded verbatim in the output USDZ."
+        ),
+    )
 
     p.add_argument("--chunk-size", type=float, default=50.0)
     p.add_argument("--max-points-per-chunk", type=int, default=200_000)
@@ -210,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         tracks=tracks,
         rig_trajectories=rig_trajectories,
         ppisp=ppisp,
+        actor_assets=args.actor_assets,
         metadata=metadata,
         options=_options_from_args(args),
     )
