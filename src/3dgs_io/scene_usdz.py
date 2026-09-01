@@ -14,6 +14,9 @@ Output USDZ layout (one ``ZIP_STORED`` archive, all entries uncompressed)::
                                  # directly in the alpasim ENU world frame;
                                  # per-Gaussian LiDAR attrs ride inside each SPZ
                                  # as an extension record (no sidecar files)
+    actor_assets.json            # splatsim.actor_assets/v1 rigid-actor bank
+                                 # (index + track bindings), optional
+    actor_assets/<id>/asset.spz  # one object-local SPZ per rigid actor asset
     <user-supplied extras>       # verbatim files / dirs at user-chosen paths
 
 The bundle itself contains no Cesium 3D Tiles structures; the Cesium
@@ -33,6 +36,7 @@ archive path                      scene.json key
 ``sequence_tracks.json``          ``extras.sequence_tracks``
 ``rig_trajectories.json``         ``extras.rig_trajectories``
 ``ppisp.json``                    ``extras.ppisp``
+``actor_assets.json``             ``extras.actor_assets``
 ================================  =================================
 """
 
@@ -53,12 +57,19 @@ import numpy as np
 import spz
 
 from ._geodesy import validate_anchor_against_lanelet2
+from .actor_assets import (
+    ACTOR_ASSETS_ARCHIVE_PATH,
+    ACTOR_ASSETS_PREFIX,
+    ActorAssetBank,
+    ActorAssetSource,
+    ActorInstance,
+    encode_actor_assets_doc,
+    resolve_actor_asset_bank,
+    validate_instances_against_tracks,
+)
 from .ext_attributes import (
-    EXT_GAUSSIAN_LIDAR_NAME,
-    RAYDROP_SH_KEY,
-    SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
     embed_lidar_extension,
-    raydrop_sh_degree_from_coefs,
+    ext_attributes_index_block,
 )
 from .frame_convention import FRAME_CONVENTION, RUB_TO_ENU, validate_rigid_transform
 from .gltf_io import load_gltf_with_metadata
@@ -88,8 +99,10 @@ _TOOL_VERSION = "0.1.0"
 _SCENE_SCHEMA = "splatsim.scene/v3"
 
 # Archive entries owned by the writer; user extras must not collide.
-_RESERVED_PATHS = frozenset({"default.usda", "scene.json", USDZ_METADATA_ARCHIVE_PATH})
-_RESERVED_PREFIXES: tuple[str, ...] = ("chunks/",)
+_RESERVED_PATHS = frozenset(
+    {"default.usda", "scene.json", USDZ_METADATA_ARCHIVE_PATH, ACTOR_ASSETS_ARCHIVE_PATH}
+)
+_RESERVED_PREFIXES: tuple[str, ...] = ("chunks/", ACTOR_ASSETS_PREFIX)
 
 _IDENTITY_16: tuple[float, ...] = (
     1.0,
@@ -133,6 +146,7 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "sequence_tracks.json": "sequence_tracks",
     "rig_trajectories.json": "rig_trajectories",
     "ppisp.json": "ppisp",
+    ACTOR_ASSETS_ARCHIVE_PATH: "actor_assets",
 }
 
 
@@ -171,6 +185,7 @@ class SceneUsdzResult:
     n_gaussians: int = 0
     sh_degree: int = 0
     n_chunks: int = 0
+    n_actor_assets: int = 0
     extras: dict[str, str | None] = field(default_factory=dict)
     ecef_anchor: list[list[float]] = field(default_factory=lambda: np.eye(4).tolist())
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -261,14 +276,6 @@ def _concat_clouds(clouds: list[spz.GaussianCloud]) -> spz.GaussianCloud:
     out.alphas = np.concatenate([np.array(c.alphas, dtype=np.float32) for c in clouds])
     out.sh = np.concatenate([np.array(c.sh, dtype=np.float32) for c in clouds])
     return out
-
-
-def _raydrop_sh_degree(ext: dict[str, np.ndarray]) -> int:
-    """SH degree implied by an ext dict's ``raydrop_sh`` array, or ``0`` if absent."""
-    sh = ext.get(RAYDROP_SH_KEY)
-    if sh is None:
-        return 0
-    return raydrop_sh_degree_from_coefs(int(np.asarray(sh).shape[1]))
 
 
 def _concat_ext_attrs(
@@ -652,16 +659,8 @@ def _compose_scene_json(
             ),
         },
     }
-    if arrays.ext_attrs:
-        ext_attributes_block: dict[str, Any] = {
-            "extension": EXT_GAUSSIAN_LIDAR_NAME,
-            "container": "spz_extension",
-            "spz_extension_type": SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
-            "attributes": sorted(arrays.ext_attrs.keys()),
-        }
-        sh_degree = _raydrop_sh_degree(arrays.ext_attrs)
-        if sh_degree > 0:
-            ext_attributes_block["raydrop_sh_degree"] = sh_degree
+    ext_attributes_block = ext_attributes_index_block(arrays.ext_attrs)
+    if ext_attributes_block is not None:
         gaussians["ext_attributes"] = ext_attributes_block
     return {
         "schema": _SCENE_SCHEMA,
@@ -698,6 +697,8 @@ def save_scene_usdz(
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
     ppisp: Ppisp | None = None,
+    actor_assets: list[ActorAssetSource] | str | Path | None = None,
+    actor_instances: list[ActorInstance] | None = None,
     metadata: UsdzMetadata | None = None,
     options: SceneUsdzOptions | None = None,
 ) -> SceneUsdzResult:
@@ -742,6 +743,24 @@ def save_scene_usdz(
         ``scene.json.extras.ppisp``. Cameras are keyed by name (matching
         ``rig_trajectories.json`` cameras) and frames by ``timestamp_us``
         (matching rig poses).
+    actor_assets:
+        Optional rigid dynamic-object assets — either a list of
+        :class:`~3dgs_io.ActorAssetSource` clouds or a standalone asset-bank
+        directory (see :func:`~3dgs_io.load_actor_asset_dir`, whose payloads
+        are packed byte-for-byte). Each asset is authored in the canonical
+        object-local frame (``+x`` forward, ``+y`` left, ``+z`` up, origin at
+        the box centre, metric scale) and is written as
+        ``actor_assets/<asset_id>/asset.spz`` — the same NGSP v4 SPZ container
+        the background chunks use, carrying the same optional per-Gaussian
+        LiDAR extension record — and indexed in ``actor_assets.json``
+        (schema ``splatsim.actor_assets/v1``), recorded under
+        ``scene.json.extras.actor_assets``.
+    actor_instances:
+        Optional list of :class:`~3dgs_io.ActorInstance` bindings saying which
+        track is rendered with which asset (and with what ``fit_mode``). Every
+        bound ``track_id`` must exist in ``tracks``; one asset may back many
+        tracks. For a bank directory these override the bindings recorded
+        there when given.
     metadata:
         Identity card written to ``metadata.yaml`` at the archive root
         (``uuid`` / ``scene_id`` / ``version_string``). When ``None`` a
@@ -761,6 +780,8 @@ def save_scene_usdz(
     root_matrix = source_root_matrix @ np.linalg.inv(source_to_world)
     validate_rigid_transform(root_matrix, where="tileset root.transform")
 
+    actor_bank, actor_payloads = resolve_actor_asset_bank(actor_assets, actor_instances)
+
     return _save_bundle(
         cloud=cloud,
         ext_attrs=source_ext_attrs,
@@ -773,6 +794,8 @@ def save_scene_usdz(
         tracks=tracks,
         rig_trajectories=rig_trajectories,
         ppisp=ppisp,
+        actor_bank=actor_bank,
+        actor_payloads=actor_payloads,
     )
 
 
@@ -790,6 +813,8 @@ def _save_bundle(
     tracks: list[Track] | None = None,
     rig_trajectories: list[RigTrajectory] | None = None,
     ppisp: Ppisp | None = None,
+    actor_bank: ActorAssetBank | None = None,
+    actor_payloads: Mapping[str, bytes] | None = None,
 ) -> SceneUsdzResult:
     """Core bundle writer shared by the tileset path and the scene-connect path.
 
@@ -797,6 +822,10 @@ def _save_bundle(
     by ``ecef_anchor``. ``extra_payloads`` carries in-memory archive entries
     (``(archive_path, bytes)``) written verbatim — used by connect to carry
     extras straight from an input bundle without touching the filesystem.
+
+    ``actor_bank`` / ``actor_payloads`` arrive pre-encoded (``{asset_id: spz
+    bytes}``) so connect can carry actor assets through byte-for-byte instead
+    of re-quantising them on every merge.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -823,36 +852,43 @@ def _save_bundle(
         raise ValueError(f"extras and extra_payloads both provide {sorted(dup)}")
     archive_paths |= {arc for arc, _ in payload_entries}
 
-    tracks_payload: bytes | None = None
+    # Optional sidecar documents. ``sequence_tracks.json`` / ``rig_trajectories.json``
+    # / ``ppisp.json`` are deliberately NOT reserved paths — a caller may supply
+    # them ready-made through ``extras`` instead — so passing both is ambiguous
+    # and rejected here. (``actor_assets.json`` IS reserved, so it needs no such
+    # check; ``_collect_extras_entries`` rejects it long before this point.)
+    sidecar_entries: list[tuple[str, bytes]] = []
+
+    def _add_sidecar(arc: str, kwarg: str, doc: dict[str, Any]) -> None:
+        if arc in archive_paths:
+            raise ValueError(
+                f"{kwarg}=... was passed but {arc!r} is also present in extras; pick one of the two"
+            )
+        sidecar_entries.append((arc, json.dumps(doc, indent=2).encode("utf-8")))
+        archive_paths.add(arc)
+
     if tracks is not None:
-        if "sequence_tracks.json" in archive_paths:
-            raise ValueError(
-                "tracks=... was passed but 'sequence_tracks.json' is also present in "
-                "extras; pick one of the two"
-            )
-        tracks_payload = json.dumps(serialize_tracks(tracks), indent=2).encode("utf-8")
-        archive_paths.add("sequence_tracks.json")
-
-    rig_trajectories_payload: bytes | None = None
+        _add_sidecar("sequence_tracks.json", "tracks", serialize_tracks(tracks))
     if rig_trajectories:
-        if "rig_trajectories.json" in archive_paths:
-            raise ValueError(
-                "rig_trajectories=... was passed but 'rig_trajectories.json' is also "
-                "present in extras; pick one of the two"
-            )
-        rig_doc = serialize_rig_trajectories(rig_trajectories)
-        rig_trajectories_payload = json.dumps(rig_doc, indent=2).encode("utf-8")
-        archive_paths.add("rig_trajectories.json")
-
-    ppisp_payload: bytes | None = None
+        _add_sidecar(
+            "rig_trajectories.json",
+            "rig_trajectories",
+            serialize_rig_trajectories(rig_trajectories),
+        )
     if ppisp is not None:
-        if "ppisp.json" in archive_paths:
-            raise ValueError(
-                "ppisp=... was passed but 'ppisp.json' is also present in "
-                "extras; pick one of the two"
-            )
-        ppisp_payload = json.dumps(serialize_ppisp(ppisp), indent=2).encode("utf-8")
-        archive_paths.add("ppisp.json")
+        _add_sidecar("ppisp.json", "ppisp", serialize_ppisp(ppisp))
+    if actor_bank is not None:
+        # Bindings are only meaningful against the tracks that ship with the
+        # bundle, so resolve them here rather than leaving a dangling
+        # track_id for the renderer to trip over.
+        validate_instances_against_tracks(actor_bank, tracks or [])
+        sidecar_entries.append((ACTOR_ASSETS_ARCHIVE_PATH, encode_actor_assets_doc(actor_bank)))
+        for asset in actor_bank.assets:
+            payload = (actor_payloads or {}).get(asset.asset_id)
+            if payload is None:
+                raise ValueError(f"no SPZ payload supplied for actor asset {asset.asset_id!r}")
+            sidecar_entries.append((str(asset.uri), payload))
+        archive_paths.update(arc for arc, _ in sidecar_entries)
 
     extras_meta = _detect_known_extras(archive_paths)
 
@@ -884,12 +920,8 @@ def _save_bundle(
             _zip_write_str(zf, "default.usda", _DEFAULT_USDA)
             _zip_write_bytes(zf, USDZ_METADATA_ARCHIVE_PATH, metadata_payload)
             _zip_write_str(zf, "scene.json", json.dumps(scene_doc, indent=2))
-            if tracks_payload is not None:
-                _zip_write_bytes(zf, "sequence_tracks.json", tracks_payload)
-            if rig_trajectories_payload is not None:
-                _zip_write_bytes(zf, "rig_trajectories.json", rig_trajectories_payload)
-            if ppisp_payload is not None:
-                _zip_write_bytes(zf, "ppisp.json", ppisp_payload)
+            for arc, payload in sidecar_entries:
+                _zip_write_bytes(zf, arc, payload)
             for entry, src, ext in zip(chunk_index, chunk_paths, chunk_ext, strict=True):
                 if ext:
                     # Splice the LiDAR extension in memory on the way into the
@@ -911,6 +943,7 @@ def _save_bundle(
         n_gaussians=arrays.n,
         sh_degree=arrays.sh_degree,
         n_chunks=len(sub_clouds),
+        n_actor_assets=len(actor_bank.assets) if actor_bank is not None else 0,
         extras=extras_meta,
         ecef_anchor=ecef_anchor,
         metadata=metadata.to_dict(),

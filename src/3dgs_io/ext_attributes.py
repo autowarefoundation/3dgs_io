@@ -102,6 +102,7 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -132,6 +133,33 @@ _LIDAR_PAYLOAD_HEADER_FMT = "<4sIII"  # magic, version, count, channels
 _LIDAR_PAYLOAD_HEADER_SIZE = struct.calcsize(_LIDAR_PAYLOAD_HEADER_FMT)
 _LIDAR_PAYLOAD_SH_HEADER_FMT = "<II"  # raydrop_sh_degree, raydrop_sh_coefs (=(deg+1)^2-1)
 _LIDAR_PAYLOAD_SH_HEADER_SIZE = struct.calcsize(_LIDAR_PAYLOAD_SH_HEADER_FMT)
+
+
+def ext_attributes_index_block(ext_attrs: dict[str, np.ndarray]) -> dict[str, Any] | None:
+    """The index entry describing a payload's per-Gaussian extension record.
+
+    One writer for a wire-format contract with two homes: background chunks
+    publish it as ``scene.json.gaussians.ext_attributes`` and rigid actor
+    assets as ``actor_assets.json.assets[].ext_attributes``. Consumers are
+    documented to parse both with the same code, so both must be built here.
+
+    Returns ``None`` when there are no ext attributes (no record is embedded,
+    so no index entry is written).
+    """
+    if not ext_attrs:
+        return None
+    block: dict[str, Any] = {
+        "extension": EXT_GAUSSIAN_LIDAR_NAME,
+        "container": "spz_extension",
+        "spz_extension_type": SPZ_EXT_TYPE_TIER4_GAUSSIAN_LIDAR_HEX,
+        "attributes": sorted(ext_attrs.keys()),
+    }
+    sh = ext_attrs.get(RAYDROP_SH_KEY)
+    if sh is not None:
+        degree = raydrop_sh_degree_from_coefs(int(np.asarray(sh).shape[1]))
+        if degree > 0:
+            block["raydrop_sh_degree"] = degree
+    return block
 
 
 def raydrop_sh_coefs(degree: int) -> int:
