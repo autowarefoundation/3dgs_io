@@ -7,6 +7,9 @@ Supports:
   ``scene.json.extras.map_lanelet2``.
 * :func:`add_ppisp_to_usdz` — embed PPISP appearance-correction parameters
   as ``ppisp.json`` and record it in ``scene.json.extras.ppisp``.
+* :func:`add_actor_assets_to_usdz` — embed a rigid dynamic-object asset bank
+  (``actor_assets.json`` plus ``actor_assets/<asset_id>/asset.spz``) and record
+  it in ``scene.json.extras.actor_assets``.
 * :func:`update_camera_intrinsics_in_usdz` — rewrite a camera's intrinsics
   inside the ``rig_trajectories.json`` embedded in the USDZ.
 * :func:`set_usdz_metadata` — write (or overwrite) ``metadata.yaml`` at the
@@ -30,6 +33,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .actor_assets import (
+    ACTOR_ASSETS_ARCHIVE_PATH,
+    ACTOR_ASSETS_PREFIX,
+    ActorAssetSource,
+    ActorInstance,
+    encode_actor_assets_doc,
+    resolve_actor_asset_bank,
+    validate_instances_against_tracks,
+)
 from .ppisp import Ppisp, parse_ppisp, serialize_ppisp
 from .rig_trajectories import (
     load_rig_trajectories_doc,
@@ -44,6 +56,7 @@ from .scene_usdz import (
     AUTOWARE_POINTCLOUD_PATH,
     autoware_map_extras,
 )
+from .tracks import parse_tracks
 from .usdz_metadata import (
     USDZ_METADATA_ARCHIVE_PATH,
     UsdzMetadata,
@@ -56,6 +69,7 @@ __all__ = [
     "EditUsdzResult",
     "IntrinsicsEditResult",
     "MetadataEditResult",
+    "add_actor_assets_to_usdz",
     "add_autoware_map_to_usdz",
     "add_clipgt_to_usdz",
     "add_lanelet2_to_usdz",
@@ -73,6 +87,8 @@ _RIG_TRAJECTORIES_ARCHIVE_PATH = "rig_trajectories.json"
 _CLIPGT_ARCHIVE_PREFIX = "clipgt/"
 _PPISP_ARCHIVE_PATH = "ppisp.json"
 _PPISP_SCENE_KEY = "ppisp"
+_ACTOR_ASSETS_SCENE_KEY = "actor_assets"
+_SEQUENCE_TRACKS_ARCHIVE_PATH = "sequence_tracks.json"
 
 
 @dataclass
@@ -82,6 +98,7 @@ class EditUsdzResult:
     out_path: Path
     added: list[str] = field(default_factory=list)
     replaced: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -159,7 +176,7 @@ def add_lanelet2_to_usdz(
             zin.read("scene.json"), _LANELET2_SCENE_KEY, _LANELET2_ARCHIVE_PATH
         )
 
-    added, replaced = _repack_usdz(
+    added, replaced, _removed = _repack_usdz(
         input_usdz,
         output_usdz,
         entries_to_write={
@@ -218,7 +235,7 @@ def add_clipgt_to_usdz(
                 f"{input_usdz} already has clipgt/ entries; pass overwrite=True to replace"
             )
 
-    added, replaced = _repack_usdz(
+    added, replaced, _removed = _repack_usdz(
         input_usdz,
         output_usdz,
         entries_to_write=entries_to_write,
@@ -422,7 +439,7 @@ def add_ppisp_to_usdz(
             zin.read("scene.json"), _PPISP_SCENE_KEY, _PPISP_ARCHIVE_PATH
         )
 
-    added, replaced = _repack_usdz(
+    added, replaced, _removed = _repack_usdz(
         input_usdz,
         output_usdz,
         entries_to_write={
@@ -433,6 +450,91 @@ def add_ppisp_to_usdz(
     # scene.json is always a pre-existing replacement, not a user-facing edit.
     replaced = [n for n in replaced if n != "scene.json"]
     return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
+
+
+def add_actor_assets_to_usdz(
+    input_usdz: str | Path,
+    output_usdz: str | Path,
+    actor_assets: str | Path | list[ActorAssetSource],
+    *,
+    actor_instances: list[ActorInstance] | None = None,
+    overwrite: bool = True,
+) -> EditUsdzResult:
+    """Add (or replace) the rigid dynamic-object asset bank of an existing USDZ.
+
+    Most bundles are built before their actors are harvested, so retrofitting a
+    bank is the normal path rather than the exception. The bank is written as
+    ``actor_assets.json`` plus one ``actor_assets/<asset_id>/asset.spz`` per
+    asset, and ``scene.json.extras.actor_assets`` is set. Gaussian chunks are
+    never touched.
+
+    Parameters
+    ----------
+    input_usdz:
+        An existing ``.usdz`` produced by :func:`3dgs_io.save_scene_usdz`.
+    output_usdz:
+        Destination ``.usdz``. May equal ``input_usdz`` for an atomic in-place
+        edit.
+    actor_assets:
+        Either a standalone asset-bank directory (see
+        :func:`3dgs_io.load_actor_asset_dir`) whose payloads are carried
+        through byte-for-byte, or a list of in-memory
+        :class:`~3dgs_io.ActorAssetSource` clouds to encode.
+    actor_instances:
+        Track bindings. Required for a source list; for a bank directory it
+        overrides the bindings recorded there when given. Every bound
+        ``track_id`` must exist in the archive's ``sequence_tracks.json``.
+    overwrite:
+        When ``True`` (default), replace an existing bank — payloads of assets
+        the new bank does not define are dropped. When ``False``, raise
+        :class:`FileExistsError` if the archive already carries one.
+    """
+    input_usdz = Path(input_usdz).expanduser()
+    output_usdz = Path(output_usdz).expanduser()
+
+    if not input_usdz.is_file():
+        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
+
+    bank, payloads = resolve_actor_asset_bank(actor_assets, actor_instances)
+    if bank is None or not bank.assets:
+        raise ValueError("actor_assets is empty; nothing to add")
+
+    with zipfile.ZipFile(input_usdz, "r") as zin:
+        names = zin.namelist()
+        if "scene.json" not in names:
+            raise ValueError(f"{input_usdz} is not a splatsim scene USDZ (missing scene.json)")
+        if ACTOR_ASSETS_ARCHIVE_PATH in names and not overwrite:
+            raise FileExistsError(
+                f"{input_usdz} already contains {ACTOR_ASSETS_ARCHIVE_PATH!r}; "
+                "pass overwrite=True to replace"
+            )
+        tracks = (
+            parse_tracks(json.loads(zin.read(_SEQUENCE_TRACKS_ARCHIVE_PATH)))
+            if _SEQUENCE_TRACKS_ARCHIVE_PATH in names
+            else []
+        )
+        scene_bytes = _rewrite_scene_extras(
+            zin.read("scene.json"), _ACTOR_ASSETS_SCENE_KEY, ACTOR_ASSETS_ARCHIVE_PATH
+        )
+
+    validate_instances_against_tracks(bank, tracks)
+
+    entries: dict[str, bytes] = {
+        "scene.json": scene_bytes,
+        ACTOR_ASSETS_ARCHIVE_PATH: encode_actor_assets_doc(bank),
+    }
+    for asset in bank.assets:
+        entries[str(asset.uri)] = payloads[asset.asset_id]
+
+    added, replaced, removed = _repack_usdz(
+        input_usdz,
+        output_usdz,
+        entries_to_write=entries,
+        drop_prefixes=(ACTOR_ASSETS_PREFIX,),
+    )
+    # scene.json is always a pre-existing replacement, not a user-facing edit.
+    replaced = [n for n in replaced if n != "scene.json"]
+    return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced, removed=removed)
 
 
 def update_camera_intrinsics_in_usdz(
@@ -492,7 +594,7 @@ def update_camera_intrinsics_in_usdz(
     new_rig_doc = serialize_rig_trajectories(rigs)
     new_rig_bytes = (json.dumps(new_rig_doc, indent=2) + "\n").encode("utf-8")
 
-    _added, replaced = _repack_usdz(
+    _added, replaced, _removed = _repack_usdz(
         input_usdz,
         output_usdz,
         entries_to_write={_RIG_TRAJECTORIES_ARCHIVE_PATH: new_rig_bytes},
@@ -578,7 +680,7 @@ def set_usdz_metadata(
     )
     payload = encode_usdz_metadata(new_metadata)
 
-    added, replaced = _repack_usdz(
+    added, replaced, _removed = _repack_usdz(
         input_usdz,
         output_usdz,
         entries_to_write={USDZ_METADATA_ARCHIVE_PATH: payload},
@@ -657,7 +759,9 @@ def _embed_map_with_extras(
         scene_bytes = _rewrite_scene_extras_multi(zin.read("scene.json"), scene_updates)
 
     entries_to_write["scene.json"] = scene_bytes
-    added, replaced = _repack_usdz(input_usdz, output_usdz, entries_to_write=entries_to_write)
+    added, replaced, _removed = _repack_usdz(
+        input_usdz, output_usdz, entries_to_write=entries_to_write
+    )
     replaced = [n for n in replaced if n != "scene.json"]
     return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
 
@@ -667,13 +771,17 @@ def _repack_usdz(
     output_usdz: Path,
     *,
     entries_to_write: dict[str, bytes | Path],
-) -> tuple[list[str], list[str]]:
+    drop_prefixes: tuple[str, ...] = (),
+) -> tuple[list[str], list[str], list[str]]:
     """Copy ``input_usdz`` to ``output_usdz`` replacing/appending given entries.
 
     Original entry order is preserved, entries in ``entries_to_write`` that
     already exist are replaced in place, and new entries are appended after
     the copied ones. Values may be ``bytes`` (written in memory) or a
-    :class:`~pathlib.Path` (streamed from disk). Every entry is written
+    :class:`~pathlib.Path` (streamed from disk). Entries under
+    ``drop_prefixes`` that are *not* being rewritten are omitted — used when
+    replacing a whole directory-shaped payload (an actor bank) whose member
+    names change. Every entry is written
     ``ZIP_STORED``. Safe when ``output_usdz == input_usdz`` (writes to a
     sibling temp file, then :func:`os.replace`).
     """
@@ -681,8 +789,16 @@ def _repack_usdz(
 
     with zipfile.ZipFile(input_usdz, "r") as zin:
         names = zin.namelist()
-        replaced = sorted(n for n in entries_to_write if n in names)
-        added = sorted(n for n in entries_to_write if n not in names)
+        # Sets, not lists: a bank retrofit writes one entry per asset, so the
+        # membership tests below run over every archive entry.
+        existing = set(names)
+        replaced = sorted(n for n in entries_to_write if n in existing)
+        added = sorted(n for n in entries_to_write if n not in existing)
+        removed = {
+            n
+            for n in names
+            if drop_prefixes and n not in entries_to_write and n.startswith(drop_prefixes)
+        }
 
         with tempfile.NamedTemporaryFile(
             "wb",
@@ -699,6 +815,8 @@ def _repack_usdz(
                     if name in seen:
                         continue
                     seen.add(name)
+                    if name in removed:
+                        continue
                     if name in entries_to_write:
                         _write_entry(zout, name, entries_to_write[name])
                     else:
@@ -710,7 +828,7 @@ def _repack_usdz(
             tmp_path.unlink(missing_ok=True)
             raise
 
-    return added, replaced
+    return added, replaced, sorted(removed)
 
 
 def _write_entry(zf: zipfile.ZipFile, name: str, source: bytes | Path) -> None:

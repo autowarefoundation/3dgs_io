@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import tempfile
 from pathlib import Path
 
 import spz
@@ -133,6 +134,28 @@ def save_spz_world(gc: spz.GaussianCloud, path: str | Path) -> None:
     opts = spz.PackOptions()
     opts.from_coord = spz.UNSPECIFIED
     spz.save_spz(gc, opts, str(path))
+
+
+# ``spz`` only exposes path-based (de)serialisation, so the in-memory forms
+# below round-trip through a temporary file. Kept here, beside the coord-option
+# decisions they share, so callers that hold SPZ *bytes* (archive entries,
+# actor-asset payloads) do not each re-invent the temp-file dance.
+
+
+def load_spz_world_bytes(data: bytes) -> spz.GaussianCloud:
+    """Decode an in-memory SPZ stream whose axes are already the world frame."""
+    with tempfile.NamedTemporaryFile(suffix=".spz") as tmp:
+        tmp.write(data)
+        tmp.flush()
+        return load_spz_world(tmp.name)
+
+
+def save_spz_world_bytes(gc: spz.GaussianCloud) -> bytes:
+    """Encode ``gc`` to an SPZ stream without an implicit axis conversion."""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "cloud.spz"
+        save_spz_world(gc, path)
+        return path.read_bytes()
 
 
 def load_ply(path: str | Path) -> spz.GaussianCloud:

@@ -69,6 +69,117 @@ python -m 3dgs_io.edit_usdz_cli pointcloud \
     --pcd path/to/pointcloud_map --metadata path/to/pointcloud_map_metadata.yaml
 ```
 
+## Dynamic objects: rigid actor assets (`splatsim.actor_assets/v1`)
+
+`sequence_tracks.json` says *where* every dynamic object is at every moment; it
+cannot say what it looks like, because a bundle's Gaussians are one static
+world-frame cloud. `actor_assets.json` supplies the other half — an **asset
+bank** of object-local Gaussian clouds plus the bindings that say which track
+renders with which asset:
+
+```
+actor_assets.json                     # index + track bindings
+actor_assets/<asset_id>/asset.spz     # NGSP v4 SPZ, object-local frame
+```
+
+recorded in `scene.json.extras.actor_assets`. A renderer draws frame `t` by
+taking the track's pose `(R, p)` and instancing the asset's Gaussians through
+it — means rotated and translated, orientation quaternions pre-multiplied by
+`R`, everything else untouched.
+
+**Scope is rigid objects** — cars, trucks, trailers, cones: anything whose
+shape does not change over time. Each asset declares `motion: "rigid"`, and a
+v1 reader rejects any other value rather than rendering a walking pedestrian as
+a frozen statue.
+
+**Gaussian parameters are identical to the static background.** The payload is
+the same NGSP v4 SPZ container the chunks use, carrying the same optional
+per-Gaussian LiDAR extension record (`0x54340001`: `lidar_intensity_raw`,
+`lidar_raydrop_logit`, `lidar_mask`, `raydrop_sh`). Nothing about an actor is a
+special kind of Gaussian.
+
+### Object-local frame
+
+Every document carries the convention and it is compared exactly on read:
+
+| | |
+| --- | --- |
+| axes | right-handed, **+X forward** (drive direction), **+Y left**, **+Z up** — the same FLU triad as the sensor rig |
+| origin | **centre of the oriented bounding box**, all three axes — exactly what `Track.frames[].translation` refers to |
+| units | metres, xyzw quaternions |
+| scale | **metric**, 1:1 — not unit-normalised |
+
+Leaving this implicit is the classic failure: NVIDIA's NuRec asset-insertion
+workflow needs a hand-applied 90° rotation to reconcile Asset-Harvester output
+with its renderer. Convert before packing instead — shift a ground-origin model
+by `+size_z / 2` along `+Z`, rotate a glTF/SPZ RUB model by
+`3dgs_io.frame_convention.RUB_TO_ENU`. An asset whose AABB does not contain the
+origin is rejected at write time, which catches the "still in world
+coordinates" bug before it reaches a renderer.
+
+### Metric scale and `fit_mode`
+
+NuRec normalises assets to unit scale and stretches them to each track's cuboid
+at render time. That distorts geometry non-uniformly, which a LiDAR simulator
+must not do — a range return off a car stretched into a truck's box is wrong by
+construction. So assets are stored at true metric scale, and each binding picks
+how it reconciles the asset's box with the track's:
+
+| `fit_mode` | behaviour |
+| --- | --- |
+| `rigid` (default) | use the asset as authored; the track's `size` is metadata only. Metrically faithful. |
+| `uniform` | one isotropic scale factor. Shape preserved, scale approximate. |
+| `stretch` | per-axis scale (NuRec-equivalent). Interoperable, **not** metrically faithful — never for LiDAR ground truth. |
+
+`asset_id` is decoupled from `track_id` (as NuRec's
+`DynamicObjectTrack.asset_id` is), so one asset can back fifty tracks and a
+track is re-skinned by editing one binding. `sequence_tracks/v2` is unchanged.
+
+### Usage
+
+Cut an actor out of a world-frame reconstruction and pack it:
+
+```python
+import 3dgs_io as io
+
+asset = io.extract_actor_asset(
+    world_cloud,                      # the scene's ENU world-frame gaussians
+    asset_id="sedan_0007",
+    class_name="automobile",
+    size=track.size,                  # the tracked box (dx, dy, dz), metres
+    translation=frame.translation,    # one TrackFrame pose of that box
+    rotation=frame.rotation,          # xyzw
+    margin=0.2,                       # splat tails spill past a tight box
+)
+
+io.save_scene_usdz(
+    "tileset.json", "scene.usdz",
+    tracks=[track],
+    actor_assets=[asset],
+    actor_instances=[io.ActorInstance(track_id=track.track_id, asset_id="sedan_0007")],
+)
+```
+
+View-dependent SH lives in the object frame too. `extract_actor_asset` rotates
+it there exactly for the yaw-only poses road vehicles have; pass
+`sh_policy="drop"` for a view-independent asset, and note that a pose with more
+than ~2° of pitch/roll is refused rather than silently approximated.
+
+Retrofit a bank onto an existing bundle (the usual path — bundles are built
+before their actors are harvested):
+
+```bash
+python -m 3dgs_io.edit_usdz_cli actor-assets \
+    --input        path/to/scene.usdz \
+    --output       path/to/scene_with_actors.usdz \
+    --actor-assets path/to/actor_asset_bank_dir
+```
+
+A bank directory mirrors the in-archive layout exactly, so one bank can be
+authored once (`save_actor_asset_dir`) and packed into many bundles
+(`--actor-assets` on `scene_usdz_cli`, or `actor_assets=<dir>` on
+`save_scene_usdz`) with its payloads carried byte-for-byte.
+
 ## USDZ scene-bundle manifest (`metadata.yaml`)
 
 Every USDZ produced by `3dgs_io.save_scene_usdz` writes a `metadata.yaml` at

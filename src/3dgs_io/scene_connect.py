@@ -29,9 +29,8 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +38,14 @@ import numpy as np
 import spz
 from scipy.spatial.transform import Rotation
 
+from .actor_assets import (
+    ACTOR_ASSETS_ARCHIVE_PATH,
+    ACTOR_ASSETS_PREFIX,
+    ActorAsset,
+    ActorAssetBank,
+    ActorInstance,
+    parse_actor_assets,
+)
 from .ext_attributes import (
     LIDAR_MASK_KEY,
     decode_lidar_extension,
@@ -54,7 +61,7 @@ from .scene_usdz import (
     _concat_ext_attrs,
     _save_bundle,
 )
-from .spz_io import load_spz_world
+from .spz_io import load_spz_world_bytes
 from .tracks import Track, TrackFrame, parse_tracks
 from .usdz_metadata import (
     USDZ_METADATA_ARCHIVE_PATH,
@@ -82,6 +89,10 @@ _REBUILT_ENTRIES = frozenset(
         "tileset.json",  # v2 bundles carried a Cesium tileset; v3 dropped it
         "rig_trajectories.json",
         "sequence_tracks.json",
+        # Rebuilt: banks are merged across inputs and their asset ids
+        # namespaced on collision, so carrying the reference bundle's copy
+        # verbatim would silently drop every other input's actors.
+        ACTOR_ASSETS_ARCHIVE_PATH,
     }
 )
 # Per-frame appearance data is tied to one sequence's timestamps/cameras and
@@ -111,17 +122,16 @@ class SceneBundle:
     tracks: list[Track] = field(default_factory=list)
     render_defaults: dict[str, float] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    actor_bank: ActorAssetBank | None = None
+    actor_payloads: dict[str, bytes] = field(default_factory=dict)
+    """Encoded actor SPZ payloads by ``asset_id``, carried through verbatim."""
     extras: list[tuple[str, bytes]] = field(default_factory=list)
     """Non-rebuilt archive entries (``autoware_map/``, CARLA world, ...) verbatim."""
 
 
 def _load_chunk_cloud(zf: zipfile.ZipFile, name: str) -> tuple[spz.GaussianCloud, bytes]:
     data = zf.read(name)
-    with tempfile.NamedTemporaryFile(suffix=".spz") as tmp:
-        tmp.write(data)
-        tmp.flush()
-        cloud = load_spz_world(tmp.name)
-    return cloud, data
+    return load_spz_world_bytes(data), data
 
 
 def _load_chunks_v3(
@@ -204,10 +214,19 @@ def load_scene_bundle(usdz_path: str | Path) -> SceneBundle:
         if "sequence_tracks.json" in names:
             tracks = parse_tracks(json.loads(zf.read("sequence_tracks.json")))
 
+        actor_bank: ActorAssetBank | None = None
+        actor_payloads: dict[str, bytes] = {}
+        if ACTOR_ASSETS_ARCHIVE_PATH in names:
+            actor_bank = parse_actor_assets(json.loads(zf.read(ACTOR_ASSETS_ARCHIVE_PATH)))
+            for asset in actor_bank.assets:
+                actor_payloads[asset.asset_id] = zf.read(str(asset.uri))
+
         extras: list[tuple[str, bytes]] = []
         for name in sorted(names):
             if name in _REBUILT_ENTRIES or name.startswith("chunks/"):
                 continue
+            if name.startswith(ACTOR_ASSETS_PREFIX):
+                continue  # carried through actor_payloads, re-emitted by the writer
             if name in _DROPPED_ENTRIES:
                 _log.warning(
                     "%s: dropping %s (per-frame appearance data cannot be merged)",
@@ -231,6 +250,8 @@ def load_scene_bundle(usdz_path: str | Path) -> SceneBundle:
         tracks=tracks,
         render_defaults=dict(scene.get("render_defaults") or {}),
         metadata=metadata,
+        actor_bank=actor_bank,
+        actor_payloads=actor_payloads,
         extras=extras,
     )
 
@@ -315,11 +336,21 @@ def _transform_pose_as_kwargs(transform: np.ndarray, pose: RigPose | TrackFrame)
     return {"translation": translation, "rotation": rotation}
 
 
-def _merge_tracks(bundles: list[SceneBundle], transforms: list[np.ndarray]) -> list[Track]:
-    """Concatenate tracks in the connected frame, de-duplicating track ids."""
+def _merge_tracks(
+    bundles: list[SceneBundle], transforms: list[np.ndarray]
+) -> tuple[list[Track], list[dict[str, str]]]:
+    """Concatenate tracks in the connected frame, de-duplicating track ids.
+
+    Also returns, per input bundle, the ``{original_id: merged_id}`` renaming
+    that de-duplication applied — actor bindings reference tracks by id and
+    have to follow the same renames.
+    """
     merged: list[Track] = []
+    renames: list[dict[str, str]] = []
     seen_ids: set[str] = set()
     for scene_idx, (bundle, transform) in enumerate(zip(bundles, transforms, strict=True)):
+        rename: dict[str, str] = {}
+        renames.append(rename)
         for track in bundle.tracks:
             frames = [
                 TrackFrame(
@@ -332,6 +363,7 @@ def _merge_tracks(bundles: list[SceneBundle], transforms: list[np.ndarray]) -> l
             if track_id in seen_ids:
                 track_id = f"scene{scene_idx}/{track_id}"
             seen_ids.add(track_id)
+            rename[track.track_id] = track_id
             merged.append(
                 Track(
                     track_id=track_id,
@@ -342,7 +374,56 @@ def _merge_tracks(bundles: list[SceneBundle], transforms: list[np.ndarray]) -> l
                     metadata=dict(track.metadata),
                 )
             )
-    return merged
+    return merged, renames
+
+
+def _merge_actor_banks(
+    bundles: list[SceneBundle],
+    track_renames: list[dict[str, str]],
+) -> tuple[ActorAssetBank | None, dict[str, bytes]]:
+    """Union every input's actor bank into one.
+
+    Actor assets are object-local, so they are frame-invariant and pass through
+    byte-for-byte — no re-quantisation, no transform. Only the identifiers move:
+    an ``asset_id`` claimed by two inputs is namespaced per scene unless the two
+    payloads are byte-identical (the same asset packed into both clips), and
+    bindings follow the track renaming :func:`_merge_tracks` applied.
+    """
+    merged_assets: list[ActorAsset] = []
+    merged_instances: list[ActorInstance] = []
+    payloads: dict[str, bytes] = {}
+    for scene_idx, (bundle, rename) in enumerate(zip(bundles, track_renames, strict=True)):
+        if bundle.actor_bank is None:
+            continue
+        asset_renames: dict[str, str] = {}
+        for asset in bundle.actor_bank.assets:
+            payload = bundle.actor_payloads[asset.asset_id]
+            new_id = asset.asset_id
+            if new_id in payloads and payloads[new_id] != payload:
+                # '_' not '/' as _merge_tracks uses: an asset_id is an archive
+                # path component and _ASSET_ID_RE forbids separators.
+                new_id = f"scene{scene_idx}_{asset.asset_id}"
+                suffix = 1
+                while new_id in payloads:
+                    new_id = f"scene{scene_idx}_{asset.asset_id}_{suffix}"
+                    suffix += 1
+            asset_renames[asset.asset_id] = new_id
+            if new_id in payloads:
+                continue  # identical asset already packed by an earlier input
+            payloads[new_id] = payload
+            merged_assets.append(replace(asset, asset_id=new_id, uri=None))
+        for instance in bundle.actor_bank.instances:
+            merged_instances.append(
+                ActorInstance(
+                    track_id=rename.get(instance.track_id, instance.track_id),
+                    asset_id=asset_renames[instance.asset_id],
+                    fit_mode=instance.fit_mode,
+                    metadata=dict(instance.metadata),
+                )
+            )
+    if not merged_assets:
+        return None, {}
+    return ActorAssetBank(assets=merged_assets, instances=merged_instances), payloads
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +533,8 @@ def connect_scene_usdzs(
 
     pose_transforms = [recentre @ t for t in transforms]
     rigs = _merge_rigs(bundles, pose_transforms)
-    tracks = _merge_tracks(bundles, pose_transforms)
+    tracks, track_renames = _merge_tracks(bundles, pose_transforms)
+    actor_bank, actor_payloads = _merge_actor_banks(bundles, track_renames)
 
     producer_source = {
         "source_scenes": [
@@ -476,4 +558,6 @@ def connect_scene_usdzs(
         extra_payloads=reference.extras,
         tracks=tracks or None,
         rig_trajectories=rigs or None,
+        actor_bank=actor_bank,
+        actor_payloads=actor_payloads,
     )

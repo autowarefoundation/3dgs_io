@@ -17,6 +17,9 @@ Features
 - **Typed metadata** (``GlbMetadata``) stored in ``asset.extras``
 - **USDZ scene bundles** with a guaranteed ``metadata.yaml`` identity card
   (``uuid`` / ``scene_id`` / ``version_string``) at the archive root
+- **Rigid dynamic-object assets** (``splatsim.actor_assets/v1``): object-local
+  Gaussian clouds for cars and other shape-invariant actors, plus the bindings
+  that say which ``sequence_tracks`` track renders with which asset
 
 Installation
 ------------
@@ -44,3 +47,4 @@ Or with `uv <https://docs.astral.sh/uv/>`_:
    api/lidar_2dgs
    api/metadata
    api/usdz_metadata
+   api/actor_assets

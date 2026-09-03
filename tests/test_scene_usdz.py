@@ -416,6 +416,7 @@ def test_scene_json_schema(tmp_path: Path) -> None:
         "sequence_tracks": None,
         "rig_trajectories": None,
         "ppisp": None,
+        "actor_assets": None,
     }
 
 
@@ -578,6 +579,7 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
         "sequence_tracks": None,
         "rig_trajectories": None,
         "ppisp": None,
+        "actor_assets": None,
     }
 
 
