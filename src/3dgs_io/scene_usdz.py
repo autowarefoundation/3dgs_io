@@ -22,18 +22,30 @@ The bundle itself contains no Cesium 3D Tiles structures; the Cesium
 Recognised "well-known" extras paths get auto-recorded in ``scene.json``'s
 ``extras`` block so downstream tooling can resolve them without scanning:
 
-================================  =================================
-archive path                      scene.json key
-================================  =================================
-``map.osm``                       ``extras.map_lanelet2``
-``map.xodr``                      ``extras.map_opendrive``
-``carla_world/manifest.json``     ``extras.carla_world``
-``tracks.parquet``                ``extras.tracks``
-``trajectory.parquet``            ``extras.trajectory``
-``sequence_tracks.json``          ``extras.sequence_tracks``
-``rig_trajectories.json``         ``extras.rig_trajectories``
-``ppisp.json``                    ``extras.ppisp``
-================================  =================================
+========================================  =================================
+archive path                              scene.json key
+========================================  =================================
+``autoware_map/lanelet2_map.osm``         ``extras.map_lanelet2``
+``autoware_map/pointcloud_map.pcd``       ``extras.map_pointcloud``
+``autoware_map/pointcloud_map/``          ``extras.map_pointcloud`` (dir form)
+``autoware_map/pointcloud_map_metadata.yaml``  ``extras.map_pointcloud_metadata``
+``autoware_map/map_projector_info.yaml``  ``extras.map_projector_info``
+``map.xodr``                              ``extras.map_opendrive``
+``carla_world/manifest.json``             ``extras.carla_world``
+``tracks.parquet``                        ``extras.tracks``
+``trajectory.parquet``                    ``extras.trajectory``
+``sequence_tracks.json``                  ``extras.sequence_tracks``
+``rig_trajectories.json``                 ``extras.rig_trajectories``
+``ppisp.json``                            ``extras.ppisp``
+========================================  =================================
+
+The Autoware map family mirrors Autoware's own on-disk map directory layout
+(``lanelet2_map.osm`` + ``pointcloud_map.pcd`` / ``pointcloud_map/`` +
+``pointcloud_map_metadata.yaml`` + ``map_projector_info.yaml``) so a consumer
+can hand the extracted ``autoware_map/`` directory to ``autoware_map_loader``
+verbatim. When the point-cloud map is split into multiple ``.pcd`` files they
+live under ``autoware_map/pointcloud_map/`` and ``extras.map_pointcloud``
+records that directory prefix (trailing slash) instead of a single file.
 """
 
 from __future__ import annotations
@@ -123,9 +135,28 @@ def Xform "World"
 }
 """
 
+# Autoware map bundle — mirrors Autoware's own map directory layout so the
+# extracted ``autoware_map/`` tree can be handed to ``autoware_map_loader``
+# unchanged. The lanelet2 ``.osm`` lives here now (it used to sit at the
+# archive root as ``map.osm`` before the autoware_map/ move).
+AUTOWARE_MAP_PREFIX = "autoware_map/"
+AUTOWARE_LANELET2_PATH = "autoware_map/lanelet2_map.osm"
+AUTOWARE_POINTCLOUD_PATH = "autoware_map/pointcloud_map.pcd"
+AUTOWARE_POINTCLOUD_DIR_PREFIX = "autoware_map/pointcloud_map/"
+AUTOWARE_POINTCLOUD_METADATA_PATH = "autoware_map/pointcloud_map_metadata.yaml"
+AUTOWARE_MAP_PROJECTOR_PATH = "autoware_map/map_projector_info.yaml"
+
+# Exact-path Autoware map files → scene.json.extras key.
+_AUTOWARE_MAP_KNOWN: dict[str, str] = {
+    AUTOWARE_LANELET2_PATH: "map_lanelet2",
+    AUTOWARE_POINTCLOUD_PATH: "map_pointcloud",
+    AUTOWARE_POINTCLOUD_METADATA_PATH: "map_pointcloud_metadata",
+    AUTOWARE_MAP_PROJECTOR_PATH: "map_projector_info",
+}
+
 # Recognised archive paths that get auto-recorded in scene.json's extras.
 _KNOWN_EXTRAS: dict[str, str] = {
-    "map.osm": "map_lanelet2",
+    **_AUTOWARE_MAP_KNOWN,
     "map.xodr": "map_opendrive",
     "carla_world/manifest.json": "carla_world",
     "tracks.parquet": "tracks",
@@ -134,6 +165,26 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "rig_trajectories.json": "rig_trajectories",
     "ppisp.json": "ppisp",
 }
+
+
+def autoware_map_extras(archive_paths: set[str]) -> dict[str, str]:
+    """Map present ``autoware_map/`` files to their ``scene.json.extras`` keys.
+
+    Returns only the keys that are actually present (so callers can merge the
+    result without clobbering unrelated keys). Handles the split point-cloud
+    map: when no single ``pointcloud_map.pcd`` exists but one or more files
+    live under ``autoware_map/pointcloud_map/``, ``map_pointcloud`` records the
+    directory prefix (trailing slash) instead.
+    """
+    out: dict[str, str] = {}
+    for path, key in _AUTOWARE_MAP_KNOWN.items():
+        if path in archive_paths:
+            out[key] = path
+    if "map_pointcloud" not in out and any(
+        p.startswith(AUTOWARE_POINTCLOUD_DIR_PREFIX) for p in archive_paths
+    ):
+        out["map_pointcloud"] = AUTOWARE_POINTCLOUD_DIR_PREFIX
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +671,8 @@ def _detect_known_extras(archive_paths: set[str]) -> dict[str, str | None]:
     for path, scene_key in _KNOWN_EXTRAS.items():
         if path in archive_paths:
             detected[scene_key] = path
+    # Fold in the split point-cloud-map directory case (no exact-path match).
+    detected.update(autoware_map_extras(archive_paths))
     return detected
 
 
@@ -921,12 +974,16 @@ def _find_map_osm(
     extras_entries: list[tuple[str, Path]],
     payload_entries: list[tuple[str, bytes]],
 ) -> bytes | None:
-    """Return the bytes of the ``map.osm`` entry about to be bundled, if any."""
+    """Return the bytes of the bundled lanelet2 ``.osm`` entry, if any.
+
+    The lanelet2 map lives at :data:`AUTOWARE_LANELET2_PATH`
+    (``autoware_map/lanelet2_map.osm``).
+    """
     for arc, payload in payload_entries:
-        if arc == "map.osm":
+        if arc == AUTOWARE_LANELET2_PATH:
             return payload
     for arc, src in extras_entries:
-        if arc == "map.osm":
+        if arc == AUTOWARE_LANELET2_PATH:
             return src.read_bytes()
     return None
 

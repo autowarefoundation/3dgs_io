@@ -5,7 +5,7 @@ Invoke with ``python -m 3dgs_io.scene_connect_cli``::
     python -m 3dgs_io.scene_connect_cli scene1.usdz scene2.usdz ... -o connected.usdz
 
 The first input is the reference scene: its world frame orientation and
-extras (``map.osm``, CARLA world, ...) are carried into the output, and the
+extras (``autoware_map/``, CARLA world, ...) are carried into the output, and the
 merged geometry is re-anchored so the connected bundle stays geodetically
 aligned with its inputs.
 """

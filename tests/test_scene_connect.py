@@ -142,9 +142,9 @@ def _make_scene_usdz(
 
     extras = None
     if map_osm is not None:
-        osm_path = scene_dir / "map.osm"
+        osm_path = scene_dir / "lanelet2_map.osm"
         osm_path.write_text(map_osm)
-        extras = {"map.osm": osm_path}
+        extras = {"autoware_map/lanelet2_map.osm": osm_path}
 
     out = tmp_path / f"{name}.usdz"
     save_scene_usdz(
@@ -213,9 +213,9 @@ def test_connect_preserves_ecef_positions_and_anchor(tmp_path: Path) -> None:
     assert abs(lat - _LAT0) < 0.01
     assert abs(lon - _LON0) < 0.01
 
-    # Reference extras (map.osm) are carried into the output.
+    # Reference extras (autoware_map/lanelet2_map.osm) are carried into the output.
     with zipfile.ZipFile(out) as zf:
-        assert "map.osm" in zf.namelist()
+        assert "autoware_map/lanelet2_map.osm" in zf.namelist()
 
     assert scene["producer"]["source_scenes"][0]["path"] == "a.usdz"
 

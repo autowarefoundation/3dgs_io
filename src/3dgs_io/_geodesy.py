@@ -1,11 +1,11 @@
 """Minimal WGS84 geodesy helpers (no external projection dependency).
 
 Used to sanity-check that a scene bundle's ``ecef_anchor`` actually sits at
-the location described by the embedded Lanelet2 ``map.osm``. A mis-derived
-anchor (e.g. one that points at an MGRS 100 km grid corner instead of the
-scene) renders fine standalone but silently breaks every geodetic consumer
-(CARLA bridges, Autoware map alignment), so the writer refuses to produce
-such a bundle.
+the location described by the embedded Lanelet2 map
+(``autoware_map/lanelet2_map.osm``). A mis-derived anchor (e.g. one that
+points at an MGRS 100 km grid corner instead of the scene) renders fine
+standalone but silently breaks every geodetic consumer (CARLA bridges,
+Autoware map alignment), so the writer refuses to produce such a bundle.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def lanelet2_mean_ecef(map_osm: bytes, *, max_nodes: int = 1000) -> np.ndarray |
     try:
         root = ET.fromstring(map_osm)  # noqa: S314 - trusted local map file
     except ET.ParseError:
-        _log.warning("map.osm is not parseable XML; skipping anchor cross-check")
+        _log.warning("lanelet2 map is not parseable XML; skipping anchor cross-check")
         return None
     lats: list[float] = []
     lons: list[float] = []
@@ -127,7 +127,7 @@ def validate_anchor_against_lanelet2(
 
     ``ecef_anchor`` is the row-major 4×4 world→ECEF transform; its translation
     column is the geodetic location of the scene's world origin, which must sit
-    inside (or near) the area the bundled ``map.osm`` describes. Silently
+    inside (or near) the area the bundled lanelet2 map describes. Silently
     returns when the map carries no usable nodes.
     """
     map_ecef = lanelet2_mean_ecef(map_osm)
@@ -143,7 +143,7 @@ def validate_anchor_against_lanelet2(
     raise ValueError(
         "ecef_anchor is inconsistent with the embedded Lanelet2 map: the world "
         f"origin decodes to lat={anchor_lat:.6f} lon={anchor_lon:.6f} "
-        f"h={anchor_h:.1f} m but the map.osm nodes centre on "
+        f"h={anchor_h:.1f} m but the lanelet2 map nodes centre on "
         f"lat={map_lat:.6f} lon={map_lon:.6f} — {offset / 1000.0:.1f} km apart "
         f"(limit {max_offset_m / 1000.0:.1f} km). This usually means the anchor "
         "was derived at an MGRS grid origin or a recentring shift was applied "

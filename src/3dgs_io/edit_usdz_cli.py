@@ -6,13 +6,36 @@ Subcommands
 -----------
 
 ``lanelet2``
-    Embed a lanelet2 ``.osm`` at archive path ``map.osm`` and record it under
+    Embed a lanelet2 ``.osm`` at archive path
+    ``autoware_map/lanelet2_map.osm`` and record it under
     ``scene.json.extras.map_lanelet2``::
 
         python -m 3dgs_io.edit_usdz_cli lanelet2                       \\
             --input    path/to/scene.usdz                              \\
             --output   path/to/scene_with_map.usdz                     \\
-            --lanelet2 path/to/map.osm
+            --lanelet2 path/to/lanelet2_map.osm
+
+``pointcloud``
+    Embed an Autoware point-cloud map — a single ``.pcd`` at
+    ``autoware_map/pointcloud_map.pcd`` or a directory of split tiles under
+    ``autoware_map/pointcloud_map/`` — and record it under
+    ``scene.json.extras.map_pointcloud``::
+
+        python -m 3dgs_io.edit_usdz_cli pointcloud                     \\
+            --input  path/to/scene.usdz                                \\
+            --output path/to/scene_with_pcd.usdz                       \\
+            --pcd    path/to/pointcloud_map.pcd                        \\
+            [--metadata path/to/pointcloud_map_metadata.yaml]
+
+``autoware-map``
+    Embed a whole Autoware map directory under ``autoware_map/`` and
+    auto-record every well-known file (lanelet2, point cloud, projector
+    info) in ``scene.json.extras``::
+
+        python -m 3dgs_io.edit_usdz_cli autoware-map                   \\
+            --input   path/to/scene.usdz                               \\
+            --output  path/to/scene_with_map.usdz                      \\
+            --map-dir path/to/autoware_map
 
 ``intrinsics``
     Rewrite a camera's intrinsics inside the ``rig_trajectories.json``
@@ -65,8 +88,10 @@ from typing import Any
 
 from .edit_usdz import (
     _result_summary,
+    add_autoware_map_to_usdz,
     add_clipgt_to_usdz,
     add_lanelet2_to_usdz,
+    add_pointcloud_map_to_usdz,
     add_ppisp_to_usdz,
     set_usdz_metadata,
     update_camera_intrinsics_in_usdz,
@@ -159,10 +184,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     lanelet2 = sub.add_parser(
         "lanelet2",
-        help="Embed a lanelet2 map.osm into the USDZ",
+        help="Embed a lanelet2 .osm into the USDZ (autoware_map/lanelet2_map.osm)",
         description=(
-            "Embed a lanelet2 .osm at archive path map.osm and record it in "
-            "scene.json.extras.map_lanelet2."
+            "Embed a lanelet2 .osm at archive path autoware_map/lanelet2_map.osm "
+            "and record it in scene.json.extras.map_lanelet2."
         ),
     )
     _add_common_io_args(lanelet2)
@@ -171,12 +196,68 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         metavar="PATH",
-        help="Path to a lanelet2 .osm file to embed as map.osm",
+        help="Path to a lanelet2 .osm file to embed as autoware_map/lanelet2_map.osm",
     )
     lanelet2.add_argument(
         "--no-overwrite",
         action="store_true",
-        help="Fail if the input archive already contains map.osm",
+        help="Fail if the input archive already contains autoware_map/lanelet2_map.osm",
+    )
+
+    pointcloud = sub.add_parser(
+        "pointcloud",
+        help="Embed an Autoware point-cloud map into the USDZ",
+        description=(
+            "Embed a .pcd file at autoware_map/pointcloud_map.pcd, or a "
+            "directory of split .pcd tiles under autoware_map/pointcloud_map/, "
+            "and record it in scene.json.extras.map_pointcloud."
+        ),
+    )
+    _add_common_io_args(pointcloud)
+    pointcloud.add_argument(
+        "--pcd",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Path to a .pcd file or a directory of split .pcd tiles.",
+    )
+    pointcloud.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optional pointcloud_map_metadata.yaml (embedded at "
+            "autoware_map/pointcloud_map_metadata.yaml)."
+        ),
+    )
+    pointcloud.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Fail if the input archive already carries a point-cloud map",
+    )
+
+    autoware_map = sub.add_parser(
+        "autoware-map",
+        help="Embed a whole Autoware map directory under autoware_map/",
+        description=(
+            "Copy every file under --map-dir into the USDZ under the "
+            "autoware_map/ prefix (mirroring Autoware's map directory layout) "
+            "and auto-record well-known files in scene.json.extras."
+        ),
+    )
+    _add_common_io_args(autoware_map)
+    autoware_map.add_argument(
+        "--map-dir",
+        type=Path,
+        required=True,
+        metavar="PATH",
+        help="Autoware map directory (lanelet2_map.osm, pointcloud_map*, ...).",
+    )
+    autoware_map.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Fail if the input archive already contains autoware_map/ entries",
     )
 
     clipgt = sub.add_parser(
@@ -341,6 +422,27 @@ def main(argv: list[str] | None = None) -> int:
             args.lanelet2,
             overwrite=not args.no_overwrite,
         )
+    elif args.command == "pointcloud":
+        try:
+            result = add_pointcloud_map_to_usdz(
+                args.input,
+                args.output,
+                args.pcd,
+                metadata_yaml=args.metadata,
+                overwrite=not args.no_overwrite,
+            )
+        except (FileNotFoundError, FileExistsError, ValueError) as exc:
+            parser.error(str(exc))
+    elif args.command == "autoware-map":
+        try:
+            result = add_autoware_map_to_usdz(
+                args.input,
+                args.output,
+                args.map_dir,
+                overwrite=not args.no_overwrite,
+            )
+        except (FileNotFoundError, FileExistsError, ValueError) as exc:
+            parser.error(str(exc))
     elif args.command == "clipgt":
         result = add_clipgt_to_usdz(
             args.input,

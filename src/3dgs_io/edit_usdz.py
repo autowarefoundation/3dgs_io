@@ -25,6 +25,7 @@ import logging
 import os
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,14 @@ from .rig_trajectories import (
     load_rig_trajectories_doc,
     serialize_rig_trajectories,
     update_camera_intrinsics,
+)
+from .scene_usdz import (
+    AUTOWARE_LANELET2_PATH,
+    AUTOWARE_MAP_PREFIX,
+    AUTOWARE_POINTCLOUD_DIR_PREFIX,
+    AUTOWARE_POINTCLOUD_METADATA_PATH,
+    AUTOWARE_POINTCLOUD_PATH,
+    autoware_map_extras,
 )
 from .usdz_metadata import (
     USDZ_METADATA_ARCHIVE_PATH,
@@ -47,8 +56,10 @@ __all__ = [
     "EditUsdzResult",
     "IntrinsicsEditResult",
     "MetadataEditResult",
+    "add_autoware_map_to_usdz",
     "add_clipgt_to_usdz",
     "add_lanelet2_to_usdz",
+    "add_pointcloud_map_to_usdz",
     "add_ppisp_to_usdz",
     "set_usdz_metadata",
     "update_camera_intrinsics_in_usdz",
@@ -56,7 +67,7 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-_LANELET2_ARCHIVE_PATH = "map.osm"
+_LANELET2_ARCHIVE_PATH = AUTOWARE_LANELET2_PATH
 _LANELET2_SCENE_KEY = "map_lanelet2"
 _RIG_TRAJECTORIES_ARCHIVE_PATH = "rig_trajectories.json"
 _CLIPGT_ARCHIVE_PREFIX = "clipgt/"
@@ -101,11 +112,12 @@ def add_lanelet2_to_usdz(
     *,
     overwrite: bool = True,
 ) -> EditUsdzResult:
-    """Add a lanelet2 ``map.osm`` file to an existing USDZ scene bundle.
+    """Add a lanelet2 ``.osm`` file to an existing USDZ scene bundle.
 
-    The source file is embedded verbatim at archive path ``map.osm`` and
-    ``scene.json.extras.map_lanelet2`` is set to ``"map.osm"``. All other
-    archive entries are copied through in their original order.
+    The source file is embedded verbatim at archive path
+    ``autoware_map/lanelet2_map.osm`` — mirroring Autoware's own map directory
+    layout — and ``scene.json.extras.map_lanelet2`` is set to that path. All
+    other archive entries are copied through in their original order.
 
     Parameters
     ----------
@@ -117,11 +129,11 @@ def add_lanelet2_to_usdz(
         the input is replaced atomically once the new archive is fully
         written.
     lanelet2_path:
-        Source ``.osm`` file to embed at ``map.osm``.
+        Source ``.osm`` file to embed at ``autoware_map/lanelet2_map.osm``.
     overwrite:
-        When ``True`` (default), replace an existing ``map.osm`` entry.
-        When ``False``, raise :class:`ValueError` if the archive already
-        contains one.
+        When ``True`` (default), replace an existing
+        ``autoware_map/lanelet2_map.osm`` entry. When ``False``, raise
+        :class:`ValueError` if the archive already contains one.
     """
     input_usdz = Path(input_usdz).expanduser()
     output_usdz = Path(output_usdz).expanduser()
@@ -192,13 +204,9 @@ def add_clipgt_to_usdz(
     if not clipgt_dir.is_dir():
         raise FileNotFoundError(f"clipgt directory not found: {clipgt_dir}")
 
-    entries_to_write: dict[str, bytes] = {}
-    for file_path in sorted(clipgt_dir.rglob("*")):
-        if not file_path.is_file():
-            continue
-        rel = file_path.relative_to(clipgt_dir).as_posix()
-        entries_to_write[f"{_CLIPGT_ARCHIVE_PREFIX}{rel}"] = file_path.read_bytes()
-
+    entries_to_write: dict[str, bytes | Path] = dict(
+        _dir_entries(clipgt_dir, _CLIPGT_ARCHIVE_PREFIX)
+    )
     if not entries_to_write:
         raise ValueError(f"No files found under {clipgt_dir}")
 
@@ -216,6 +224,142 @@ def add_clipgt_to_usdz(
         entries_to_write=entries_to_write,
     )
     return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
+
+
+def add_pointcloud_map_to_usdz(
+    input_usdz: str | Path,
+    output_usdz: str | Path,
+    pointcloud: str | Path,
+    *,
+    metadata_yaml: str | Path | None = None,
+    overwrite: bool = True,
+) -> EditUsdzResult:
+    """Add an Autoware point-cloud map to an existing USDZ scene bundle.
+
+    ``pointcloud`` may be either:
+
+    * a single ``.pcd`` file — embedded at
+      ``autoware_map/pointcloud_map.pcd`` with
+      ``scene.json.extras.map_pointcloud`` set to that path; or
+    * a directory of split ``.pcd`` tiles — every regular file is embedded
+      under ``autoware_map/pointcloud_map/<relative_path>`` and
+      ``extras.map_pointcloud`` records the directory prefix
+      ``"autoware_map/pointcloud_map/"``.
+
+    When ``metadata_yaml`` is given (Autoware's ``pointcloud_map_metadata.yaml``
+    that lists the split tiles), it is embedded at
+    ``autoware_map/pointcloud_map_metadata.yaml`` and recorded under
+    ``extras.map_pointcloud_metadata``.
+
+    Parameters
+    ----------
+    input_usdz, output_usdz:
+        Same semantics as :func:`add_lanelet2_to_usdz` — ``output_usdz`` may
+        equal ``input_usdz`` for atomic in-place edits.
+    pointcloud:
+        A ``.pcd`` file or a directory of ``.pcd`` tiles.
+    metadata_yaml:
+        Optional ``pointcloud_map_metadata.yaml`` describing the split tiles.
+    overwrite:
+        When ``True`` (default), replace any existing point-cloud-map entries.
+        When ``False``, raise :class:`FileExistsError` if the archive already
+        carries a point-cloud map.
+    """
+    input_usdz = Path(input_usdz).expanduser()
+    output_usdz = Path(output_usdz).expanduser()
+    pointcloud = Path(pointcloud).expanduser()
+
+    if not input_usdz.is_file():
+        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
+    if not pointcloud.exists():
+        raise FileNotFoundError(f"point-cloud map not found: {pointcloud}")
+
+    entries_to_write: dict[str, bytes | Path] = {}
+    if pointcloud.is_dir():
+        entries_to_write.update(_dir_entries(pointcloud, AUTOWARE_POINTCLOUD_DIR_PREFIX))
+        if not entries_to_write:
+            raise ValueError(f"No files found under {pointcloud}")
+    else:
+        entries_to_write[AUTOWARE_POINTCLOUD_PATH] = pointcloud
+
+    if metadata_yaml is not None:
+        metadata_yaml = Path(metadata_yaml).expanduser()
+        if not metadata_yaml.is_file():
+            raise FileNotFoundError(f"pointcloud metadata not found: {metadata_yaml}")
+        entries_to_write[AUTOWARE_POINTCLOUD_METADATA_PATH] = metadata_yaml
+
+    def _conflict(name: str) -> bool:
+        return (
+            name == AUTOWARE_POINTCLOUD_PATH
+            or name.startswith(AUTOWARE_POINTCLOUD_DIR_PREFIX)
+            or (metadata_yaml is not None and name == AUTOWARE_POINTCLOUD_METADATA_PATH)
+        )
+
+    # The writer's detection path (autoware_map_extras) owns the file→extras-key
+    # rule, including the single-file vs split-directory choice; reuse it so the
+    # editor and writer can never disagree.
+    scene_updates = autoware_map_extras(set(entries_to_write))
+    return _embed_map_with_extras(
+        input_usdz,
+        output_usdz,
+        entries_to_write,
+        scene_updates,
+        conflict=_conflict,
+        overwrite=overwrite,
+    )
+
+
+def add_autoware_map_to_usdz(
+    input_usdz: str | Path,
+    output_usdz: str | Path,
+    map_dir: str | Path,
+    *,
+    overwrite: bool = True,
+) -> EditUsdzResult:
+    """Embed a whole Autoware map directory into a USDZ under ``autoware_map/``.
+
+    Every regular file under ``map_dir`` (recursively) is copied into the
+    output USDZ at ``autoware_map/<relative_path>``, reproducing Autoware's own
+    map directory layout so a consumer can extract ``autoware_map/`` and hand
+    it to ``autoware_map_loader`` unchanged. Well-known files
+    (``lanelet2_map.osm``, ``pointcloud_map.pcd`` or a ``pointcloud_map/``
+    directory, ``pointcloud_map_metadata.yaml``, ``map_projector_info.yaml``)
+    are auto-recorded in the corresponding ``scene.json.extras`` keys.
+
+    Parameters
+    ----------
+    input_usdz, output_usdz:
+        Same semantics as :func:`add_lanelet2_to_usdz` — ``output_usdz`` may
+        equal ``input_usdz`` for atomic in-place edits.
+    map_dir:
+        An Autoware map directory (containing e.g. ``lanelet2_map.osm``).
+    overwrite:
+        When ``True`` (default), replace any existing ``autoware_map/``
+        entries. When ``False``, raise :class:`FileExistsError` if the archive
+        already carries an ``autoware_map/`` tree.
+    """
+    input_usdz = Path(input_usdz).expanduser()
+    output_usdz = Path(output_usdz).expanduser()
+    map_dir = Path(map_dir).expanduser()
+
+    if not input_usdz.is_file():
+        raise FileNotFoundError(f"input USDZ not found: {input_usdz}")
+    if not map_dir.is_dir():
+        raise FileNotFoundError(f"autoware map directory not found: {map_dir}")
+
+    entries_to_write: dict[str, bytes | Path] = dict(_dir_entries(map_dir, AUTOWARE_MAP_PREFIX))
+    if not entries_to_write:
+        raise ValueError(f"No files found under {map_dir}")
+
+    scene_updates = autoware_map_extras(set(entries_to_write))
+    return _embed_map_with_extras(
+        input_usdz,
+        output_usdz,
+        entries_to_write,
+        scene_updates,
+        conflict=lambda name: name.startswith(AUTOWARE_MAP_PREFIX),
+        overwrite=overwrite,
+    )
 
 
 def add_ppisp_to_usdz(
@@ -450,6 +594,11 @@ def set_usdz_metadata(
 
 def _rewrite_scene_extras(scene_json_bytes: bytes, key: str, value: str) -> bytes:
     """Load ``scene.json``, set ``extras[key] = value``, return re-encoded bytes."""
+    return _rewrite_scene_extras_multi(scene_json_bytes, {key: value})
+
+
+def _rewrite_scene_extras_multi(scene_json_bytes: bytes, updates: dict[str, str]) -> bytes:
+    """Load ``scene.json``, merge ``updates`` into ``extras``, re-encode."""
     scene_doc = json.loads(scene_json_bytes.decode("utf-8-sig"))
     if not isinstance(scene_doc, dict):
         raise ValueError("scene.json is not a JSON object")
@@ -459,23 +608,74 @@ def _rewrite_scene_extras(scene_json_bytes: bytes, key: str, value: str) -> byte
         scene_doc["extras"] = extras
     elif not isinstance(extras, dict):
         raise ValueError("scene.json.extras is not an object")
-    extras[key] = value
+    extras.update(updates)
     return json.dumps(scene_doc, indent=2).encode("utf-8")
+
+
+def _dir_entries(root: Path, prefix: str) -> dict[str, Path]:
+    """Map every regular file under ``root`` to ``{prefix}<rel>`` → source path.
+
+    Sources are returned as :class:`~pathlib.Path` values so :func:`_repack_usdz`
+    streams them from disk instead of slurping (potentially multi-GB) map files
+    into memory.
+    """
+    out: dict[str, Path] = {}
+    for file_path in sorted(root.rglob("*")):
+        if file_path.is_file():
+            rel = file_path.relative_to(root).as_posix()
+            out[f"{prefix}{rel}"] = file_path
+    return out
+
+
+def _embed_map_with_extras(
+    input_usdz: Path,
+    output_usdz: Path,
+    entries_to_write: dict[str, bytes | Path],
+    scene_updates: dict[str, str],
+    *,
+    conflict: Callable[[str], bool],
+    overwrite: bool,
+) -> EditUsdzResult:
+    """Embed ``entries_to_write`` and merge ``scene_updates`` into ``scene.json``.
+
+    Shared tail for the map editors: validate ``scene.json`` is present, reject
+    clashing entries (per the ``conflict`` predicate) unless ``overwrite``,
+    rewrite the ``extras`` block, and repack. ``scene.json`` is always a
+    pre-existing replacement, so it is stripped from the reported ``replaced``.
+    """
+    with zipfile.ZipFile(input_usdz, "r") as zin:
+        names = zin.namelist()
+        if "scene.json" not in names:
+            raise ValueError(f"{input_usdz} is not a splatsim scene USDZ (missing scene.json)")
+        if not overwrite:
+            clashing = sorted(n for n in names if conflict(n))
+            if clashing:
+                raise FileExistsError(
+                    f"{input_usdz} already contains conflicting entries "
+                    f"({clashing}); pass overwrite=True to replace"
+                )
+        scene_bytes = _rewrite_scene_extras_multi(zin.read("scene.json"), scene_updates)
+
+    entries_to_write["scene.json"] = scene_bytes
+    added, replaced = _repack_usdz(input_usdz, output_usdz, entries_to_write=entries_to_write)
+    replaced = [n for n in replaced if n != "scene.json"]
+    return EditUsdzResult(out_path=output_usdz, added=added, replaced=replaced)
 
 
 def _repack_usdz(
     input_usdz: Path,
     output_usdz: Path,
     *,
-    entries_to_write: dict[str, bytes],
+    entries_to_write: dict[str, bytes | Path],
 ) -> tuple[list[str], list[str]]:
     """Copy ``input_usdz`` to ``output_usdz`` replacing/appending given entries.
 
     Original entry order is preserved, entries in ``entries_to_write`` that
     already exist are replaced in place, and new entries are appended after
-    the copied ones. Every entry is written ``ZIP_STORED``. Safe when
-    ``output_usdz == input_usdz`` (writes to a sibling temp file, then
-    :func:`os.replace`).
+    the copied ones. Values may be ``bytes`` (written in memory) or a
+    :class:`~pathlib.Path` (streamed from disk). Every entry is written
+    ``ZIP_STORED``. Safe when ``output_usdz == input_usdz`` (writes to a
+    sibling temp file, then :func:`os.replace`).
     """
     output_usdz.parent.mkdir(parents=True, exist_ok=True)
 
@@ -500,17 +700,25 @@ def _repack_usdz(
                         continue
                     seen.add(name)
                     if name in entries_to_write:
-                        _write_stored(zout, name, entries_to_write[name])
+                        _write_entry(zout, name, entries_to_write[name])
                     else:
                         _write_stored(zout, name, zin.read(name))
                 for name in added:
-                    _write_stored(zout, name, entries_to_write[name])
+                    _write_entry(zout, name, entries_to_write[name])
             os.replace(tmp_path, output_usdz)
         except BaseException:
             tmp_path.unlink(missing_ok=True)
             raise
 
     return added, replaced
+
+
+def _write_entry(zf: zipfile.ZipFile, name: str, source: bytes | Path) -> None:
+    """Write ``source`` at ``name`` as ``ZIP_STORED`` — streamed if it's a Path."""
+    if isinstance(source, Path):
+        zf.write(source, name, compress_type=zipfile.ZIP_STORED)
+    else:
+        _write_stored(zf, name, source)
 
 
 def _write_stored(zf: zipfile.ZipFile, name: str, content: bytes) -> None:
