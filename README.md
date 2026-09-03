@@ -26,6 +26,49 @@ rigs use X-forward/Y-left/Z-up, quaternions are xyzw, and timestamps are
 strictly increasing u64 microseconds. Writers reject reflections, invalid
 rotations, and mismatched frame declarations.
 
+## Autoware map bundle (`autoware_map/`)
+
+HD maps are embedded under an `autoware_map/` prefix that mirrors Autoware's
+own [map directory layout](https://autowarefoundation.github.io/autoware-documentation/main/how-to-guides/integrating-autoware/launch-autoware/map/),
+so a consumer can extract `autoware_map/` and hand it to `autoware_map_loader`
+verbatim:
+
+```
+autoware_map/
+├── lanelet2_map.osm              # vector map      -> extras.map_lanelet2
+├── pointcloud_map.pcd            # single PCD, OR  -> extras.map_pointcloud
+├── pointcloud_map/               #   split tiles   -> extras.map_pointcloud ("autoware_map/pointcloud_map/")
+│   ├── A.pcd
+│   └── B.pcd
+├── pointcloud_map_metadata.yaml  # split-tile index -> extras.map_pointcloud_metadata
+└── map_projector_info.yaml       # projection info  -> extras.map_projector_info
+```
+
+The lanelet2 map lives here now (`autoware_map/lanelet2_map.osm`); the earlier
+archive-root `map.osm` location was removed. When the point-cloud map is split
+into multiple `.pcd` files, `extras.map_pointcloud` records the directory
+prefix (trailing slash) instead of a single file. The writer still
+cross-checks a bundle's `ecef_anchor` against the embedded lanelet2 map and
+refuses to produce one whose world origin decodes far from the map.
+
+Embed maps into an existing bundle with the editor CLI — a single file, a
+whole map directory, or a point-cloud map (single `.pcd` or a tile directory):
+
+```bash
+# whole Autoware map directory
+python -m 3dgs_io.edit_usdz_cli autoware-map \
+    --input scene.usdz --output scene.usdz --map-dir path/to/autoware_map
+
+# lanelet2 only
+python -m 3dgs_io.edit_usdz_cli lanelet2 \
+    --input scene.usdz --output scene.usdz --lanelet2 path/to/lanelet2_map.osm
+
+# point cloud (file or directory, with optional metadata)
+python -m 3dgs_io.edit_usdz_cli pointcloud \
+    --input scene.usdz --output scene.usdz \
+    --pcd path/to/pointcloud_map --metadata path/to/pointcloud_map_metadata.yaml
+```
+
 ## Dynamic objects: rigid actor assets (`splatsim.actor_assets/v1`)
 
 `sequence_tracks.json` says *where* every dynamic object is at every moment; it

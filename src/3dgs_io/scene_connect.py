@@ -16,8 +16,9 @@ prevent: an earlier external pipeline subtracted the anchor's MGRS map
 coordinates instead, producing a bundle that rendered fine standalone but
 whose anchor decoded ~95 km away — silently breaking every geodetic consumer
 (CARLA bridge, Autoware map alignment). The writer additionally cross-checks
-the output anchor against the bundled Lanelet2 ``map.osm``
-(:func:`~3dgs_io._geodesy.validate_anchor_against_lanelet2`).
+the output anchor against the bundled Lanelet2 map
+(``autoware_map/lanelet2_map.osm``,
+:func:`~3dgs_io._geodesy.validate_anchor_against_lanelet2`).
 
 Both ``splatsim.scene/v2`` (sidecar LiDAR files) and ``splatsim.scene/v3``
 (SPZ-embedded LiDAR extension records) bundles are accepted as input; the
@@ -125,7 +126,7 @@ class SceneBundle:
     actor_payloads: dict[str, bytes] = field(default_factory=dict)
     """Encoded actor SPZ payloads by ``asset_id``, carried through verbatim."""
     extras: list[tuple[str, bytes]] = field(default_factory=list)
-    """Non-rebuilt archive entries (``map.osm``, CARLA world, ...) verbatim."""
+    """Non-rebuilt archive entries (``autoware_map/``, CARLA world, ...) verbatim."""
 
 
 def _load_chunk_cloud(zf: zipfile.ZipFile, name: str) -> tuple[spz.GaussianCloud, bytes]:
@@ -441,7 +442,7 @@ def connect_scene_usdzs(
     """Merge multiple scene USDZ bundles into one connected bundle.
 
     The first input is the *reference* scene: its world frame orientation,
-    ``map.osm`` / CARLA world / other extras are carried into the output.
+    ``autoware_map/`` / CARLA world / other extras are carried into the output.
     Every other scene is baked into the reference frame through the geodetic
     anchors (``inv(A_ref) @ A_i``); the merged geometry is then recentred at
     its bounding-box centre and that shift is folded into the output

@@ -28,6 +28,9 @@ _cli = importlib.import_module("3dgs_io.edit_usdz_cli")
 
 _SAMPLE_OSM = b'<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6"/>\n'
 
+# Archive path the lanelet2 map lives at, mirroring Autoware's map directory.
+_LL2 = "autoware_map/lanelet2_map.osm"
+
 
 # ----------------------------------------------------------------------------
 # Fixtures
@@ -134,17 +137,17 @@ def test_add_lanelet2_inserts_map_osm_and_updates_scene_json(tmp_path: Path) -> 
     out = tmp_path / "with_map.usdz"
 
     result = _edit.add_lanelet2_to_usdz(src, out, osm)
-    assert result.added == ["map.osm"]
+    assert result.added == [_LL2]
     assert result.replaced == []
     assert result.out_path == out
 
     with zipfile.ZipFile(out) as zf:
         names = zf.namelist()
         assert names[0] == "default.usda", "default.usda must remain first per USDZ spec"
-        assert "map.osm" in names
-        assert zf.read("map.osm") == _SAMPLE_OSM
+        assert _LL2 in names
+        assert zf.read(_LL2) == _SAMPLE_OSM
         scene = json.loads(zf.read("scene.json"))
-    assert scene["extras"]["map_lanelet2"] == "map.osm"
+    assert scene["extras"]["map_lanelet2"] == _LL2
 
 
 def test_add_lanelet2_preserves_original_entry_order(tmp_path: Path) -> None:
@@ -159,28 +162,28 @@ def test_add_lanelet2_preserves_original_entry_order(tmp_path: Path) -> None:
     with zipfile.ZipFile(out) as zout:
         out_names = zout.namelist()
     assert out_names[: len(src_names)] == src_names
-    assert out_names[-1] == "map.osm"
+    assert out_names[-1] == _LL2
 
 
 def test_add_lanelet2_replaces_existing_map_osm(tmp_path: Path) -> None:
     old_osm = _make_osm(tmp_path, name="old.osm", data=b"<osm/><!-- old -->")
-    src = _make_usdz(tmp_path, extras={"map.osm": old_osm})
+    src = _make_usdz(tmp_path, extras={_LL2: old_osm})
     new_osm = _make_osm(tmp_path, name="new.osm", data=_SAMPLE_OSM)
     out = tmp_path / "replaced.usdz"
 
     result = _edit.add_lanelet2_to_usdz(src, out, new_osm, overwrite=True)
-    assert result.replaced == ["map.osm"]
+    assert result.replaced == [_LL2]
     assert result.added == []
 
     with zipfile.ZipFile(out) as zf:
-        assert zf.read("map.osm") == _SAMPLE_OSM
+        assert zf.read(_LL2) == _SAMPLE_OSM
         scene = json.loads(zf.read("scene.json"))
-    assert scene["extras"]["map_lanelet2"] == "map.osm"
+    assert scene["extras"]["map_lanelet2"] == _LL2
 
 
 def test_add_lanelet2_no_overwrite_raises_when_present(tmp_path: Path) -> None:
     existing_osm = _make_osm(tmp_path, name="existing.osm", data=b"<osm/>")
-    src = _make_usdz(tmp_path, extras={"map.osm": existing_osm})
+    src = _make_usdz(tmp_path, extras={_LL2: existing_osm})
     with pytest.raises(ValueError, match="already contains"):
         _edit.add_lanelet2_to_usdz(
             src,
@@ -207,9 +210,9 @@ def test_add_lanelet2_output_can_equal_input(tmp_path: Path) -> None:
     with zipfile.ZipFile(src) as zf:
         names = zf.namelist()
         assert names[0] == "default.usda"
-        assert "map.osm" in names
+        assert _LL2 in names
         scene = json.loads(zf.read("scene.json"))
-    assert scene["extras"]["map_lanelet2"] == "map.osm"
+    assert scene["extras"]["map_lanelet2"] == _LL2
 
 
 def test_add_lanelet2_missing_scene_json_raises(tmp_path: Path) -> None:
@@ -329,6 +332,131 @@ def test_add_clipgt_missing_dir_raises(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------------
+# add_pointcloud_map_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def _make_pcd(tmp_path: Path, name: str = "pointcloud_map.pcd") -> Path:
+    p = tmp_path / name
+    p.write_bytes(b"# .PCD v0.7\nPOINTS 0\n")
+    return p
+
+
+def test_add_pointcloud_single_file(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    pcd = _make_pcd(tmp_path)
+    out = tmp_path / "with_pcd.usdz"
+
+    result = _edit.add_pointcloud_map_to_usdz(src, out, pcd)
+    assert "autoware_map/pointcloud_map.pcd" in result.added
+
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("autoware_map/pointcloud_map.pcd") == pcd.read_bytes()
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map.pcd"
+
+
+def test_add_pointcloud_directory_with_metadata(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    pcd_dir = tmp_path / "pointcloud_map"
+    pcd_dir.mkdir()
+    (pcd_dir / "A.pcd").write_bytes(b"# .PCD A\n")
+    (pcd_dir / "B.pcd").write_bytes(b"# .PCD B\n")
+    meta = tmp_path / "pointcloud_map_metadata.yaml"
+    meta.write_text("x_resolution: 100.0\n")
+    out = tmp_path / "with_pcd_dir.usdz"
+
+    result = _edit.add_pointcloud_map_to_usdz(src, out, pcd_dir, metadata_yaml=meta)
+    assert "autoware_map/pointcloud_map/A.pcd" in result.added
+    assert "autoware_map/pointcloud_map/B.pcd" in result.added
+    assert "autoware_map/pointcloud_map_metadata.yaml" in result.added
+
+    with zipfile.ZipFile(out) as zf:
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map/"
+    assert scene["extras"]["map_pointcloud_metadata"] == "autoware_map/pointcloud_map_metadata.yaml"
+
+
+def test_add_pointcloud_no_overwrite_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path, extras={"autoware_map/pointcloud_map.pcd": _make_pcd(tmp_path)})
+    with pytest.raises(FileExistsError):
+        _edit.add_pointcloud_map_to_usdz(
+            src, tmp_path / "out.usdz", _make_pcd(tmp_path, name="fresh.pcd"), overwrite=False
+        )
+
+
+def test_add_pointcloud_missing_input_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_pointcloud_map_to_usdz(src, tmp_path / "out.usdz", tmp_path / "nope.pcd")
+
+
+# ----------------------------------------------------------------------------
+# add_autoware_map_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def _make_autoware_map_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "autoware_map_src"
+    d.mkdir()
+    (d / "lanelet2_map.osm").write_bytes(_SAMPLE_OSM)
+    (d / "pointcloud_map.pcd").write_bytes(b"# .PCD v0.7\n")
+    (d / "map_projector_info.yaml").write_text("projector_type: MGRS\n")
+    return d
+
+
+def test_add_autoware_map_embeds_dir_and_records_extras(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    map_dir = _make_autoware_map_dir(tmp_path)
+    out = tmp_path / "with_autoware_map.usdz"
+
+    result = _edit.add_autoware_map_to_usdz(src, out, map_dir)
+    assert _LL2 in result.added
+    assert "autoware_map/pointcloud_map.pcd" in result.added
+    assert "autoware_map/map_projector_info.yaml" in result.added
+
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read(_LL2) == _SAMPLE_OSM
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_lanelet2"] == _LL2
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map.pcd"
+    assert scene["extras"]["map_projector_info"] == "autoware_map/map_projector_info.yaml"
+
+
+def test_add_autoware_map_no_overwrite_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path, extras={_LL2: _make_osm(tmp_path)})
+    map_dir = _make_autoware_map_dir(tmp_path)
+    with pytest.raises(FileExistsError):
+        _edit.add_autoware_map_to_usdz(src, tmp_path / "out.usdz", map_dir, overwrite=False)
+
+
+def test_add_autoware_map_missing_dir_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_autoware_map_to_usdz(src, tmp_path / "out.usdz", tmp_path / "nope")
+
+
+def test_cli_pointcloud_and_autoware_map(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    src = _make_usdz(tmp_path)
+    pcd = _make_pcd(tmp_path)
+    out_pcd = tmp_path / "cli_pcd.usdz"
+    rc = _cli.main(["pointcloud", "--input", str(src), "--output", str(out_pcd), "--pcd", str(pcd)])
+    assert rc == 0
+    capsys.readouterr()
+    with zipfile.ZipFile(out_pcd) as zf:
+        assert "autoware_map/pointcloud_map.pcd" in zf.namelist()
+
+    map_dir = _make_autoware_map_dir(tmp_path)
+    out_map = tmp_path / "cli_map.usdz"
+    rc = _cli.main(
+        ["autoware-map", "--input", str(src), "--output", str(out_map), "--map-dir", str(map_dir)]
+    )
+    assert rc == 0
+    with zipfile.ZipFile(out_map) as zf:
+        assert _LL2 in zf.namelist()
+
+
+# ----------------------------------------------------------------------------
 # update_camera_intrinsics_in_usdz — library API
 # ----------------------------------------------------------------------------
 
@@ -426,13 +554,13 @@ def test_cli_lanelet2_writes_output_and_summary(
     assert rc == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["out_path"] == str(out)
-    assert summary["added"] == ["map.osm"]
+    assert summary["added"] == [_LL2]
     assert summary["replaced"] == []
 
     with zipfile.ZipFile(out) as zf:
-        assert "map.osm" in zf.namelist()
+        assert _LL2 in zf.namelist()
         scene = json.loads(zf.read("scene.json"))
-    assert scene["extras"]["map_lanelet2"] == "map.osm"
+    assert scene["extras"]["map_lanelet2"] == _LL2
 
 
 def test_cli_lanelet2_quiet_suppresses_summary(
@@ -458,7 +586,7 @@ def test_cli_lanelet2_quiet_suppresses_summary(
 
 def test_cli_lanelet2_no_overwrite_errors_when_map_osm_present(tmp_path: Path) -> None:
     existing_osm = _make_osm(tmp_path, name="existing.osm", data=b"<osm/>")
-    src = _make_usdz(tmp_path, extras={"map.osm": existing_osm})
+    src = _make_usdz(tmp_path, extras={_LL2: existing_osm})
     with pytest.raises(ValueError, match="already contains"):
         _cli.main(
             [

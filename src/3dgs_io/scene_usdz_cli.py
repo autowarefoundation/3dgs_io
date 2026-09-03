@@ -70,9 +70,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Embed SRC (file or directory) at archive path ARC. Repeatable. "
             "Known archive paths get recorded in scene.json's extras block: "
-            "map.osm, map.xodr, carla_world/manifest.json, tracks.parquet, "
-            "trajectory.parquet, sequence_tracks.json, rig_trajectories.json, "
-            "ppisp.json."
+            "autoware_map/lanelet2_map.osm, autoware_map/pointcloud_map.pcd (or "
+            "autoware_map/pointcloud_map/), autoware_map/pointcloud_map_metadata.yaml, "
+            "autoware_map/map_projector_info.yaml, map.xodr, carla_world/manifest.json, "
+            "tracks.parquet, trajectory.parquet, sequence_tracks.json, "
+            "rig_trajectories.json, ppisp.json."
         ),
     )
 

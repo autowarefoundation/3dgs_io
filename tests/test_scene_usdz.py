@@ -406,6 +406,9 @@ def test_scene_json_schema(tmp_path: Path) -> None:
     assert scene["gaussians"]["n_gaussians"] > 0
     assert scene["extras"] == {
         "map_lanelet2": None,
+        "map_pointcloud": None,
+        "map_pointcloud_metadata": None,
+        "map_projector_info": None,
         "map_opendrive": None,
         "carla_world": None,
         "tracks": None,
@@ -530,8 +533,12 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
     src_dir.mkdir()
     (src_dir / "manifest.json").write_text('{"schema": "splatsim.carla_world/v1"}')
     (src_dir / "extra.bin").write_bytes(b"\x00\x01")
-    osm = tmp_path / "map.osm"
+    osm = tmp_path / "lanelet2_map.osm"
     osm.write_text("<osm/>")
+    pcd = tmp_path / "pointcloud_map.pcd"
+    pcd.write_bytes(b"# .PCD v0.7\n")
+    projector = tmp_path / "map_projector_info.yaml"
+    projector.write_text("projector_type: MGRS\n")
     xodr = tmp_path / "map.xodr"
     xodr.write_text("<OpenDRIVE/>")
     traj = tmp_path / "trajectory.parquet"
@@ -543,7 +550,9 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
         out,
         extras={
             "carla_world": src_dir,
-            "map.osm": osm,
+            "autoware_map/lanelet2_map.osm": osm,
+            "autoware_map/pointcloud_map.pcd": pcd,
+            "autoware_map/map_projector_info.yaml": projector,
             "map.xodr": xodr,
             "trajectory.parquet": traj,
         },
@@ -551,13 +560,18 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
     names = set(_names(out))
     assert "carla_world/manifest.json" in names
     assert "carla_world/extra.bin" in names
-    assert "map.osm" in names
+    assert "autoware_map/lanelet2_map.osm" in names
+    assert "autoware_map/pointcloud_map.pcd" in names
+    assert "autoware_map/map_projector_info.yaml" in names
     assert "map.xodr" in names
     assert "trajectory.parquet" in names
 
     scene = json.loads(_read(out, "scene.json"))
     assert scene["extras"] == {
-        "map_lanelet2": "map.osm",
+        "map_lanelet2": "autoware_map/lanelet2_map.osm",
+        "map_pointcloud": "autoware_map/pointcloud_map.pcd",
+        "map_pointcloud_metadata": None,
+        "map_projector_info": "autoware_map/map_projector_info.yaml",
         "map_opendrive": "map.xodr",
         "carla_world": "carla_world/manifest.json",
         "tracks": None,
@@ -567,6 +581,35 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
         "ppisp": None,
         "actor_assets": None,
     }
+
+
+def test_extras_split_pointcloud_map_directory(tmp_path: Path) -> None:
+    ts = _make_tileset(tmp_path)
+    pcd_dir = tmp_path / "pointcloud_map"
+    pcd_dir.mkdir()
+    (pcd_dir / "A.pcd").write_bytes(b"# .PCD A\n")
+    (pcd_dir / "B.pcd").write_bytes(b"# .PCD B\n")
+    meta = tmp_path / "pointcloud_map_metadata.yaml"
+    meta.write_text("x_resolution: 100.0\n")
+
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(
+        ts,
+        out,
+        extras={
+            "autoware_map/pointcloud_map": pcd_dir,
+            "autoware_map/pointcloud_map_metadata.yaml": meta,
+        },
+    )
+    names = set(_names(out))
+    assert "autoware_map/pointcloud_map/A.pcd" in names
+    assert "autoware_map/pointcloud_map/B.pcd" in names
+    assert "autoware_map/pointcloud_map_metadata.yaml" in names
+
+    scene = json.loads(_read(out, "scene.json"))
+    # A split point-cloud map records the directory prefix, not a single file.
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map/"
+    assert scene["extras"]["map_pointcloud_metadata"] == "autoware_map/pointcloud_map_metadata.yaml"
 
 
 def test_arbitrary_extras_path_is_embedded_but_not_in_scene_meta(tmp_path: Path) -> None:
