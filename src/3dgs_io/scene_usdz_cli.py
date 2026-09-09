@@ -1,0 +1,239 @@
+"""CLI for :func:`3dgs_io.scene_usdz.save_scene_usdz`.
+
+Invoke with ``python -m 3dgs_io`` (or ``python -m 3dgs_io.scene_usdz_cli``)::
+
+    python -m 3dgs_io  path/to/tileset.json  output.usdz  \\
+        [--extra ARCHIVE_PATH=SOURCE_PATH ...]              \\
+        [--chunk-size N]  [--min-scale F]  ...
+
+The input must be a Cesium 3D Tiles ``tileset.json``. Its ECEF placement is
+preserved while glTF/RUB payloads are reconciled to the bundle's Z-up ENU
+world convention.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import sys
+from pathlib import Path
+
+from .ppisp import parse_ppisp
+from .rig_trajectories import load_rig_trajectories_doc
+from .scene_usdz import (
+    SceneUsdzOptions,
+    _result_summary,
+    save_scene_usdz,
+)
+from .tracks import parse_tracks
+from .usdz_metadata import make_default_metadata
+
+
+def _parse_extra(spec: str) -> tuple[str, Path]:
+    """``ARCHIVE_PATH=SOURCE_PATH`` → ``(archive_path, Path(source))``."""
+    if "=" not in spec:
+        raise argparse.ArgumentTypeError(f"--extra value {spec!r} must be ARCHIVE_PATH=SOURCE_PATH")
+    arc, src = spec.split("=", 1)
+    arc = arc.strip()
+    src_path = Path(src.strip()).expanduser()
+    if not arc:
+        raise argparse.ArgumentTypeError(f"--extra {spec!r}: archive path is empty")
+    return arc, src_path
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m 3dgs_io",
+        description=(
+            "Pack a Cesium 3D Tiles tileset.json (+ optional extra files) "
+            "into a single self-contained USDZ scene bundle. The source "
+            "tileset's root.transform (world anchor) is preserved into the "
+            "output."
+        ),
+    )
+    p.add_argument(
+        "tileset",
+        type=Path,
+        help="Input Cesium 3D Tiles tileset.json",
+    )
+    p.add_argument("out_usdz", type=Path, help="Output single-file USDZ path")
+
+    p.add_argument(
+        "--extra",
+        action="append",
+        dest="extras",
+        default=[],
+        metavar="ARC=SRC",
+        type=_parse_extra,
+        help=(
+            "Embed SRC (file or directory) at archive path ARC. Repeatable. "
+            "Known archive paths get recorded in scene.json's extras block: "
+            "autoware_map/lanelet2_map.osm, autoware_map/pointcloud_map.pcd (or "
+            "autoware_map/pointcloud_map/), autoware_map/pointcloud_map_metadata.yaml, "
+            "autoware_map/map_projector_info.yaml, map.xodr, carla_world/manifest.json, "
+            "tracks.parquet, trajectory.parquet, sequence_tracks.json, "
+            "rig_trajectories.json, ppisp.json."
+        ),
+    )
+
+    p.add_argument(
+        "--tracks",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a splatsim.sequence_tracks/v2 JSON file describing dynamic-object "
+            "trajectories. Embedded as sequence_tracks.json in the output USDZ."
+        ),
+    )
+    p.add_argument(
+        "--rig-trajectories",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a splatsim.rig_trajectories/v2 JSON file describing ego / sensor-rig "
+            "pose time-series. Embedded as rig_trajectories.json in the output USDZ."
+        ),
+    )
+    p.add_argument(
+        "--ppisp",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to a splatsim.ppisp/v1 JSON file describing per-camera / "
+            "per-frame PPISP appearance-correction parameters. Embedded as "
+            "ppisp.json in the output USDZ."
+        ),
+    )
+    p.add_argument(
+        "--actor-assets",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Path to a splatsim.actor_assets/v1 bank directory (an "
+            "actor_assets.json plus actor_assets/<asset_id>/asset.spz payloads) "
+            "describing rigid dynamic-object assets and their track bindings. "
+            "Embedded verbatim in the output USDZ."
+        ),
+    )
+
+    p.add_argument("--chunk-size", type=float, default=50.0)
+    p.add_argument("--max-points-per-chunk", type=int, default=200_000)
+    p.add_argument("--min-scale", type=float, default=0.05)
+    p.add_argument("--max-aspect-ratio", type=float, default=5.0)
+    p.add_argument("--opacity-threshold", type=float, default=0.0)
+    p.add_argument(
+        "--bbox-radius",
+        type=float,
+        default=math.inf,
+        help="Drop gaussians whose distance to median exceeds this radius (default: inf)",
+    )
+
+    p.add_argument("--exposure", type=float, default=1.6)
+    p.add_argument("--near-plane", type=float, default=0.5)
+    p.add_argument("--far-plane", type=float, default=300.0)
+
+    p.add_argument(
+        "--uuid",
+        default=None,
+        help="metadata.yaml uuid for the output USDZ (default: fresh random UUID4)",
+    )
+    p.add_argument(
+        "--scene-id",
+        dest="scene_id",
+        default=None,
+        help="metadata.yaml scene_id for the output USDZ (default: output filename stem)",
+    )
+    p.add_argument(
+        "--version-string",
+        dest="version_string",
+        default=None,
+        help=(
+            "metadata.yaml version_string for the output USDZ "
+            "(default: '3dgs_io/<installed-version>')"
+        ),
+    )
+
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the JSON result summary on stdout",
+    )
+    return p
+
+
+def _options_from_args(args: argparse.Namespace) -> SceneUsdzOptions:
+    return SceneUsdzOptions(
+        chunk_size=args.chunk_size,
+        max_points_per_chunk=args.max_points_per_chunk,
+        min_scale=args.min_scale,
+        max_aspect_ratio=args.max_aspect_ratio,
+        opacity_threshold=args.opacity_threshold,
+        bbox_radius=args.bbox_radius,
+        exposure=args.exposure,
+        near_plane=args.near_plane,
+        far_plane=args.far_plane,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    level = logging.WARNING - 10 * args.verbose
+    logging.basicConfig(
+        level=max(level, logging.DEBUG),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    extras = dict(args.extras) if args.extras else None
+    tracks = None
+    if args.tracks is not None:
+        tracks_path = Path(args.tracks).expanduser()
+        tracks_doc = json.loads(tracks_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(tracks_doc, dict):
+            raise ValueError(
+                f"--tracks: {tracks_path} top-level value must be a JSON object, "
+                f"got {type(tracks_doc).__name__}"
+            )
+        tracks = parse_tracks(tracks_doc)
+    rig_trajectories = None
+    if args.rig_trajectories is not None:
+        rig_path = Path(args.rig_trajectories).expanduser()
+        rig_doc = json.loads(rig_path.read_text(encoding="utf-8-sig"))
+        rig_trajectories = load_rig_trajectories_doc(rig_doc)
+    ppisp = None
+    if args.ppisp is not None:
+        ppisp_path = Path(args.ppisp).expanduser()
+        ppisp_doc = json.loads(ppisp_path.read_text(encoding="utf-8-sig"))
+        ppisp = parse_ppisp(ppisp_doc)
+    metadata = make_default_metadata(
+        out_path=args.out_usdz,
+        uuid=args.uuid,
+        scene_id=args.scene_id,
+        version_string=args.version_string,
+    )
+    result = save_scene_usdz(
+        args.tileset,
+        args.out_usdz,
+        extras=extras,
+        tracks=tracks,
+        rig_trajectories=rig_trajectories,
+        ppisp=ppisp,
+        actor_assets=args.actor_assets,
+        metadata=metadata,
+        options=_options_from_args(args),
+    )
+
+    if not args.quiet:
+        json.dump(_result_summary(result), sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -1,0 +1,62 @@
+[project]
+name = "3dgs-io"
+version = "2.2.1"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Masaya Kataoka", email = "ms.kataoka@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.1,<2.3",
+    "scipy>=1.11",
+    "spz",
+]
+
+[project.optional-dependencies]
+# Origin auto-derivation for the lanelet2→clipgt converter (ECEF → MGRS).
+# Install with: pip install 3dgs-io[converters]
+converters = [
+    "pyproj>=3.6",
+    "mgrs>=1.4",
+]
+
+# Note: the package directory is named ``3dgs_io`` (starts with a digit), so a
+# ``[project.scripts]`` console-script entry is not possible — the generated
+# wrapper would emit ``from 3dgs_io.* import ...`` which is a SyntaxError, and
+# uv_build refuses ``module-name`` entries that aren't valid Python identifiers.
+# Run the CLI with ``python -m 3dgs_io`` or ``python -m 3dgs_io.scene_bundle_cli``.
+
+
+[build-system]
+requires = ["uv_build>=0.9.7,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+spz = { git = "https://github.com/nianticlabs/spz.git", rev="v3.0.0"}
+
+# Force spz's CMake down the FetchContent path for zstd. Distro zstd CMake
+# configs (e.g. Ubuntu 24.04) expose a non-PIC libzstd.a that spz prefers,
+# which cannot be linked into the Python shared module.
+[tool.uv.extra-build-variables]
+spz = { CMAKE_ARGS = "-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE" }
+
+[dependency-groups]
+dev = [
+    "furo>=2024.8.6",
+    "pre-commit>=4.0.0",
+    "pytest>=9.0.3",
+    "ruff>=0.14.0",
+    "sphinx>=8.0",
+    "sphinx-autodoc-typehints>=2.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,899 @@
+"""Tests for :mod:`3dgs_io.edit_usdz` and ``python -m 3dgs_io.edit_usdz_cli``."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import zipfile
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+import spz
+
+_mod = importlib.import_module("3dgs_io")
+Camera = _mod.Camera
+CameraExtrinsics = _mod.CameraExtrinsics
+CameraModel = _mod.CameraModel
+RigPose = _mod.RigPose
+RigTrajectory = _mod.RigTrajectory
+save_gltf = _mod.save_gltf
+save_scene_usdz = _mod.save_scene_usdz
+serialize_rig_trajectories = _mod.serialize_rig_trajectories
+
+_edit = importlib.import_module("3dgs_io.edit_usdz")
+_cli = importlib.import_module("3dgs_io.edit_usdz_cli")
+
+
+_SAMPLE_OSM = b'<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6"/>\n'
+
+# Archive path the lanelet2 map lives at, mirroring Autoware's map directory.
+_LL2 = "autoware_map/lanelet2_map.osm"
+
+
+# ----------------------------------------------------------------------------
+# Fixtures
+# ----------------------------------------------------------------------------
+
+
+def _make_cloud(n: int = 32) -> spz.GaussianCloud:
+    rng = np.random.default_rng(0)
+    gc = spz.GaussianCloud()
+    gc.antialiased = False
+    gc.positions = rng.uniform(-10.0, 10.0, size=n * 3).astype(np.float32)
+    quats = rng.standard_normal((n, 4)).astype(np.float32)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True)
+    gc.rotations = quats.reshape(-1)
+    gc.scales = rng.uniform(-3.0, 0.5, size=n * 3).astype(np.float32)
+    gc.alphas = rng.standard_normal(n).astype(np.float32)
+    gc.colors = rng.uniform(0.0, 1.0, size=n * 3).astype(np.float32)
+    gc.sh_degree = 0
+    gc.sh = np.zeros(0, dtype=np.float32)
+    return gc
+
+
+def _make_tileset(tmp_path: Path) -> Path:
+    save_gltf(_make_cloud(), tmp_path / "model.glb")
+    doc = {
+        "asset": {"version": "1.1"},
+        "geometricError": 100.0,
+        "root": {
+            "boundingVolume": {
+                "box": [0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 100.0]
+            },
+            "geometricError": 0,
+            "refine": "ADD",
+            "content": {"uri": "model.glb"},
+        },
+    }
+    tp = tmp_path / "tileset.json"
+    tp.write_text(json.dumps(doc))
+    return tp
+
+
+def _make_usdz(tmp_path: Path, *, extras: dict[str, Path] | None = None) -> Path:
+    ts = _make_tileset(tmp_path)
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, extras=extras)
+    return out
+
+
+def _make_osm(tmp_path: Path, *, name: str = "map.osm", data: bytes = _SAMPLE_OSM) -> Path:
+    p = tmp_path / name
+    p.write_bytes(data)
+    return p
+
+
+def _make_rig_trajectories_json(
+    tmp_path: Path,
+    *,
+    name: str = "rig_trajectories.json",
+    model: CameraModel | None = None,
+    camera_name: str = "front",
+    rig_id: str = "ego",
+) -> Path:
+    if model is None:
+        model = CameraModel.pinhole(width=1920, height=1080, fx=500, fy=500, cx=960, cy=540)
+    rig = RigTrajectory(
+        rig_id=rig_id,
+        poses=[RigPose(timestamp_us=0, translation=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0))],
+        cameras=[
+            Camera(
+                name=camera_name,
+                camera_model=model,
+                extrinsics=CameraExtrinsics(
+                    translation=(0.0, 0.0, 0.0),
+                    rotation=(0.0, 0.0, 0.0, 1.0),
+                ),
+            )
+        ],
+    )
+    p = tmp_path / name
+    p.write_text(json.dumps(serialize_rig_trajectories([rig]), indent=2), encoding="utf-8")
+    return p
+
+
+def _make_usdz_with_rig(tmp_path: Path, **rig_kwargs: Any) -> Path:
+    rig_path = _make_rig_trajectories_json(tmp_path, **rig_kwargs)
+    return _make_usdz(tmp_path, extras={"rig_trajectories.json": rig_path})
+
+
+def _read_rig_camera_params(usdz_path: Path) -> dict[str, Any]:
+    with zipfile.ZipFile(usdz_path) as zf:
+        doc = json.loads(zf.read("rig_trajectories.json").decode("utf-8-sig"))
+    (params,) = (camera["camera_model"]["parameters"] for camera in doc["rigs"][0]["cameras"])
+    return params
+
+
+# ----------------------------------------------------------------------------
+# add_lanelet2_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def test_add_lanelet2_inserts_map_osm_and_updates_scene_json(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    osm = _make_osm(tmp_path)
+    out = tmp_path / "with_map.usdz"
+
+    result = _edit.add_lanelet2_to_usdz(src, out, osm)
+    assert result.added == [_LL2]
+    assert result.replaced == []
+    assert result.out_path == out
+
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        assert names[0] == "default.usda", "default.usda must remain first per USDZ spec"
+        assert _LL2 in names
+        assert zf.read(_LL2) == _SAMPLE_OSM
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_lanelet2"] == _LL2
+
+
+def test_add_lanelet2_preserves_original_entry_order(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    osm = _make_osm(tmp_path)
+    out = tmp_path / "with_map.usdz"
+
+    _edit.add_lanelet2_to_usdz(src, out, osm)
+
+    with zipfile.ZipFile(src) as zin:
+        src_names = zin.namelist()
+    with zipfile.ZipFile(out) as zout:
+        out_names = zout.namelist()
+    assert out_names[: len(src_names)] == src_names
+    assert out_names[-1] == _LL2
+
+
+def test_add_lanelet2_replaces_existing_map_osm(tmp_path: Path) -> None:
+    old_osm = _make_osm(tmp_path, name="old.osm", data=b"<osm/><!-- old -->")
+    src = _make_usdz(tmp_path, extras={_LL2: old_osm})
+    new_osm = _make_osm(tmp_path, name="new.osm", data=_SAMPLE_OSM)
+    out = tmp_path / "replaced.usdz"
+
+    result = _edit.add_lanelet2_to_usdz(src, out, new_osm, overwrite=True)
+    assert result.replaced == [_LL2]
+    assert result.added == []
+
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read(_LL2) == _SAMPLE_OSM
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_lanelet2"] == _LL2
+
+
+def test_add_lanelet2_no_overwrite_raises_when_present(tmp_path: Path) -> None:
+    existing_osm = _make_osm(tmp_path, name="existing.osm", data=b"<osm/>")
+    src = _make_usdz(tmp_path, extras={_LL2: existing_osm})
+    with pytest.raises(ValueError, match="already contains"):
+        _edit.add_lanelet2_to_usdz(
+            src,
+            tmp_path / "out.usdz",
+            _make_osm(tmp_path, name="fresh.osm"),
+            overwrite=False,
+        )
+
+
+def test_add_lanelet2_zip_entries_are_uncompressed(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "with_map.usdz"
+    _edit.add_lanelet2_to_usdz(src, out, _make_osm(tmp_path))
+    with zipfile.ZipFile(out) as zf:
+        for info in zf.infolist():
+            assert info.compress_type == zipfile.ZIP_STORED, info.filename
+
+
+def test_add_lanelet2_output_can_equal_input(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    osm = _make_osm(tmp_path)
+    result = _edit.add_lanelet2_to_usdz(src, src, osm)
+    assert result.out_path == src
+    with zipfile.ZipFile(src) as zf:
+        names = zf.namelist()
+        assert names[0] == "default.usda"
+        assert _LL2 in names
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_lanelet2"] == _LL2
+
+
+def test_add_lanelet2_missing_scene_json_raises(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.usdz"
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("default.usda", "")
+    with pytest.raises(ValueError, match="scene.json"):
+        _edit.add_lanelet2_to_usdz(bad, tmp_path / "out.usdz", _make_osm(tmp_path))
+
+
+def test_add_lanelet2_missing_input_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        _edit.add_lanelet2_to_usdz(
+            tmp_path / "missing.usdz",
+            tmp_path / "out.usdz",
+            _make_osm(tmp_path),
+        )
+
+
+def test_add_lanelet2_missing_lanelet2_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_lanelet2_to_usdz(src, tmp_path / "out.usdz", tmp_path / "missing.osm")
+
+
+# ----------------------------------------------------------------------------
+# add_clipgt_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def _make_clipgt_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "clipgt_src"
+    d.mkdir()
+    (d / "lane.parquet").write_bytes(b"parquet-lane")
+    (d / "road_boundary.parquet").write_bytes(b"parquet-rb")
+    sub = d / "extras"
+    sub.mkdir()
+    (sub / "wait_line.parquet").write_bytes(b"parquet-wl")
+    return d
+
+
+def test_add_clipgt_inserts_files_under_prefix(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "with_clipgt.usdz"
+
+    result = _edit.add_clipgt_to_usdz(src, out, src_dir)
+    assert sorted(result.added) == [
+        "clipgt/extras/wait_line.parquet",
+        "clipgt/lane.parquet",
+        "clipgt/road_boundary.parquet",
+    ]
+    assert result.replaced == []
+    assert result.out_path == out
+
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+        assert names[0] == "default.usda", "default.usda must remain first per USDZ spec"
+        assert zf.read("clipgt/lane.parquet") == b"parquet-lane"
+        assert zf.read("clipgt/road_boundary.parquet") == b"parquet-rb"
+        assert zf.read("clipgt/extras/wait_line.parquet") == b"parquet-wl"
+
+
+def test_add_clipgt_preserves_original_entry_order(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "with_clipgt.usdz"
+
+    _edit.add_clipgt_to_usdz(src, out, src_dir)
+
+    with zipfile.ZipFile(src) as zin:
+        src_names = zin.namelist()
+    with zipfile.ZipFile(out) as zout:
+        out_names = zout.namelist()
+    assert out_names[: len(src_names)] == src_names
+    assert all(n.startswith("clipgt/") for n in out_names[len(src_names) :])
+
+
+def test_add_clipgt_replaces_existing_entries(tmp_path: Path) -> None:
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "lane.parquet").write_bytes(b"stale")
+    src = _make_usdz(tmp_path, extras={"clipgt/lane.parquet": stale_dir / "lane.parquet"})
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "replaced.usdz"
+
+    result = _edit.add_clipgt_to_usdz(src, out, src_dir)
+    assert "clipgt/lane.parquet" in result.replaced
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("clipgt/lane.parquet") == b"parquet-lane"
+
+
+def test_add_clipgt_no_overwrite_raises_on_existing_prefix(tmp_path: Path) -> None:
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    (stale_dir / "lane.parquet").write_bytes(b"stale")
+    src = _make_usdz(tmp_path, extras={"clipgt/lane.parquet": stale_dir / "lane.parquet"})
+    src_dir = _make_clipgt_dir(tmp_path)
+    out = tmp_path / "should_not_write.usdz"
+
+    with pytest.raises(FileExistsError):
+        _edit.add_clipgt_to_usdz(src, out, src_dir, overwrite=False)
+
+
+def test_add_clipgt_empty_dir_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(ValueError):
+        _edit.add_clipgt_to_usdz(src, tmp_path / "out.usdz", empty)
+
+
+def test_add_clipgt_missing_dir_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_clipgt_to_usdz(src, tmp_path / "out.usdz", tmp_path / "nope")
+
+
+# ----------------------------------------------------------------------------
+# add_pointcloud_map_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def _make_pcd(tmp_path: Path, name: str = "pointcloud_map.pcd") -> Path:
+    p = tmp_path / name
+    p.write_bytes(b"# .PCD v0.7\nPOINTS 0\n")
+    return p
+
+
+def test_add_pointcloud_single_file(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    pcd = _make_pcd(tmp_path)
+    out = tmp_path / "with_pcd.usdz"
+
+    result = _edit.add_pointcloud_map_to_usdz(src, out, pcd)
+    assert "autoware_map/pointcloud_map.pcd" in result.added
+
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read("autoware_map/pointcloud_map.pcd") == pcd.read_bytes()
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map.pcd"
+
+
+def test_add_pointcloud_directory_with_metadata(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    pcd_dir = tmp_path / "pointcloud_map"
+    pcd_dir.mkdir()
+    (pcd_dir / "A.pcd").write_bytes(b"# .PCD A\n")
+    (pcd_dir / "B.pcd").write_bytes(b"# .PCD B\n")
+    meta = tmp_path / "pointcloud_map_metadata.yaml"
+    meta.write_text("x_resolution: 100.0\n")
+    out = tmp_path / "with_pcd_dir.usdz"
+
+    result = _edit.add_pointcloud_map_to_usdz(src, out, pcd_dir, metadata_yaml=meta)
+    assert "autoware_map/pointcloud_map/A.pcd" in result.added
+    assert "autoware_map/pointcloud_map/B.pcd" in result.added
+    assert "autoware_map/pointcloud_map_metadata.yaml" in result.added
+
+    with zipfile.ZipFile(out) as zf:
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map/"
+    assert scene["extras"]["map_pointcloud_metadata"] == "autoware_map/pointcloud_map_metadata.yaml"
+
+
+def test_add_pointcloud_no_overwrite_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path, extras={"autoware_map/pointcloud_map.pcd": _make_pcd(tmp_path)})
+    with pytest.raises(FileExistsError):
+        _edit.add_pointcloud_map_to_usdz(
+            src, tmp_path / "out.usdz", _make_pcd(tmp_path, name="fresh.pcd"), overwrite=False
+        )
+
+
+def test_add_pointcloud_missing_input_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_pointcloud_map_to_usdz(src, tmp_path / "out.usdz", tmp_path / "nope.pcd")
+
+
+# ----------------------------------------------------------------------------
+# add_autoware_map_to_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def _make_autoware_map_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "autoware_map_src"
+    d.mkdir()
+    (d / "lanelet2_map.osm").write_bytes(_SAMPLE_OSM)
+    (d / "pointcloud_map.pcd").write_bytes(b"# .PCD v0.7\n")
+    (d / "map_projector_info.yaml").write_text("projector_type: MGRS\n")
+    return d
+
+
+def test_add_autoware_map_embeds_dir_and_records_extras(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    map_dir = _make_autoware_map_dir(tmp_path)
+    out = tmp_path / "with_autoware_map.usdz"
+
+    result = _edit.add_autoware_map_to_usdz(src, out, map_dir)
+    assert _LL2 in result.added
+    assert "autoware_map/pointcloud_map.pcd" in result.added
+    assert "autoware_map/map_projector_info.yaml" in result.added
+
+    with zipfile.ZipFile(out) as zf:
+        assert zf.read(_LL2) == _SAMPLE_OSM
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_lanelet2"] == _LL2
+    assert scene["extras"]["map_pointcloud"] == "autoware_map/pointcloud_map.pcd"
+    assert scene["extras"]["map_projector_info"] == "autoware_map/map_projector_info.yaml"
+
+
+def test_add_autoware_map_no_overwrite_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path, extras={_LL2: _make_osm(tmp_path)})
+    map_dir = _make_autoware_map_dir(tmp_path)
+    with pytest.raises(FileExistsError):
+        _edit.add_autoware_map_to_usdz(src, tmp_path / "out.usdz", map_dir, overwrite=False)
+
+
+def test_add_autoware_map_missing_dir_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        _edit.add_autoware_map_to_usdz(src, tmp_path / "out.usdz", tmp_path / "nope")
+
+
+def test_cli_pointcloud_and_autoware_map(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    src = _make_usdz(tmp_path)
+    pcd = _make_pcd(tmp_path)
+    out_pcd = tmp_path / "cli_pcd.usdz"
+    rc = _cli.main(["pointcloud", "--input", str(src), "--output", str(out_pcd), "--pcd", str(pcd)])
+    assert rc == 0
+    capsys.readouterr()
+    with zipfile.ZipFile(out_pcd) as zf:
+        assert "autoware_map/pointcloud_map.pcd" in zf.namelist()
+
+    map_dir = _make_autoware_map_dir(tmp_path)
+    out_map = tmp_path / "cli_map.usdz"
+    rc = _cli.main(
+        ["autoware-map", "--input", str(src), "--output", str(out_map), "--map-dir", str(map_dir)]
+    )
+    assert rc == 0
+    with zipfile.ZipFile(out_map) as zf:
+        assert _LL2 in zf.namelist()
+
+
+# ----------------------------------------------------------------------------
+# update_camera_intrinsics_in_usdz — library API
+# ----------------------------------------------------------------------------
+
+
+def test_intrinsics_updates_pinhole_focal_and_resolution(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "edited.usdz"
+    result = _edit.update_camera_intrinsics_in_usdz(
+        src,
+        out,
+        camera_name="front",
+        width=3840,
+        height=2160,
+        fx=1234.5,
+        fy=1200.0,
+    )
+    assert result.out_path == out
+    assert result.camera_name == "front"
+    assert result.replaced == ["rig_trajectories.json"]
+    assert result.updated_fields == ["fx", "fy", "height", "width"]
+
+    params = _read_rig_camera_params(out)
+    assert params["resolution"] == [3840, 2160]
+    assert params["fx"] == pytest.approx(1234.5)
+    assert params["fy"] == pytest.approx(1200.0)
+
+
+def test_intrinsics_output_can_equal_input(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    result = _edit.update_camera_intrinsics_in_usdz(src, src, camera_name="front", fx=999.0)
+    assert result.out_path == src
+    params = _read_rig_camera_params(src)
+    assert params["fx"] == pytest.approx(999.0)
+
+
+def test_intrinsics_preserves_original_entry_order(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "edited.usdz"
+    _edit.update_camera_intrinsics_in_usdz(src, out, camera_name="front", fx=800.0)
+    with zipfile.ZipFile(src) as zin:
+        src_names = zin.namelist()
+    with zipfile.ZipFile(out) as zout:
+        out_names = zout.namelist()
+    assert out_names == src_names
+    assert out_names[0] == "default.usda"
+
+
+def test_intrinsics_requires_at_least_one_update(tmp_path: Path) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    with pytest.raises(ValueError, match="at least one intrinsic update"):
+        _edit.update_camera_intrinsics_in_usdz(src, tmp_path / "out.usdz", camera_name="front")
+
+
+def test_intrinsics_missing_rig_trajectories_raises(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)  # no rig_trajectories embedded
+    with pytest.raises(ValueError, match="rig_trajectories.json"):
+        _edit.update_camera_intrinsics_in_usdz(
+            src, tmp_path / "out.usdz", camera_name="front", fx=800.0
+        )
+
+
+def test_intrinsics_missing_input_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        _edit.update_camera_intrinsics_in_usdz(
+            tmp_path / "missing.usdz",
+            tmp_path / "out.usdz",
+            camera_name="front",
+            fx=1.0,
+        )
+
+
+# ----------------------------------------------------------------------------
+# CLI — lanelet2 subcommand
+# ----------------------------------------------------------------------------
+
+
+def test_cli_lanelet2_writes_output_and_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz(tmp_path)
+    osm = _make_osm(tmp_path)
+    out = tmp_path / "cli.usdz"
+
+    rc = _cli.main(
+        [
+            "lanelet2",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--lanelet2",
+            str(osm),
+        ]
+    )
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["out_path"] == str(out)
+    assert summary["added"] == [_LL2]
+    assert summary["replaced"] == []
+
+    with zipfile.ZipFile(out) as zf:
+        assert _LL2 in zf.namelist()
+        scene = json.loads(zf.read("scene.json"))
+    assert scene["extras"]["map_lanelet2"] == _LL2
+
+
+def test_cli_lanelet2_quiet_suppresses_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "lanelet2",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--lanelet2",
+            str(_make_osm(tmp_path)),
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_lanelet2_no_overwrite_errors_when_map_osm_present(tmp_path: Path) -> None:
+    existing_osm = _make_osm(tmp_path, name="existing.osm", data=b"<osm/>")
+    src = _make_usdz(tmp_path, extras={_LL2: existing_osm})
+    with pytest.raises(ValueError, match="already contains"):
+        _cli.main(
+            [
+                "lanelet2",
+                "--input",
+                str(src),
+                "--output",
+                str(tmp_path / "out.usdz"),
+                "--lanelet2",
+                str(_make_osm(tmp_path, name="fresh.osm")),
+                "--no-overwrite",
+            ]
+        )
+
+
+# ----------------------------------------------------------------------------
+# CLI — intrinsics subcommand
+# ----------------------------------------------------------------------------
+
+
+def test_cli_intrinsics_updates_and_prints_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "intrinsics",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--camera",
+            "front",
+            "--width",
+            "3840",
+            "--height",
+            "2160",
+            "--fx",
+            "1000",
+            "--fy",
+            "1010",
+        ]
+    )
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["out_path"] == str(out)
+    assert summary["camera_name"] == "front"
+    assert summary["updated_fields"] == ["fx", "fy", "height", "width"]
+    assert summary["replaced"] == ["rig_trajectories.json"]
+
+    params = _read_rig_camera_params(out)
+    assert params["resolution"] == [3840, 2160]
+    assert params["fx"] == pytest.approx(1000.0)
+    assert params["fy"] == pytest.approx(1010.0)
+
+
+def test_cli_intrinsics_no_updates_returns_2(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    src = _make_usdz_with_rig(tmp_path)
+    rc = _cli.main(
+        [
+            "intrinsics",
+            "--input",
+            str(src),
+            "--output",
+            str(tmp_path / "out.usdz"),
+            "--camera",
+            "front",
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no intrinsic updates" in err
+
+
+def test_cli_intrinsics_distortion_coeffs_on_opencv(tmp_path: Path) -> None:
+    opencv_model = CameraModel.opencv(
+        width=1920,
+        height=1080,
+        fx=500,
+        fy=500,
+        cx=960,
+        cy=540,
+        distortion_coeffs=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    src = _make_usdz_with_rig(tmp_path, model=opencv_model)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "intrinsics",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--camera",
+            "front",
+            "--distortion-coeffs",
+            "0.1,-0.05,0.001,0.002,0.0",
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    params = _read_rig_camera_params(out)
+    assert params["distortion_coeffs"] == pytest.approx([0.1, -0.05, 0.001, 0.002, 0.0])
+
+
+# ----------------------------------------------------------------------------
+# set_usdz_metadata — library API
+# ----------------------------------------------------------------------------
+
+
+def _read_metadata_yaml(usdz_path: Path) -> dict[str, Any]:
+    with zipfile.ZipFile(usdz_path) as zf:
+        return json.loads(zf.read("metadata.yaml").decode("utf-8-sig"))
+
+
+def test_set_usdz_metadata_overwrites_default_manifest(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "edited.usdz"
+
+    result = _edit.set_usdz_metadata(
+        src,
+        out,
+        uuid="odaibatest5",
+        scene_id="odaibatest5",
+        version_string="local-e2e",
+    )
+    assert result.out_path == out
+    assert result.replaced == ["metadata.yaml"]
+    assert result.added == []
+    assert result.metadata == {
+        "uuid": "odaibatest5",
+        "scene_id": "odaibatest5",
+        "version_string": "local-e2e",
+    }
+
+    doc = _read_metadata_yaml(out)
+    assert doc["uuid"] == "odaibatest5"
+    assert doc["scene_id"] == "odaibatest5"
+    assert doc["version_string"] == "local-e2e"
+
+
+def test_set_usdz_metadata_adds_manifest_when_missing(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    # Simulate a legacy archive that predates the metadata.yaml commitment.
+    stripped = tmp_path / "legacy.usdz"
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(stripped, "w", zipfile.ZIP_STORED) as zout:
+        for info in zin.infolist():
+            if info.filename == "metadata.yaml":
+                continue
+            zout.writestr(info, zin.read(info.filename))
+    with zipfile.ZipFile(stripped) as zf:
+        assert "metadata.yaml" not in zf.namelist()
+
+    out = tmp_path / "restored.usdz"
+    result = _edit.set_usdz_metadata(stripped, out, uuid="u", scene_id="s", version_string="v")
+    assert result.added == ["metadata.yaml"]
+    assert result.replaced == []
+    doc = _read_metadata_yaml(out)
+    assert doc == {"uuid": "u", "scene_id": "s", "version_string": "v"}
+
+
+def test_set_usdz_metadata_inherits_missing_fields_from_existing(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    existing = _read_metadata_yaml(src)
+
+    out = tmp_path / "partial.usdz"
+    result = _edit.set_usdz_metadata(src, out, uuid="fixed-uuid")
+    assert result.metadata["uuid"] == "fixed-uuid"
+    # scene_id / version_string carry through from the source manifest.
+    assert result.metadata["scene_id"] == existing["scene_id"]
+    assert result.metadata["version_string"] == existing["version_string"]
+
+
+def test_set_usdz_metadata_output_can_equal_input(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    result = _edit.set_usdz_metadata(src, src, uuid="u2", scene_id="s2", version_string="v2")
+    assert result.out_path == src
+    doc = _read_metadata_yaml(src)
+    assert doc == {"uuid": "u2", "scene_id": "s2", "version_string": "v2"}
+
+
+def test_set_usdz_metadata_rejects_empty_required_field(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    with pytest.raises(ValueError, match="uuid"):
+        _edit.set_usdz_metadata(src, tmp_path / "out.usdz", uuid="")
+
+
+def test_set_usdz_metadata_extras_persist(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "with_extras.usdz"
+    _edit.set_usdz_metadata(
+        src,
+        out,
+        uuid="u",
+        scene_id="s",
+        version_string="v",
+        extras={"pipeline": "alpasim", "frame_count": 60},
+    )
+    doc = _read_metadata_yaml(out)
+    assert doc["pipeline"] == "alpasim"
+    assert doc["frame_count"] == 60
+
+
+def test_set_usdz_metadata_missing_input_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        _edit.set_usdz_metadata(
+            tmp_path / "missing.usdz",
+            tmp_path / "out.usdz",
+            uuid="u",
+            scene_id="s",
+            version_string="v",
+        )
+
+
+# ----------------------------------------------------------------------------
+# CLI — metadata subcommand
+# ----------------------------------------------------------------------------
+
+
+def test_cli_metadata_writes_manifest_and_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "cli.usdz"
+
+    rc = _cli.main(
+        [
+            "metadata",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--uuid",
+            "odaibatest5",
+            "--scene-id",
+            "odaibatest5",
+            "--version-string",
+            "local-e2e",
+        ]
+    )
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["out_path"] == str(out)
+    assert summary["metadata"] == {
+        "uuid": "odaibatest5",
+        "scene_id": "odaibatest5",
+        "version_string": "local-e2e",
+    }
+    assert summary["replaced"] == ["metadata.yaml"]
+
+    doc = _read_metadata_yaml(out)
+    assert doc["uuid"] == "odaibatest5"
+
+
+def test_cli_metadata_extras_flag_is_json_parsed(tmp_path: Path) -> None:
+    src = _make_usdz(tmp_path)
+    out = tmp_path / "cli.usdz"
+    rc = _cli.main(
+        [
+            "metadata",
+            "--input",
+            str(src),
+            "--output",
+            str(out),
+            "--uuid",
+            "u",
+            "--scene-id",
+            "s",
+            "--version-string",
+            "v",
+            "--extra",
+            "frame_count=60",
+            "--extra",
+            'tags=["mock","alpasim"]',
+            "--extra",
+            "pipeline=alpasim",
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    doc = _read_metadata_yaml(out)
+    assert doc["frame_count"] == 60
+    assert doc["tags"] == ["mock", "alpasim"]
+    assert doc["pipeline"] == "alpasim"
+
+
+def test_cli_metadata_rejects_shadowing_extra(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    src = _make_usdz(tmp_path)
+    rc = _cli.main(
+        [
+            "metadata",
+            "--input",
+            str(src),
+            "--output",
+            str(tmp_path / "out.usdz"),
+            "--uuid",
+            "u",
+            "--scene-id",
+            "s",
+            "--version-string",
+            "v",
+            "--extra",
+            "uuid=other",
+        ]
+    )
+    assert rc == 2
+    assert "shadow" in capsys.readouterr().err

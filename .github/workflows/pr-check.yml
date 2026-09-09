@@ -1,0 +1,31 @@
+name: pr-check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches: [main]
+
+jobs:
+  version-bump-label:
+    name: Require version bump label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for release label
+        env:
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          has() { echo "$LABELS" | jq -e --arg l "$1" 'any(. == $l)' >/dev/null; }
+          count=0
+          for lvl in major minor patch; do
+            if has "release:${lvl}"; then count=$((count + 1)); fi
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "::error::PR must have exactly one of: release:major, release:minor, release:patch"
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::PR has multiple release labels — pick exactly one"
+            exit 1
+          fi
+          echo "Release label check passed"

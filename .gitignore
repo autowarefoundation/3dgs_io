@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Sphinx build output
+docs/_build/
+
+# Hydra run logs (created in CWD when test_converters runs the lanelet2→clipgt tool)
+outputs/
+.serena

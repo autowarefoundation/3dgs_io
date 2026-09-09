@@ -1,0 +1,54 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Pinned to 22.04 because lanelet2's FindGeographicLib.cmake relies on the
+    # GeographicLib_LIBRARY_DIRS variable exported by Ubuntu's older
+    # libgeographic-dev package; 24.04 ships libgeographiclib-dev (GeographicLib
+    # 2.x) which uses a modern cmake config and breaks the find script.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # lanelet2_to_clipgt's end-to-end test builds lanelet2_python_api_for_autoware
+      # (which vendors Rosless-Lanelet2) from source via uvx. Its CMake needs the
+      # same native deps as upstream lanelet2: Boost, Eigen3, pugixml, GeographicLib.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libboost-all-dev \
+            libeigen3-dev \
+            libpugixml-dev \
+            libgeographic-dev \
+            librange-v3-dev \
+            python3-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run ruff (lint)
+        run: uv run ruff check
+
+      - name: Run ruff (format check)
+        run: uv run ruff format --check
+
+      - name: Run pytest
+        run: uv run pytest -v
