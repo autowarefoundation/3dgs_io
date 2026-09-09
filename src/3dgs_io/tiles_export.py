@@ -261,33 +261,40 @@ def _save_from_cloud(
     bbox_max = positions.max(axis=0)
 
     cell_keys = _assign_cell_keys(positions, bbox_min, bbox_max, cs)
-    unique_keys, inverse = np.unique(cell_keys, return_inverse=True)
+
+    # Group by sorting once, then slicing. Testing ``inverse == chunk_idx`` per
+    # chunk walks all N points for every chunk and gathers each attribute with
+    # a full-length boolean mask, so the split costs O(chunks x N): a town-scale
+    # cloud (8.8M splats, ~800 chunks) spends tens of minutes there. Sorting is
+    # O(N log N) once and every chunk is then a contiguous run of indices.
+    order = np.argsort(cell_keys, kind="stable")
+    ordered_keys = cell_keys[order]
+    starts = np.flatnonzero(np.concatenate(([True], ordered_keys[1:] != ordered_keys[:-1])))
+    bounds = np.append(starts, n)
+    sh_reshaped = sh.reshape(n, sh_per_point, 3) if has_sh else None
 
     children: list[dict[str, Any]] = []
     save_tasks: list[tuple[spz.GaussianCloud, Path, dict[str, np.ndarray] | None]] = []
 
-    for chunk_idx, _key in enumerate(unique_keys):
-        mask = inverse == chunk_idx
-        if not mask.any():
-            continue
+    for chunk_idx in range(starts.shape[0]):
+        sel = order[bounds[chunk_idx] : bounds[chunk_idx + 1]]
 
         chunk_gc = spz.GaussianCloud()
-        chunk_gc.positions = positions[mask].reshape(-1).astype(np.float32)
-        chunk_gc.rotations = rotations[mask].reshape(-1).astype(np.float32)
-        chunk_gc.scales = scales[mask].reshape(-1).astype(np.float32)
-        chunk_gc.colors = colors[mask].reshape(-1).astype(np.float32)
-        chunk_gc.alphas = alphas[mask].astype(np.float32)
+        chunk_gc.positions = positions[sel].reshape(-1).astype(np.float32)
+        chunk_gc.rotations = rotations[sel].reshape(-1).astype(np.float32)
+        chunk_gc.scales = scales[sel].reshape(-1).astype(np.float32)
+        chunk_gc.colors = colors[sel].reshape(-1).astype(np.float32)
+        chunk_gc.alphas = alphas[sel].astype(np.float32)
         if has_sh:
             chunk_gc.sh_degree = gc.sh_degree
-            sh_reshaped = sh.reshape(n, sh_per_point, 3)
-            chunk_gc.sh = sh_reshaped[mask].reshape(-1).astype(np.float32)
+            chunk_gc.sh = sh_reshaped[sel].reshape(-1).astype(np.float32)
 
-        chunk_ext = {name: arr[mask] for name, arr in ext_attrs.items()}
+        chunk_ext = {name: arr[sel] for name, arr in ext_attrs.items()}
 
         filename = f"chunk_{chunk_idx}.glb"
         save_tasks.append((chunk_gc, output_dir / filename, chunk_ext))
 
-        chunk_positions = positions[mask]
+        chunk_positions = positions[sel]
         bounding_box = _aabb_to_3dtiles_box(
             chunk_positions.min(axis=0), chunk_positions.max(axis=0)
         )

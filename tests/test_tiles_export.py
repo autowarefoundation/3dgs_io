@@ -45,6 +45,43 @@ def _make_cloud(n: int = 200, seed: int = 42, spread: float = 10.0) -> GaussianC
 class TestSaveFromCloud:
     """Tests for save_tileset with a GaussianCloud source."""
 
+    def test_every_splat_lands_in_exactly_one_chunk(self, tmp_path: Path) -> None:
+        """Grouping is by sorted runs; nothing may be dropped or duplicated."""
+        gc = _make_cloud(500, spread=20.0)
+        out = tmp_path / "tiles"
+        save_tileset(gc, out, TilesetSaveOptions(chunk_size=5.0))
+
+        wanted = np.array(gc.positions, dtype=np.float32).reshape(-1, 3)
+        got = np.concatenate(
+            [
+                np.array(load_gltf(path).positions, dtype=np.float32).reshape(-1, 3)
+                for path in sorted(out.glob("chunk_*.glb"))
+            ]
+        )
+        assert got.shape == wanted.shape
+        order_a = np.lexsort(wanted.T)
+        order_b = np.lexsort(got.T)
+        assert np.allclose(wanted[order_a], got[order_b])
+
+    def test_chunk_attributes_stay_with_their_splat(self, tmp_path: Path) -> None:
+        """A chunk's colours and scales must belong to the points in it."""
+        gc = _make_cloud(400, spread=15.0)
+        out = tmp_path / "tiles"
+        save_tileset(gc, out, TilesetSaveOptions(chunk_size=6.0))
+
+        positions = np.array(gc.positions, dtype=np.float32).reshape(-1, 3)
+        colors = np.array(gc.colors, dtype=np.float32).reshape(-1, 3)
+        lookup = {tuple(np.round(p, 4)): c for p, c in zip(positions, colors, strict=True)}
+
+        for path in sorted(out.glob("chunk_*.glb")):
+            chunk = load_gltf(path)
+            n = chunk.num_points
+            chunk_positions = np.array(chunk.positions, dtype=np.float32).reshape(n, 3)
+            chunk_colors = np.array(chunk.colors, dtype=np.float32).reshape(n, 3)
+            for position, color in zip(chunk_positions, chunk_colors, strict=True):
+                wanted = lookup[tuple(np.round(position, 4))]
+                assert np.allclose(color, wanted, atol=1e-3)
+
     def test_produces_tileset_json(self, tmp_path: Path) -> None:
         gc = _make_cloud(100)
         result = save_tileset(gc, tmp_path / "tiles")
