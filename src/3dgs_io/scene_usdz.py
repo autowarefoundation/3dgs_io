@@ -40,6 +40,7 @@ archive path                              scene.json key
 ``sequence_tracks.json``                  ``extras.sequence_tracks``
 ``rig_trajectories.json``                 ``extras.rig_trajectories``
 ``ppisp.json``                            ``extras.ppisp``
+``skybox.png``                            ``extras.skybox``
 ``actor_assets.json``                     ``extras.actor_assets``
 ========================================  =================================
 
@@ -50,6 +51,13 @@ can hand the extracted ``autoware_map/`` directory to ``autoware_map_loader``
 verbatim. When the point-cloud map is split into multiple ``.pcd`` files they
 live under ``autoware_map/pointcloud_map/`` and ``extras.map_pointcloud``
 records that directory prefix (trailing slash) instead of a single file.
+
+``skybox.png`` is an equirectangular panorama of the scene's sky, sampled by
+ray direction behind the Gaussians. Because the sky is effectively at infinity
+a directional texture is the right representation: a finite Gaussian dome would
+show parallax and, being far outside SPZ's ~±2 km position range, would not
+survive the chunk encoding at all. It is packed verbatim at the archive root
+and recorded under ``scene.json.extras.skybox``.
 """
 
 from __future__ import annotations
@@ -177,6 +185,7 @@ _KNOWN_EXTRAS: dict[str, str] = {
     "sequence_tracks.json": "sequence_tracks",
     "rig_trajectories.json": "rig_trajectories",
     "ppisp.json": "ppisp",
+    "skybox.png": "skybox",
     ACTOR_ASSETS_ARCHIVE_PATH: "actor_assets",
 }
 

@@ -416,6 +416,7 @@ def test_scene_json_schema(tmp_path: Path) -> None:
         "sequence_tracks": None,
         "rig_trajectories": None,
         "ppisp": None,
+        "skybox": None,
         "actor_assets": None,
     }
 
@@ -527,6 +528,27 @@ def test_extras_file_is_embedded_verbatim(tmp_path: Path) -> None:
     assert scene["extras"]["tracks"] == "tracks.parquet"
 
 
+def test_extras_skybox_png_populates_scene_extras(tmp_path: Path) -> None:
+    # A minimal 1x1 PNG (equirectangular sky panoramas ride here in practice).
+    png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    ts = _make_tileset(tmp_path)
+    src = tmp_path / "skybox.png"
+    src.write_bytes(png)
+
+    out = tmp_path / "scene.usdz"
+    save_scene_usdz(ts, out, extras={"skybox.png": src})
+
+    # Packed verbatim at the archive root and declared as a first-class extra.
+    assert "skybox.png" in _names(out)
+    assert _read(out, "skybox.png") == png
+    scene = json.loads(_read(out, "scene.json"))
+    assert scene["extras"]["skybox"] == "skybox.png"
+
+
 def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> None:
     ts = _make_tileset(tmp_path)
     src_dir = tmp_path / "carla_root"
@@ -579,6 +601,7 @@ def test_extras_known_archive_paths_populate_scene_extras(tmp_path: Path) -> Non
         "sequence_tracks": None,
         "rig_trajectories": None,
         "ppisp": None,
+        "skybox": None,
         "actor_assets": None,
     }
 
