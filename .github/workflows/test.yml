@@ -15,7 +15,7 @@ jobs:
     # GeographicLib_LIBRARY_DIRS variable exported by Ubuntu's older
     # libgeographic-dev package; 24.04 ships libgeographiclib-dev (GeographicLib
     # 2.x) which uses a modern cmake config and breaks the find script.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
